@@ -2713,7 +2713,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                         // buffer of its own, four a frame, 43 to 60 ms a
                         // frame) and neither side had other bytes after
                         // one. A copy INTO such a range still waits.
-                        if !touches(written, dst, dst + len) && fill_ahead::on() {
+                        if !touches(written, dst, dst + len) && fill_ahead::on_for(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2731,7 +2731,7 @@ fn blocked_by(written: &[(usize, usize)], runs: &[&HostList], count: bool) -> Op
                     if touches(written, src, src + len) {
                         // Not waited for, and checked when the flights land
                         // (`fill_ahead`).
-                        if fill_ahead::on() {
+                        if fill_ahead::on_for(src, len) {
                             if count {
                                 fill_ahead::read(src, len);
                             }
@@ -2798,6 +2798,18 @@ mod fill_ahead {
 
     /// A flight changed bytes a fill had read ahead of it: fills wait.
     static WAIT: AtomicBool = AtomicBool::new(false);
+    /// The 64 KiB pieces where a fill read bytes a flight then changed:
+    /// fills that read them wait from then on, the others go on not waiting
+    /// (`VICTORY_FILL_WAIT_ALL=1`: every fill waits again after the first
+    /// such fill, as before). One such fill in the loading screen turned
+    /// the waiting back on for every fill of the session: two waits a
+    /// frame, 40 to 55 ms of the submitting thread standing still.
+    static BAD: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+
+    fn wait_all() -> bool {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT_ALL").is_some_and(|v| v == "1"))
+    }
     /// Since the last frame line: fills that read ahead; landings' writes
     /// that touched one's piece. Since the start: fills that read bytes a
     /// flight then changed.
@@ -2829,6 +2841,24 @@ mod fill_ahead {
     pub(super) fn on() -> bool {
         static ON: OnceLock<bool> = OnceLock::new();
         *ON.get_or_init(|| std::env::var_os("VICTORY_FILL_WAIT").is_none_or(|v| v != "1")) && !WAIT.load(Relaxed)
+    }
+
+    /// [`on`], and none of `[src, src + len)` lies in a piece where a fill
+    /// was once caught reading ahead of a flight's write.
+    pub(super) fn on_for(src: usize, len: usize) -> bool {
+        // Measuring only (`VICTORY_FILL_NEVER_WAIT=1`): no fill or copy
+        // that only reads where flights may write ever waits, caught or
+        // not; such reads may take bytes a frame old. Tells what doing
+        // those copies on the card, in order, would gain.
+        static NEVER: OnceLock<bool> = OnceLock::new();
+        if *NEVER.get_or_init(|| std::env::var_os("VICTORY_FILL_NEVER_WAIT").is_some_and(|v| v == "1")) {
+            return true;
+        }
+        if !on() {
+            return false;
+        }
+        let bad = BAD.lock().unwrap_or_else(|e| e.into_inner());
+        bad.is_empty() || !(src / PIECE..=(src + len.max(1) - 1) / PIECE).any(|p| bad.contains(&p))
     }
 
     /// A fill reads `len` bytes at `src` ahead of flights that may write
@@ -2886,14 +2916,32 @@ mod fill_ahead {
             }
             let n = COUNT[2].fetch_add(1, Relaxed) + 1;
             let first = now.iter().zip(&new[a - at..b - at]).position(|(x, y)| x != y).unwrap_or(0);
-            if !WAIT.swap(true, Relaxed) {
-                tracing::warn!(
-                    "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders changed \
-                     them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes from before. \
-                     Fills wait for flights again from here on, as with VICTORY_FILL_WAIT=1 ({n} such fills)",
-                    to - from,
-                    a + first
-                );
+            let pieces: Vec<usize> = (from / PIECE..=(to - 1) / PIECE).collect();
+            if wait_all() {
+                if !WAIT.swap(true, Relaxed) {
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes \
+                         from before. Fills wait for flights again from here on (VICTORY_FILL_WAIT_ALL=1; {n} such fills)",
+                        to - from,
+                        a + first
+                    );
+                }
+            } else {
+                let mut bad = BAD.lock().unwrap_or_else(|e| e.into_inner());
+                let fresh: Vec<usize> = pieces.into_iter().filter(|p| !bad.contains(p)).collect();
+                if !fresh.is_empty() {
+                    bad.extend(&fresh);
+                    tracing::warn!(
+                        "a fill of upload memory read {} bytes at {from:#x} in frame {read_in} ahead of a flight whose shaders \
+                         changed them (first at {:#x}, landed in frame {frame}): the lists of that submission drew with the bytes \
+                         from before. Fills of that 64 KiB wait for flights from here on, the others do not ({} such pieces; \
+                         VICTORY_FILL_WAIT_ALL=1: all wait)",
+                        to - from,
+                        a + first,
+                        bad.len()
+                    );
+                }
             }
             return;
         }
@@ -2925,6 +2973,10 @@ mod fill_ahead {
             COUNT[2].load(Relaxed),
             if WAIT.load(Relaxed) { " (fills wait again)" } else { "" }
         );
+        let bad = BAD.lock().unwrap_or_else(|e| e.into_inner()).len();
+        if bad > 0 {
+            tracing::info!("fills of upload memory: {bad} pieces of 64 KiB where fills wait for flights (one was caught reading ahead there)");
+        }
     }
 }
 

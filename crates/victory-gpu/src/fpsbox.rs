@@ -54,13 +54,15 @@ fn glyph(c: char) -> [u8; 7] {
         'F' => [0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000],
         'P' => [0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000],
         'S' => [0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110],
+        'M' => [0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001],
         _ => [0; 7],
     }
 }
 
-/// The text for a frame rate in tenths.
+/// The text for a frame rate in tenths, with the frame time it means.
 fn text(tenths: u32) -> String {
-    format!("{}.{} FPS", tenths / 10, tenths % 10)
+    let ms = if tenths == 0 { 0 } else { (10_000 + tenths / 2) / tenths };
+    format!("{}.{} FPS {} MS", tenths / 10, tenths % 10, ms)
 }
 
 /// Bytes a pixel of a swap chain format this layer presents in, or none.
@@ -223,9 +225,9 @@ mod tests {
 
     #[test]
     fn the_text_is_the_rate_to_a_tenth() {
-        assert_eq!(text(103), "10.3 FPS");
-        assert_eq!(text(7), "0.7 FPS");
-        assert_eq!(text(300), "30.0 FPS");
+        assert_eq!(text(103), "10.3 FPS 97 MS");
+        assert_eq!(text(7), "0.7 FPS 1429 MS");
+        assert_eq!(text(300), "30.0 FPS 33 MS");
     }
 
     #[test]
@@ -243,7 +245,7 @@ mod tests {
         // A space lights nothing: glyph 4.
         assert!((0..7 * 3).all(|y| (0..5 * 3).all(|x| !at(6 + 4 * 18 + x, 6 + y))));
         // Every glyph used has at least one dot, but the space.
-        for c in "0123456789.FPS".chars() {
+        for c in "0123456789.FPSM".chars() {
             assert!(glyph(c).iter().any(|&r| r != 0), "{c}");
         }
     }
