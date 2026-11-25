@@ -264,8 +264,8 @@ impl Shader {
             // (a float texture store's four values, `textureStore.f32`)
             Some(bits) if opcode == 67 && name == "textureStore.f32" && args.len() > 7 => {
                 let mut a = args.to_vec();
-                for k in 4..8 {
-                    a[k] = self.m.f32(bits);
+                for v in &mut a[4..8] {
+                    *v = self.m.f32(bits);
                 }
                 faked = a;
                 &faked[..]
@@ -992,12 +992,12 @@ fn ablated(name: &str, opcode: u32) -> bool {
     });
     let hit = list
         .iter()
-        .any(|(n, o)| name.starts_with(n.as_str()) && o.map_or(true, |o| o == opcode));
+        .any(|(n, o)| name.starts_with(n.as_str()) && o.is_none_or(|o| o == opcode));
     if !hit {
         return false;
     }
     let i = ABLATE_MATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let left_out = range.map_or(true, |(a, b)| i >= a && i < b);
+    let left_out = range.is_none_or(|(a, b)| i >= a && i < b);
     if left_out && range.is_some_and(|(a, b)| b - a <= 8) {
         eprintln!("ablated #{i}: dx.op.{name} opcode {opcode}");
     }

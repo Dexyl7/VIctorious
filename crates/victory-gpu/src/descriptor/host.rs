@@ -2208,7 +2208,32 @@ fn own_copy_on() -> bool {
 /// view is made on its buffer's copy, as every other.
 #[allow(clippy::too_many_arguments)]
 fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool, unordered: bool) -> Option<(u64, u64)> {
-    own_bytes_raw(own_copy_on(), raw_own_copy(unordered), offset, base, first, count, element, stride, unknown)
+    let start = base.wrapping_add(first.wrapping_mul(4));
+    let raw_ok = raw_own_copy(unordered) && raw_own_only(start);
+    let made = own_bytes_raw(own_copy_on(), raw_ok, offset, base, first, count, element, stride, unknown);
+    // Diagnostics: each raw view off 16 bytes given its own copy, once.
+    if made.is_some() && element == 4 && stride == 0 && !unknown && offset.is_multiple_of(4) {
+        static SEEN: Mutex<Option<std::collections::HashSet<(u64, bool)>>> = Mutex::new(None);
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        if seen.get_or_insert_with(Default::default).insert((start, unordered)) {
+            tracing::info!(start = format!("{start:#x}"), bytes = u64::from(count) * 4, unordered, "raw view off 16 bytes: a copy of its own");
+        }
+    }
+    made
+}
+
+/// `VICTORY_RAW_OWN_COPY_ONLY=<hex start>,...`: only raw views starting at
+/// those title addresses get their own copy (to find one that matters).
+fn raw_own_only(start: u64) -> bool {
+    static LIST: std::sync::OnceLock<Option<Vec<u64>>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_RAW_OWN_COPY_ONLY").ok().map(|v| {
+            v.split(',')
+                .filter_map(|x| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok())
+                .collect()
+        })
+    });
+    list.as_ref().is_none_or(|l| l.contains(&start))
 }
 
 /// Whether a raw view that does not start on 16 bytes gets its own bytes
@@ -2234,6 +2259,7 @@ fn view_unordered(view: &View) -> bool {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn own_bytes_if(
     on: bool,
