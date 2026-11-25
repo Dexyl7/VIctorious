@@ -2378,6 +2378,7 @@ impl Shadow {
         if pending.contains(&range) {
             return;
         }
+        crate::inplace::note_shader_written(self.id);
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -3160,7 +3161,7 @@ impl Shadow {
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
-        crate::inplace::note_copied(self.id, self.start, self.len, self.window, to - from);
+        crate::inplace::note_copied(self.id, self.start, self.len, self.window, to - from, self.card.is_some());
         // After the bytes are in: a snapshot taken meanwhile is not current.
         self.changed(from - start, to - start);
         self.card_changed(from - start, to - start);

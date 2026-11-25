@@ -127,6 +127,11 @@ struct List {
     /// at them before it runs `host`.
     #[cfg(windows)]
     gate: Vec<ValueWait>,
+    /// With hoisted clamps (`crate::indirect::hoist_mode`): the open list
+    /// that holds the clamps of `host`'s indirect draws and runs right
+    /// before it, and `host`'s writes when it began ([`hoist_for_draws`]).
+    #[cfg(windows)]
+    hoist: Option<(crate::host::HostList, u64)>,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -310,6 +315,7 @@ fn cut(this: This, wait: ValueWait) {
     // SAFETY: the title passes one of our lists; a list is recorded by one
     // thread at a time and is not submitted while it records.
     let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    end_hoist(list);
     let Some(current) = list.host.as_ref() else {
         return;
     };
@@ -342,6 +348,68 @@ fn cut(this: This, wait: ValueWait) {
             .replay(host);
     }
 }
+
+/// Ends the hoisting of `list`'s clamps, if any: the list of clamps is
+/// ended and closed and takes its place right before `host` (with the
+/// waits recorded before `host`'s first work, which stand before the clamps
+/// then: they may read what is written after those waits).
+#[cfg(windows)]
+fn end_hoist(list: &mut List) {
+    if let Some((clamps, _)) = list.hoist.take() {
+        clamps.clamp_end();
+        clamps.close();
+        let waits = std::mem::take(&mut list.gate);
+        list.earlier.push(Part { waits, host: clamps });
+    }
+}
+
+/// Before an indirect draw, with hoisted clamps: unless the clamps of
+/// `this`'s draws already go to a list before its host list and nothing
+/// since may have written arguments (no dispatch, no copy), the recording
+/// is cut here: a new list for the clamps of the draws to come runs after
+/// what was recorded, and the recording goes on in another list after it,
+/// with the state the title set. The list of clamps, if any.
+#[cfg(windows)]
+fn hoist_for_draws<'a>(this: This) -> Option<&'a crate::host::HostList> {
+    if crate::indirect::hoist_mode() == 0 || this.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes one of our lists; a list is recorded by one
+    // thread at a time and is not submitted while it records.
+    let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+    let writes = list.host.as_ref()?.writes();
+    if list.hoist.as_ref().is_some_and(|(_, at)| *at == writes) {
+        return list.hoist.as_ref().map(|(clamps, _)| clamps);
+    }
+    end_hoist(list);
+    let clamps = fresh_list()?;
+    let current = list.host.as_ref()?;
+    if current.untouched() {
+        // Nothing recorded yet: the clamps go right before it.
+        list.hoist = Some((clamps, writes));
+    } else {
+        let Some(next) = fresh_list() else {
+            // shortcut: no list to go on in: the clamps stay with the draws.
+            return None;
+        };
+        current.close();
+        if let Some(done) = list.host.replace(next) {
+            let waits = std::mem::take(&mut list.gate);
+            list.earlier.push(Part { waits, host: done });
+        }
+        let host = list.host.as_ref()?;
+        list.state.lock().unwrap_or_else(|e| e.into_inner()).replay(host);
+        list.hoist = Some((clamps, host.writes()));
+    }
+    if HOISTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+        tracing::info!(mode = crate::indirect::hoist_mode(), "indirect draws: their clamps go to a list before theirs (VICTORY_HOIST_CLAMPS)");
+    }
+    list.hoist.as_ref().map(|(clamps, _)| clamps)
+}
+
+/// Lists of hoisted clamps begun since the start.
+#[cfg(windows)]
+pub(crate) static HOISTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether list `this` recorded a wait for a memory value (with waits cut
 /// into lists).
@@ -596,6 +664,8 @@ fn new_list(
         earlier: Vec::new(),
         #[cfg(windows)]
         gate: Vec::new(),
+        #[cfg(windows)]
+        hoist: None,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -626,6 +696,12 @@ extern "system" fn list_type(this: This) -> u32 {
 }
 extern "system" fn close(this: This) -> HRESULT {
     #[cfg(windows)]
+    if !this.is_null() {
+        // SAFETY: the title passes one of our lists, and records nothing
+        // into it while it closes it.
+        end_hoist(unsafe { &mut *this.cast_mut().cast::<List>() });
+    }
+    #[cfg(windows)]
     if let Some(host) = host_list(this) {
         host.close();
     }
@@ -653,6 +729,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        list.hoist = None;
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -822,6 +899,11 @@ extern "system" fn copy_buffer_region(
     len: u64,
 ) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        // It may write the arguments of draws clamped before it.
+        list.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && let Some(to) = buffer_range(dst, dst_offset, len)
         && let Some(from) = buffer_range(src, src_offset, len)
@@ -858,6 +940,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         let Some(list) = host_list(this) else {
             return;
         };
+        list.count_write();
         if let (Some(to), Some(from)) = (
             crate::resource::host_resource(dst),
             crate::resource::host_resource(src),
@@ -1351,6 +1434,10 @@ extern "system" fn clear_dsv(
 /// are title memory, copied at submission like buffer copies (if mapped).
 extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags: u32) {
     #[cfg(windows)]
+    if let Some(list) = host_list(this) {
+        list.count_write();
+    }
+    #[cfg(windows)]
     if let Some(list) = host_list(this)
         && dst != 0
         && src != 0
@@ -1757,8 +1844,9 @@ extern "system" fn execute_indirect(
         const DISPATCH: u32 = 2;
         const DISPATCH_SINGLE: u32 = 105;
         let kind = if *kind == DISPATCH_SINGLE { DISPATCH } else { *kind };
+        let clamps = if kind == DISPATCH { None } else { hoist_for_draws(this) };
         with_state(this, |list, s| {
-            ran = s.execute_indirect(list, (kind, stride, max), address, counter);
+            ran = s.execute_indirect(list, (kind, stride, max), address, counter, clamps);
         });
     } else {
         #[cfg(all(windows, feature = "diagnostics"))]
@@ -2066,6 +2154,7 @@ fn value_written(this: This, address: u64, value: u64) {
         // SAFETY: the title passes one of our lists; a list is recorded by
         // one thread at a time and is not submitted while it records.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+        end_hoist(list);
         let Some(current) = list.host.as_ref() else {
             return;
         };
@@ -2096,6 +2185,8 @@ fn defer_write(this: This, address: u64, what: Written, bytes: usize) {
     }
     #[cfg(windows)]
     if let Some(list) = host_list(this) {
+        // It may write the arguments of draws clamped before it.
+        list.count_write();
         list.defer_write(address as *mut u8, what, bytes);
         return;
     }

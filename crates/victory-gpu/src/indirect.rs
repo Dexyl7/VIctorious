@@ -327,6 +327,79 @@ fn validate_layout(
     (bytes <= u64::from(u32::MAX)).then_some(bytes)
 }
 
+/// Whether the clamps of a run of indirect draws are recorded in a list of
+/// their own that runs before the list that draws (`VICTORY_HOIST_CLAMPS`,
+/// after Belobug's AMD fork, ccab973 and 76387c2): with a clamp of ours and
+/// its waits before each draw the card went from drawing to compute and
+/// back thousands of times a frame (6,100 such draws a frame in the timing
+/// run of 2026-11-26, about 80 of 95 ms of card time in indirect draws;
+/// theirs: 225 to 72 ms of GPU time in a scene of 9,300 draws). 0 off; 1 on
+/// (the clamps of a run one after another, with a wait between them, so that
+/// the list's budget is charged in the draws' order, as their mode 7);
+/// 2 on, the clamps without waits between them. Off by default for now.
+pub(crate) fn hoist_mode() -> u8 {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_HOIST_CLAMPS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
+}
+
+/// As [`bound`], recorded in `clamps`, a list that runs before the one that
+/// executes: the buffer and the offset of the clamped records, readable as
+/// indirect arguments once `clamps` ended ([`HostList::clamp_end`]).
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live buffers.
+    let (src_base, count_base) = unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    // Addresses the shader's offsets (32 bits) reach, as in `clamp_into`.
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: a live buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (writable: `clamp_room`) and budget buffers. The
+    // clamps write apart and charge the budget atomically.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        // One clamp after another: the budget is charged in the draws'
+        // order, as when each clamp precedes its draw (without it mesh
+        // objects flickered in their fork).
+        if hoist_mode() == 1 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// Records, in `list`, the non-destructive clamp of up to `records` records of
 /// `kind` (PC argument numbering) `stride` bytes apart from `src` (and bounded
 /// by the 32-bit count in `count` when given) into a device-local scratch

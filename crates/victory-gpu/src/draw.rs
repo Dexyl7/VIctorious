@@ -136,6 +136,10 @@ struct Window {
     scratch: ID3D12Resource,
 }
 
+/// Indirect draws clamped in a list before theirs since the start
+/// (`crate::indirect::hoist_mode`).
+pub(crate) static HOISTED: AtomicU64 = AtomicU64::new(0);
+
 /// The most records clamped in one pass ([`windows`]).
 const WINDOW_MOST: u64 = 512;
 
@@ -2090,6 +2094,8 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        // It may write the arguments of draws clamped before it.
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         // The least indirect light after the program that resolves it; its
         // pass sets heaps, root signature and pipeline of its own, so the
@@ -2920,6 +2926,7 @@ impl State {
         (kind, stride, max): (u32, u32, u32),
         arguments: u64,
         count: Option<u64>,
+        clamps: Option<&HostList>,
     ) -> bool {
         // Skip before the argument clamp can mutate the indirect buffer.
         #[cfg(feature = "diagnostics")]
@@ -3047,6 +3054,27 @@ impl State {
                 }
                 (scratch, at)
             }
+            // Hoisted (`crate::indirect::hoist_mode`): clamped in the list
+            // before, which the run's first draw opened (`crate::list`), so
+            // that nothing of ours comes between the draws. No window then.
+            None if clamps.is_some() && kind != DISPATCH => {
+                let clamps = clamps.expect("checked");
+                args.refresh(clamps, arguments, len);
+                if let Some((s, at)) = &counter {
+                    s.refresh(clamps, *at, 4);
+                }
+                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                #[cfg(feature = "diagnostics")]
+                clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+                let Some(before) = crate::indirect::bound_before(clamps, (&args.buffer, offset), count_arg, (kind, stride, max)) else {
+                    self.window = None;
+                    why("not bounded before (no room, or arguments not 4-byte aligned)");
+                    return false;
+                };
+                self.window = None;
+                HOISTED.fetch_add(1, Ordering::Relaxed);
+                before
+            }
             None => {
                 // A record a short step after the last window's last one
                 // (the same step as that window's, if it had one): the
@@ -3139,6 +3167,8 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
+            // It may write the arguments of draws clamped before it.
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

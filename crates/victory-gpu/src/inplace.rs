@@ -1150,7 +1150,7 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
 /// outside buffers; a line every ten seconds, per frame. What a stage in
 /// place would take off the copying, where the census says only what
 /// exists.
-pub(crate) fn note_copied(id: u64, start: u64, len: u64, window: bool, bytes: usize) {
+pub(crate) fn note_copied(id: u64, start: u64, len: u64, window: bool, bytes: usize, card: bool) {
     if probe_level() == 0 || bytes == 0 {
         return;
     }
@@ -1164,6 +1164,11 @@ pub(crate) fn note_copied(id: u64, start: u64, len: u64, window: bool, bytes: us
         *map.entry(id).or_insert_with(|| kind_of(start as usize, len as usize, &mut Vec::new()) as u8)
     };
     BYTES[usize::from(kind) + if window { 6 } else { 0 }].fetch_add(bytes as u64, Ordering::Relaxed);
+    // And by the copy: in the card's memory or not, shaders ever declared
+    // writes to it or not (what a copy made on the card itself would have
+    // to keep right on the CPU's side for the merges).
+    let written = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|w| w.contains(&id));
+    BY_COPY[usize::from(card) * 2 + usize::from(written)].fetch_add(bytes as u64, Ordering::Relaxed);
     let now = crate::host::now_ms();
     let frame = crate::frame::current();
     let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
@@ -1183,6 +1188,24 @@ pub(crate) fn note_copied(id: u64, start: u64, len: u64, window: bool, bytes: us
         part(0),
         part(6)
     );
+    let by: Vec<f64> = BY_COPY.iter().map(|b| b.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    tracing::info!(
+        "in place census, MB copied per frame by copy: in PC memory, never written by shaders {:.1}, written {:.1}; in the card's memory, never written {:.1}, written {:.1}",
+        by[0], by[1], by[2], by[3]
+    );
+}
+
+/// Copies shaders declared writes to, since the start, by number (with
+/// [`probe_level`]: for [`note_copied`]).
+static WRITTEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
+static BY_COPY: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// Shaders declared a write to the copy `id` ([`note_copied`]).
+pub(crate) fn note_shader_written(id: u64) {
+    if probe_level() == 0 {
+        return;
+    }
+    WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id);
 }
 
 /// The census lines for `spans` (start, bytes, whether a window outside
