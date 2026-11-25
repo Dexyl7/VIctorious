@@ -168,23 +168,50 @@ fn section_heap(device: &ID3D12Device, section: usize) -> windows::core::Result<
     Ok(heap)
 }
 
-/// Whether host copies in the card's memory that shaders never wrote are
-/// filled by the card itself, copying from the title's committed sections
-/// (`VICTORY_GPU_FEED=1`, needs `VICTORY_POOL_COMMIT=1`): no CPU copy
-/// into the staging side, no upload of it.
+/// Whether the CPU sides of host copies in the card's memory are filled by
+/// the card itself, copying from the title's committed sections
+/// (`VICTORY_GPU_FEED=1`, needs `VICTORY_POOL_COMMIT=1`): no CPU copy of
+/// the bytes that changed; they go on to the card's side as before.
 pub(crate) fn feed() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = std::env::var_os("VICTORY_GPU_FEED").is_some_and(|v| v != "0");
-        if on {
-            tracing::info!("host copies in the card's memory that shaders never wrote: the card copies them from title memory itself (VICTORY_GPU_FEED)");
+    /// 0 off, 1 on, 2 in turn (`alt`: 20 s on, 20 s off, for an A/B within
+    /// one run; the frame log's lines tell which half they fall in).
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_GPU_FEED").as_deref() {
+            Ok("alt") => 2,
+            Ok(v) if v != "0" => 1,
+            _ => 0,
+        };
+        if mode > 0 {
+            tracing::info!(
+                alternating = mode == 2,
+                "host copies in the card's memory: the card copies changed title memory into their CPU sides itself (VICTORY_GPU_FEED)"
+            );
         }
-        on
-    })
+        mode
+    });
+    FEED_ASKED.store(mode > 0, Ordering::Relaxed);
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0
+        }
+    }
+}
+
+static FEED_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether [`feed`] was asked for at all (in turn or not): runs fed while
+/// it was on are still to be carried out after it turns off.
+pub(crate) fn feed_asked() -> bool {
+    feed();
+    FEED_ASKED.load(Ordering::Relaxed)
 }
 
 /// Fed bytes and runs, for the frame log.
-pub(crate) static FED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub(crate) static FED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// `[at, at + len)` of title memory as runs of committed sections:
 /// `(section, offset, bytes)` in address order, or `None` if any of it is
@@ -1435,19 +1462,20 @@ pub(crate) fn tick() {
     if level() > 0 {
         say();
     }
-    if feed() {
+    if feed_asked() {
         static LAST: AtomicU64 = AtomicU64::new(0);
         let now = crate::host::now_ms();
         let last = LAST.load(Ordering::Relaxed);
         if now >= last + 5_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-            let (bytes, runs, stopped) = (FED[0].swap(0, Ordering::Relaxed), FED[1].swap(0, Ordering::Relaxed), FED[2].load(Ordering::Relaxed));
+            let (bytes, runs) = (FED[0].swap(0, Ordering::Relaxed), FED[1].swap(0, Ordering::Relaxed));
             let frames = crate::frame::current();
             static FRAMES: AtomicU64 = AtomicU64::new(0);
             let n = frames.saturating_sub(FRAMES.swap(frames, Ordering::Relaxed)).max(1);
             tracing::info!(
-                "fed by the card from title sections: {:.1} MB a frame in {} copies a frame; copies fed once and then written by shaders since the start: {stopped}",
+                "copied by the card from title sections instead of by the CPU: {:.1} MB a frame in {} copies a frame (VICTORY_GPU_FEED; feeding now: {})",
                 bytes as f64 / n as f64 / 1048576.0,
-                runs / n
+                runs / n,
+                feed()
             );
         }
     }

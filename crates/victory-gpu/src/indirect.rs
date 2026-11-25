@@ -469,6 +469,44 @@ fn clamp_into(
     recorded
 }
 
+/// Whether the pass that bounds an indirect command waits for every earlier
+/// shader write before and after it (`VICTORY_INDIRECT_WAITS`: 1, the
+/// default; 0 leaves both waits out and keeps the state changes of the
+/// scratch buffer, which order the clamp against the draw that reads it;
+/// `alt` 20 s with, 20 s without, for an A/B within one run). The wait
+/// before stands for the title's own: on the console the title orders the
+/// pass that writes arguments before the command that reads them with a
+/// barrier of its own, which is recorded as such a wait anyway. Each wait
+/// drains the card: ~4,600 bounded commands a frame made ~9,300 of them in
+/// heavy outdoor views.
+pub(crate) fn indirect_waits() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_INDIRECT_WAITS").as_deref() {
+            Ok("0") => 0,
+            Ok("alt") => 2,
+            _ => 1,
+        };
+        if mode != 1 {
+            tracing::info!(mode, "bounded indirect commands: the waits for earlier shader writes left out (VICTORY_INDIRECT_WAITS; 2: in turn)");
+        }
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(waits = on, "bounded indirect commands: waits switched (VICTORY_INDIRECT_WAITS=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// Records the clamp into `dst`, which is in state `before` (common, or
 /// indirect arguments after an earlier clamp into it), and leaves `dst` in
 /// `INDIRECT_ARGUMENT`. `ahead`: the records are a window clamped ahead of
@@ -540,9 +578,9 @@ fn record_clamp_as(
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::IndirectBounded, 1);
     #[cfg(feature = "diagnostics")]
-    let waits = crate::copystat::barrier_test() & 2 == 0;
+    let waits = crate::copystat::barrier_test() & 2 == 0 && indirect_waits();
     #[cfg(not(feature = "diagnostics"))]
-    let waits = true;
+    let waits = indirect_waits();
     let first = [
         uav_barrier(),
         transition(dst, before, D3D12_RESOURCE_STATE_UNORDERED_ACCESS),

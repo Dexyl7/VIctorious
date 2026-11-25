@@ -4345,13 +4345,16 @@ impl Host {
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
                     // Fed copies (`crate::inplace::feed`): the card copies
-                    // title memory from its sections itself. Disjoint from
-                    // `dirty`'s ranges, so the order does not matter.
+                    // title memory from its sections into the CPU's sides
+                    // itself; `dirty` holds their ranges, so the copies
+                    // below take them on to the card's sides.
                     let mut sections: Vec<(usize, Option<ID3D12Resource>)> = Vec::new();
+                    let mut fed_sides: Vec<&ID3D12Resource> = Vec::new();
                     for (shadow, runs) in &fed {
                         let Some((staging, _, _)) = shadow.card_sides() else {
                             continue;
                         };
+                        let mut copied = false;
                         for &(a, b, section, offset) in runs {
                             let source = match sections.iter().find(|s| s.0 == section) {
                                 Some(s) => s.1.clone(),
@@ -4362,16 +4365,27 @@ impl Host {
                                 }
                             };
                             match source {
-                                Some(source) => list.CopyBufferRegion(&shadow.buffer, a as u64, &source, offset, (b - a) as u64),
-                                None => {
-                                    // The section cannot be read by the
-                                    // card: through the CPU's side.
-                                    shadow.refill_cpu(a, b);
-                                    list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                Some(source) => {
+                                    list.CopyBufferRegion(staging, a as u64, &source, offset, (b - a) as u64);
+                                    copied = true;
                                 }
+                                // The section cannot be read by the card:
+                                // the CPU copies after all.
+                                None => shadow.refill_cpu(a, b),
                             }
                             crate::inplace::FED[1].fetch_add(1, Ordering::Relaxed);
                         }
+                        if copied {
+                            fed_sides.push(staging);
+                        }
+                    }
+                    // What was just written is read below.
+                    if !fed_sides.is_empty() {
+                        let barriers: Vec<_> = fed_sides
+                            .iter()
+                            .map(|staging| transition(staging, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COPY_SOURCE))
+                            .collect();
+                        list.ResourceBarrier(&barriers);
                     }
                     #[cfg(feature = "diagnostics")]
                     let shot_span = crate::shot::span_begin(list);
