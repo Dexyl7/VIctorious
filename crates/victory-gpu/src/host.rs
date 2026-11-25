@@ -4492,7 +4492,7 @@ impl Host {
         f.sent += 1;
         let (copy_queue, (allocator, list), fence, event, sent) =
             (f.copy_queue.clone(), f.list.clone(), f.fence.clone(), f.event, f.sent);
-        let completed_sent_as = plans.iter().map(|p| p.sent_as).max().unwrap_or(0);
+        let completed_sent_as = plans.iter().map(|p| p.1.sent_as).max().unwrap_or(0);
         let waiting = std::time::Instant::now();
         // SAFETY: the list's last run was waited for by this thread; live
         // buffers (the copies are held by the plans); the fence and the
