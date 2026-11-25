@@ -250,6 +250,35 @@ impl Shader {
             let ty = if ret == self.t.void { self.t.i32 } else { ret };
             return self.m.undef(ty);
         }
+        // Diagnostics ([`set_fake_store`]): every raw buffer store writes
+        // one fixed dword instead of its value, to see whether a buffer the
+        // CPU reads back reaches the title at all.
+        let faked: Vec<V>;
+        let args = match FAKE_STORE.with(std::cell::Cell::get) {
+            Some(bits) if opcode == 140 && args.len() > 3 => {
+                let mut a = args.to_vec();
+                a[3] = self.m.i32(bits);
+                faked = a;
+                &faked[..]
+            }
+            // (a float texture store's four values, `textureStore.f32`)
+            Some(bits) if opcode == 67 && name == "textureStore.f32" && args.len() > 7 => {
+                let mut a = args.to_vec();
+                for k in 4..8 {
+                    a[k] = self.m.f32(bits);
+                }
+                faked = a;
+                &faked[..]
+            }
+            // (and a pixel shader's float outputs, `storeOutput.f32`)
+            Some(bits) if opcode == 5 && name == "storeOutput.f32" && args.len() > 3 => {
+                let mut a = args.to_vec();
+                a[3] = self.m.f32(bits);
+                faked = a;
+                &faked[..]
+            }
+            _ => args,
+        };
         // Diagnostics (`VICTORY_SPLIT_FMAD=1`): FMad as a multiply and an
         // add (which DXIL's FMad allows), to see if AMD's compiler crashes
         // on its multiply-adds.
@@ -973,4 +1002,15 @@ fn ablated(name: &str, opcode: u32) -> bool {
         eprintln!("ablated #{i}: dx.op.{name} opcode {opcode}");
     }
     left_out
+}
+
+thread_local! {
+    /// See [`set_fake_store`].
+    static FAKE_STORE: std::cell::Cell<Option<u32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Diagnostics: while set, translations on this thread make every raw
+/// buffer store write `bits` as its first dword.
+pub fn set_fake_store(bits: Option<u32>) {
+    FAKE_STORE.with(|f| f.set(bits));
 }

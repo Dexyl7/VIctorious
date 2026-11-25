@@ -2119,7 +2119,7 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
     if let Some((base, width)) = buffer_extent(view)
         && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
         && let Some(whole) = crate::shadow::find(base, width)
-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, view_unordered(view))
         && let Some(own) = crate::shadow::exact(start, bytes)
     {
         return Some((own, start, bytes));
@@ -2206,8 +2206,32 @@ fn own_copy_on() -> bool {
 /// a view has no host view there; it is made on a copy of its own bytes
 /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
 /// view is made on its buffer's copy, as every other.
-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
+#[allow(clippy::too_many_arguments)]
+fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool, unordered: bool) -> Option<(u64, u64)> {
+    own_bytes_raw(own_copy_on(), raw_own_copy(unordered), offset, base, first, count, element, stride, unknown)
+}
+
+/// Whether a raw view that does not start on 16 bytes gets its own bytes
+/// (`VICTORY_RAW_OWN_COPY`: unset or `uav` unordered views alone, `1` or
+/// `all` every such view, `0` none, `srv` read-only views alone). Read-only
+/// ones are left null by default: with them made, the title overran a stack
+/// buffer just before the prologue's boat (a size it read had become real).
+fn raw_own_copy(unordered: bool) -> bool {
+    match std::env::var("VICTORY_RAW_OWN_COPY").ok().as_deref().map(str::trim) {
+        Some("0") => false,
+        Some("srv") => !unordered,
+        Some("1" | "all") => true,
+        _ => unordered,
+    }
+}
+
+/// Whether a view is an unordered one ([`own_bytes`]).
+fn view_unordered(view: &View) -> bool {
+    match view {
+        View::Unordered(..) => true,
+        View::Placed(unordered, ..) => *unordered,
+        _ => false,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2221,7 +2245,36 @@ fn own_bytes_if(
     stride: u32,
     unknown: bool,
 ) -> Option<(u64, u64)> {
-    if !on || element == 0 || count == 0 || offset.is_multiple_of(element) {
+    own_bytes_raw(on, true, offset, base, first, count, element, stride, unknown)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn own_bytes_raw(
+    on: bool,
+    raw_ok: bool,
+    offset: u64,
+    base: u64,
+    first: u64,
+    count: u32,
+    element: u64,
+    stride: u32,
+    unknown: bool,
+) -> Option<(u64, u64)> {
+    if !on || element == 0 || count == 0 {
+        return None;
+    }
+    // A raw view (4-byte elements, a format, no stride) must start on 16
+    // bytes of its host buffer; the console's may start on any dword (the
+    // water height look-ups' results, `first` 2: refused and left null, so
+    // the title read no water). Such a view gets its own bytes too.
+    // (`VICTORY_RAW_OWN_COPY=0`: refused, as before.)
+    let misaligned_raw = element == 4
+        && stride == 0
+        && !unknown
+        && offset.is_multiple_of(4)
+        && !(offset / 4 + first).is_multiple_of(4)
+        && raw_ok;
+    if offset.is_multiple_of(element) && !misaligned_raw {
         return None;
     }
     if unknown && raw_window(offset, first, count, stride).is_some() {
@@ -2334,7 +2387,7 @@ fn buffer_srv(
         // SAFETY: a buffer view's union member.
         let b = unsafe { desc.Anonymous.Buffer };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
+        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown, false)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {
@@ -2428,7 +2481,7 @@ fn buffer_uav(
             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
         };
         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
+        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, true)
             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
         {
             Some(own) => {

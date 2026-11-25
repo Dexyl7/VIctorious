@@ -437,6 +437,14 @@ fn translate(
     if skip.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
+    // Diagnostics: `VICTORY_TRANSLATE_NAME=<text>,...` translates the
+    // containers whose label holds one of them (case ignored).
+    if let Ok(names) = std::env::var("VICTORY_TRANSLATE_NAME") {
+        let label = format!("{}", source.label()).to_lowercase();
+        if !names.split(',').map(|n| n.trim().to_lowercase()).any(|n| !n.is_empty() && label.contains(&n)) {
+            return;
+        }
+    }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
     t.containers += 1;
     let Ok(container) = Container::parse(&bytes) else {

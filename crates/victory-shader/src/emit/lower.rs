@@ -3118,7 +3118,12 @@ impl<'a> Lower<'a> {
         // say) is the ballot of the lanes that are there: all of them, where two exchanging
         // host waves know every lane runs that block.
         let made = self.def_block.get(&lo).copied();
-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+        // (So too on a host whose wave is the console's, declared: a ballot in a block every
+        // lane runs holds every lane's bit. `VICTORY_MASK_NATIVE=0`: refused, as before.)
+        let native = self.exchange.is_none()
+            && self.s.wave_size.is_some()
+            && std::env::var_os("VICTORY_MASK_NATIVE").is_none_or(|v| v != "0");
+        let whole = (self.exchange.is_some() || native) && !self.local && made.is_none_or(|b| self.all_lanes(b));
         if !self.x.st.active.contains(&lo) && !whole {
             if self.exchange.is_some() && !self.local {
                 need(made.unwrap_or(0));

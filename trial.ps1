@@ -16,6 +16,7 @@ foreach ($h in $list) {
     $text = Get-Content C:\VIctory3\trial_out.txt -Raw
     if ($LASTEXITCODE -eq -1073741819) { $crash++; $r = "CRASH" }
     elseif ($text -match "pipeline: ") { $r = "refused (no crash, but not built)" }
+    elseif ($text -match "\s+0 emitted of [1-9]\d* (compute|mesh|vertex)") { $r = "does not translate (nothing built)" }
     else { $ok++; $r = "built" }
     $lines += "$h $r"
     Write-Host "$h $r"

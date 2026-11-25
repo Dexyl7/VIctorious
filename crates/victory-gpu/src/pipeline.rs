@@ -182,7 +182,26 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         Some(part) => victory_shader::native_programs(part.data).map_err(|e| e.to_string())?,
         None => Vec::new(),
     };
-    let host = crate::shader_cache::host_shader(container)?;
+    // Diagnostics: `VICTORY_FAKE_STORE_HASH=<16 hex>` translates that
+    // shader (not from the cache) with every raw buffer store writing the
+    // float `VICTORY_FAKE_STORE_VALUE` (default 50.0) instead.
+    let fake = std::env::var("VICTORY_FAKE_STORE_HASH").ok().filter(|list| {
+        let hash = blake3::hash(container).to_hex();
+        list.split(',').map(|h| h.trim().to_lowercase()).any(|h| !h.is_empty() && hash.starts_with(h.as_str()))
+    });
+    let host = if fake.is_some() {
+        let value = std::env::var("VICTORY_FAKE_STORE_VALUE")
+            .ok()
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(50.0);
+        tracing::warn!(?fake, value, "a shader's raw buffer stores write a fixed value (VICTORY_FAKE_STORE_HASH)");
+        victory_shader::emit::set_fake_store(Some(value.to_bits()));
+        let made = victory_shader::emit::translate(container).map_err(|e| e.to_string());
+        victory_shader::emit::set_fake_store(None);
+        made?
+    } else {
+        crate::shader_cache::host_shader(container)?
+    };
     let stores = programs.is_empty() || programs.iter().any(stores);
     let used = programs
         .into_iter()
