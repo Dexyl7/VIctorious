@@ -227,6 +227,9 @@ pub fn run(
         }
     }
     let t = total.into_inner().unwrap_or_else(|e| e.into_inner());
+    if std::env::var_os("VICTORY_ABLATE").is_some() {
+        println!("ablated      {} matches", victory_shader::emit::ablate_matches());
+    }
     println!(
         "containers   {} ({} duplicates skipped)",
         t.containers, t.duplicates
@@ -332,6 +335,25 @@ fn translate(
             .collect()
     });
     if !only.is_empty() && !only.iter().any(|o| hash.starts_with(o.as_str())) {
+        return;
+    }
+    // Diagnostics: `VICTORY_TRANSLATE_SKIP=<hash prefix>,...` leaves those
+    // containers out (shaders known to crash the driver's compiler).
+    static SKIP: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let skip = SKIP.get_or_init(|| {
+        // (and `VICTORY_TRANSLATE_SKIP_FILE=<path>`: more of them, split by
+        // commas or lines)
+        let more = std::env::var("VICTORY_TRANSLATE_SKIP_FILE")
+            .ok()
+            .and_then(|f| std::fs::read_to_string(f).ok())
+            .unwrap_or_default();
+        (std::env::var("VICTORY_TRANSLATE_SKIP").unwrap_or_default() + "," + &more)
+            .split([',', '\n', '\r'])
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    if skip.iter().any(|o| hash.starts_with(o.as_str())) {
         return;
     }
     let example = || format!("{}{} #{hash}", path.display(), source.label());
@@ -551,6 +573,15 @@ fn check(
         );
     }
     if let Some((h, stub_ps)) = &checks.host {
+        // Diagnostics: `VICTORY_TRANSLATE_CS_ONLY=1` builds compute pipelines
+        // alone; `VICTORY_TRANSLATE_TRACE=1` names each before it is built
+        // (the last name before a driver crash is the one it crashed on).
+        if std::env::var_os("VICTORY_TRANSLATE_CS_ONLY").is_some() && shader.stage != HwStage::Cs {
+            return;
+        }
+        if std::env::var_os("VICTORY_TRANSLATE_TRACE").is_some() {
+            eprintln!("building pipeline {}", label());
+        }
         let made = match shader.stage {
             HwStage::Vs => h.pipeline(&shader, stub_ps).map(drop),
             HwStage::Cs => h.compute_pipeline(&shader).map(drop),

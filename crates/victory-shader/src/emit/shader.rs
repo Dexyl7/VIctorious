@@ -244,6 +244,25 @@ impl Shader {
         opcode: u32,
         args: &[V],
     ) -> V {
+        // Diagnostics (`VICTORY_ABLATE`): operations listed are left out,
+        // their results undefined, to find what a driver compiler crashes on.
+        if cfg!(feature = "diagnostics") && ablated(name, opcode) {
+            let ty = if ret == self.t.void { self.t.i32 } else { ret };
+            return self.m.undef(ty);
+        }
+        // Diagnostics (`VICTORY_SPLIT_FMAD=1`): FMad as a multiply and an
+        // add (which DXIL's FMad allows), to see if AMD's compiler crashes
+        // on its multiply-adds.
+        if cfg!(feature = "diagnostics")
+            && opcode == 46
+            && name.starts_with("tertiary")
+            && args.len() == 3
+            && std::env::var_os("VICTORY_SPLIT_FMAD").is_some()
+        {
+            use super::bitcode::Bin;
+            let m = self.m.bin(block, Bin::Mul, args[0], args[1]);
+            return self.m.bin(block, Bin::Add, m, args[2]);
+        }
         let mut params = vec![self.t.i32];
         params.extend(args.iter().map(|&a| self.m.type_of(a)));
         let fty = self.m.func_ty(ret, params);
@@ -694,6 +713,23 @@ impl Shader {
         // Entry properties: shader flags (tag 0), geometry state (1),
         // thread-group size (4), wave size (11).
         let mut props = Vec::new();
+        // Diagnostics: `VICTORY_DXIL_FLAGS_OR=<bits>` adds shader flags
+        // (1: skip optimizations), `VICTORY_NO_WAVE_SIZE=1` leaves out the
+        // wave size, to see what a driver compiler takes another path on.
+        if cfg!(feature = "diagnostics") {
+            if let Some(bits) = std::env::var("VICTORY_DXIL_FLAGS_OR").ok().and_then(|v| {
+                let v = v.trim();
+                match v.strip_prefix("0x") {
+                    Some(h) => u64::from_str_radix(h, 16).ok(),
+                    None => v.parse().ok(),
+                }
+            }) {
+                self.flags |= bits;
+            }
+            if std::env::var_os("VICTORY_NO_WAVE_SIZE").is_some() {
+                self.wave_size = None;
+            }
+        }
         if self.flags != 0 {
             props.push(i32c(&mut self, 0));
             let i64t = self.m.int(64);
@@ -887,4 +923,54 @@ impl Shader {
         }
         Some(self.m.md_node(list))
     }
+}
+
+/// Operations `VICTORY_ABLATE` matched so far (diagnostics).
+static ABLATE_MATCHES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many operations `VICTORY_ABLATE` has matched (diagnostics).
+pub fn ablate_matches() -> usize {
+    ABLATE_MATCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether `VICTORY_ABLATE` lists this operation (diagnostics). Entries,
+/// comma separated: `unary` (a name prefix, as `unary.f32`), `unary:24`
+/// (a prefix and an opcode) or `@24` (an opcode of any name).
+/// `VICTORY_ABLATE_RANGE=a-b` leaves out only the matches numbered a to
+/// b-1 (counted from 0 in the order they are emitted).
+fn ablated(name: &str, opcode: u32) -> bool {
+    static LIST: std::sync::OnceLock<(Vec<(String, Option<u32>)>, Option<(usize, usize)>)> =
+        std::sync::OnceLock::new();
+    let (list, range) = LIST.get_or_init(|| {
+        let list = std::env::var("VICTORY_ABLATE")
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once(':') {
+                Some((n, o)) => (n.to_owned(), o.trim().parse().ok()),
+                None => match p.strip_prefix('@') {
+                    Some(o) => (String::new(), o.trim().parse().ok()),
+                    None => (p.to_owned(), None),
+                },
+            })
+            .collect();
+        let range = std::env::var("VICTORY_ABLATE_RANGE").ok().and_then(|r| {
+            let (a, b) = r.split_once('-')?;
+            Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+        });
+        (list, range)
+    });
+    let hit = list
+        .iter()
+        .any(|(n, o)| name.starts_with(n.as_str()) && o.map_or(true, |o| o == opcode));
+    if !hit {
+        return false;
+    }
+    let i = ABLATE_MATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let left_out = range.map_or(true, |(a, b)| i >= a && i < b);
+    if left_out && range.is_some_and(|(a, b)| b - a <= 8) {
+        eprintln!("ablated #{i}: dx.op.{name} opcode {opcode}");
+    }
+    left_out
 }

@@ -525,6 +525,16 @@ impl HostPipeline {
                 CS: code(0),
                 ..Default::default()
             };
+            // Diagnostics: skipped shaders are not made at all (a driver
+            // compiler that crashes on them), and which pipeline a crash was
+            // making.
+            #[cfg(feature = "diagnostics")]
+            if skipped(&shaders) {
+                tracing::info!(?shaders, "host pipeline skipped");
+                return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            tracing::info!(?shaders, "making host pipeline");
             let name = super::library::name("compute", &root_blob, &[&code_bytes(&code(0))], "");
             let made = super::library::pipeline(
                 &name,
@@ -1316,4 +1326,16 @@ mod tests {
         assert_eq!(run_draw(0.6, 1.0), 0, "depth 0.5 outside [0.6, 1.0] must be rejected");
         assert_eq!(run_draw(0.4, 0.6), 255, "depth 0.5 inside [0.4, 0.6] must pass");
     }
+}
+
+/// Whether `shaders` names a shader `VICTORY_SKIP_PIPELINES` lists
+/// (diagnostics): its host pipeline is not made.
+#[cfg(feature = "diagnostics")]
+fn skipped(shaders: &impl std::fmt::Debug) -> bool {
+    let list = std::env::var("VICTORY_SKIP_PIPELINES").unwrap_or_default();
+    let text = format!("{shaders:?}").to_ascii_lowercase();
+    list.split(',')
+        .map(str::trim)
+        .filter(|h| h.len() == 16)
+        .any(|h| text.contains(&h.to_ascii_lowercase()))
 }
