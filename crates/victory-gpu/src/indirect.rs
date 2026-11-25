@@ -56,6 +56,8 @@ RWByteAddressBuffer dst_args : register(u0);
 // records run empty.
 RWByteAddressBuffer budget : register(u1);
 static const uint BUDGET = 1u << 27;
+// The vertices or indices an instance from which a draw record runs empty.
+static const uint MOST_DRAW = 1u << 23;
 // Groups of one dispatch; more run empty.
 static const uint GROUPS = 1u << 20;
 // Each group charges the budget once: the costs of its records go here,
@@ -99,22 +101,24 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
         uint count = min(want.x, 1u << 24);
         uint instances = min(want.y, (1u << 26) / max(count, 1u));
         cost = count * instances;
+        // A record that asks for MOST_DRAW vertices or indices an instance
+        // or more is no draw of the title's (no mesh of a console title has
+        // 2.8 million triangles): it runs empty and charges nothing. Run
+        // 206's window check found one list with 90 draws of 2^24 vertices
+        // and one instance each. Clamped one draw at a time, the list's
+        // budget lets eight of them run (2^27 in all) and empties the other
+        // 82; served from a window, whose records are charged once however
+        // often they are drawn, all 90 ran: 1.5 thousand million vertices
+        // in one list, with windows on in the runs that lost the device
+        // (201, 204).
+        if (count >= MOST_DRAW) {
+            count = 0;
+            instances = 0;
+            cost = 0;
+        }
         draw_counts = uint2(count, instances);
     } else if (active && kind == 2) {
-        uint3 asked = src_args.Load3(src_at);
-        // Diagnostics, in the budget buffer's words after the mesh ones:
-        // the largest x a compute record asked for, and the records that
-        // asked for more groups in x than one dispatch runs (they are cut
-        // to 65,535 below, so the groups past it never run). Not the
-        // garbage of a slot nothing wrote.
-        if (asked.x <= (1u << 24) && asked.y <= 64u && asked.z <= 64u) {
-            uint noted;
-            budget.InterlockedMax(12, asked.x, noted);
-            if (asked.x > 65535u) {
-                budget.InterlockedAdd(16, 1u, noted);
-            }
-        }
-        uint3 g = min(asked, uint3(65535u, 65535u, 65535u));
+        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
         // x * y fits 32 bits; the whole count may not.
         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
             g = uint3(0, 0, 0);
@@ -1462,9 +1466,11 @@ void main() {
 
         let mut initial_src = vec![0u8; total_bytes];
         for i in 0..RECORDS as usize {
+            // The first record is no draw (2^24 indices): it runs empty
+            // and charges nothing.
             let words: [u32; 6] = [
-                u32::MAX,                    // IndexCount -> clamps to 1 << 24
-                u32::MAX,                    // InstanceCount -> clamps to 4 (cost = 1 << 26)
+                if i == 0 { 1 << 24 } else { 1 << 22 }, // IndexCount
+                if i == 0 { 1 } else { u32::MAX }, // InstanceCount -> clamps to 16 (cost = 1 << 26)
                 1000 + i as u32,             // StartIndexLocation
                 (-200i32 + i as i32) as u32, // BaseVertexLocation
                 5000 + i as u32,             // StartInstanceLocation
@@ -1529,7 +1535,8 @@ void main() {
         let mut zeroed = 0usize;
         for i in 0..RECORDS as usize {
             let rec = &out_words[i * 6..(i + 1) * 6];
-            if rec[0] == (1 << 24) && rec[1] == 4 {
+            if rec[0] == (1 << 22) && rec[1] == 16 {
+                assert!(i == 1 || i == 2, "the first two real draws fit the budget");
                 kept += 1;
             } else {
                 assert_eq!((rec[0], rec[1]), (0, 0), "excess draw must be zeroed");
