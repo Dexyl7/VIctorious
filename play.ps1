@@ -1,6 +1,6 @@
 # Runs the game with the crash skip list and one set of the fork's speed
 # switches; the log goes to play_<Mode>.txt. Network off first.
-param([ValidateSet("default", "relay", "relay1", "relay1card", "relaysafe", "fast", "fast2", "fast3", "smooth", "fast2si", "fast2mc", "fast2debug", "latewait", "both")][string]$Mode = "default")
+param([ValidateSet("default", "relay", "relay1", "relay1card", "relaysafe", "fast", "fast2", "fast3", "smooth", "fast2si", "fast2mc", "fast2debug", "latewait", "both")][string]$Mode = "default", [int]$StageMs = 80)
 Set-Location C:\VIctory3
 $speed = @("VICTORY_RELAY", "VICTORY_LATE_WAIT", "VICTORY_WIDE_BACK", "VICTORY_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MB",
            "VICTORY_PIPELINE_WORKERS", "VICTORY_ABLATE", "VICTORY_ABLATE_RANGE", "VICTORY_DXIL_FLAGS_OR",
@@ -22,7 +22,7 @@ if ($Mode -in @("latewait", "both")) {
 }
 $env:VICTORY_D3D12_DRED = "1"
 if ($Mode -in @("fast3", "smooth")) { $env:VICTORY_TEXTURE_NO_WAIT = "1" }
-if ($Mode -eq "smooth") { $env:VICTORY_TEXTURE_STAGE_MS = "80"; $env:VICTORY_TEXTURE_CATCHUP = "0" }
+if ($Mode -eq "smooth") { $env:VICTORY_TEXTURE_STAGE_MS = "$StageMs"; $env:VICTORY_TEXTURE_CATCHUP = "0" }
 if ($Mode -eq "fast2mc") { $env:VICTORY_MERGE_CARD_ONLY = "1" }
 if ($Mode -eq "fast2si") { $env:VICTORY_SETTLE_INDIRECT = "1" }
 if ($Mode -eq "fast2debug") { $env:VICTORY_D3D12_DEBUG = "1"; $env:VICTORY_D3D12_GBV = "1" }

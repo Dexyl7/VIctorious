@@ -904,7 +904,36 @@ pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()
 /// place is under way and none begins ([`title_memory_reading`]). Taken
 /// around the whole change, the unmapping and the mapping again.
 pub fn title_memory_remapping() -> Remapping {
-    Remapping(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
+    let started = std::time::Instant::now();
+    let guard = MAPPING.write().unwrap_or_else(|e| e.into_inner());
+    remap_waited(started.elapsed());
+    Remapping(guard)
+}
+
+/// Diagnostics: the time the runtime's mapping changes waited for reads of
+/// title memory in place to end, summed and logged every 5 s.
+fn remap_waited(waited: std::time::Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static WAITED: AtomicU64 = AtomicU64::new(0);
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    static LONGEST: AtomicU64 = AtomicU64::new(0);
+    static SINCE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let ns = waited.as_nanos() as u64;
+    WAITED.fetch_add(ns, Ordering::Relaxed);
+    COUNT.fetch_add(1, Ordering::Relaxed);
+    LONGEST.fetch_max(ns, Ordering::Relaxed);
+    let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    let start = *since.get_or_insert_with(std::time::Instant::now);
+    if start.elapsed().as_secs() >= 5 {
+        let secs = start.elapsed().as_secs_f64();
+        tracing::info!(
+            changes = COUNT.swap(0, Ordering::Relaxed),
+            waited_ms_per_s = format_args!("{:.1}", WAITED.swap(0, Ordering::Relaxed) as f64 / 1e6 / secs),
+            longest_ms = format_args!("{:.1}", LONGEST.swap(0, Ordering::Relaxed) as f64 / 1e6),
+            "mapping changes of title memory: their wait for reads in place, last {secs:.1} s"
+        );
+        *since = None;
+    }
 }
 
 /// What a read of title memory in place holds ([`title_memory_reading`]).
@@ -933,14 +962,20 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    let t = std::time::Instant::now();
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
+    let t = remap_part(0, t);
     // The views the runtime told us of there are no longer what it shows.
     crate::inplace::views_gone(at, len);
+    let t = remap_part(1, t);
     // And nothing stays in place over it.
     crate::inplace::title_memory_freeing(at, len);
+    let t = remap_part(2, t);
     let mut g = guards();
+    let t = remap_part(3, t);
+    let _rest = RemapRest(t);
     let range = at / BLOCK..at.saturating_add(len).div_ceil(BLOCK);
     let absent: Vec<usize> = g.absent.range(range.clone()).copied().collect();
     for block in absent {
@@ -955,6 +990,31 @@ pub fn title_memory_remapped(at: usize, len: usize) {
     for block in aliased {
         g.aliased.remove(&block);
     }
+}
+
+/// Diagnostics: nanoseconds in the parts of [`title_memory_remapped`],
+/// summed: descriptors, views, in place, the guards' lock, the guards.
+/// Taken (and zeroed) by [`take_remap_parts`].
+static REMAP_PARTS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
+fn remap_part(i: usize, since: std::time::Instant) -> std::time::Instant {
+    let now = std::time::Instant::now();
+    REMAP_PARTS[i].fetch_add((now - since).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    now
+}
+
+/// Counts the rest of [`title_memory_remapped`] when dropped.
+struct RemapRest(std::time::Instant);
+
+impl Drop for RemapRest {
+    fn drop(&mut self) {
+        remap_part(4, self.0);
+    }
+}
+
+/// The parts of [`title_memory_remapped`] since last asked, in ns.
+pub fn take_remap_parts() -> [u64; 5] {
+    std::array::from_fn(|i| REMAP_PARTS[i].swap(0, std::sync::atomic::Ordering::Relaxed))
 }
 
 /// Registers the handler that takes writes to guarded blocks, once, ahead

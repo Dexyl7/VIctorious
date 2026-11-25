@@ -4274,6 +4274,34 @@ impl<'a> Lower<'a> {
         )
     }
 
+    /// Whether a read of another lane of this lane's quad goes through quad
+    /// reads, which reach helper lanes: in a pixel shader, always (unless
+    /// `VICTORY_QUAD_HELPERS=0`). At a triangle's edge the quad's other
+    /// pixels are helpers, which wave reads leave out (0 on AMD): a
+    /// derivative taken by hand was then the whole value, the texture read
+    /// that used it took its smallest level, and triangle edges showed as
+    /// lines on car paint, glass and skin. (Belobug's AMD fork, 03629f3.)
+    fn helpers_read(&self, quad: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        quad && self.s.pixel && *ON.get_or_init(|| std::env::var_os("VICTORY_QUAD_HELPERS").is_none_or(|v| v != "0"))
+    }
+
+    /// `v_readfirstlane_b32`'s result `first` of `own` in a pixel shader: a
+    /// helper lane takes its own value (upstream 0601955; Belobug's AMD fork,
+    /// f520772). Wave reads leave helper lanes out: once only helpers are
+    /// left in a waterfall loop the read gives no lane, none matches, and
+    /// the loop runs to its limit with whatever descriptor that gave. With
+    /// its own value a helper matches at once; it only feeds derivatives.
+    /// `VICTORY_QUAD_HELPERS=0` leaves it as before.
+    fn helper_reads_own(&mut self, own: V, first: V) -> V {
+        if !self.helpers_read(true) {
+            return first;
+        }
+        let c = self.cur;
+        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
+        self.s.m.select(c, helper, own, first)
+    }
+
     /// `x` of lane `src` (in this lane's quad) through quad reads, whose
     /// lane must be a constant.
     fn quad_pick(&mut self, x: V, src: V) -> V {
@@ -4418,7 +4446,7 @@ impl<'a> Lower<'a> {
                 let t = self.s.m.bin(c, Bin::Or, t, or);
                 self.s.m.bin(c, Bin::Xor, t, xor)
             };
-            let r = if mesh_quad {
+            let r = if mesh_quad || self.helpers_read(quad) {
                 self.quad_pick(x, src)
             } else {
                 self.read_lane(x, src)
@@ -6748,7 +6776,7 @@ impl<'a> Lower<'a> {
                 (src, inside, masks, bound_ctrl)
             }
         };
-        let mut r = if mesh_quad {
+        let mut r = if mesh_quad || self.helpers_read(quad) {
             self.quad_pick(x, src)
         } else {
             self.read_lane(x, src)
@@ -7640,7 +7668,7 @@ impl<'a> Lower<'a> {
                         self.s.m.select(c, in_lo, lo, hi)
                     }
                 } else {
-                    mine
+                    self.helper_reads_own(a, mine)
                 };
                 int(self, r)
             }

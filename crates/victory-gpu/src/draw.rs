@@ -2081,6 +2081,42 @@ impl State {
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+        // The least indirect light after the program that resolves it; its
+        // pass sets heaps, root signature and pipeline of its own, so the
+        // title's are set again by the next draw or dispatch.
+        if self.ambient(list, p) {
+            self.host_pipeline = 0;
+            self.host_roots = [0; 2];
+            self.host_heaps = [0; 2];
+        }
+    }
+
+    /// After a dispatch of `p`: the least indirect light, if it is the
+    /// program that resolves that ([`crate::ambient`]; Belobug's AMD fork).
+    fn ambient(&self, list: &HostList, p: &HostPipeline) -> bool {
+        let Some(stage) = p.stages.first().filter(|s| s.shader.resolves_light) else {
+            return false;
+        };
+        let (slot, offset) = crate::ambient::LIGHT;
+        let found = stage.translated().used.iter().any(|u| {
+            u.kind == ResourceType::Uav
+                && u.root == RootType::Table
+                && (u.slot, u.table_offset_dwords) == (slot, offset)
+        });
+        let light = match self.roots_ref(true).get(usize::from(slot)) {
+            Some(&Root::Table(table)) if found => {
+                match crate::descriptor::view(table + u64::from(offset) * 4) {
+                    Some(View::Unordered(r, ..)) => r,
+                    _ => 0,
+                }
+            }
+            _ => 0,
+        };
+        if light == 0 {
+            once!("no ambient light: other tables");
+            return false;
+        }
+        crate::ambient::raise(list, light as This)
     }
 
     /// What a draw or dispatch runs, for the device-removed report
