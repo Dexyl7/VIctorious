@@ -2100,6 +2100,15 @@ fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = 
     *ranges = out;
 }
 
+/// `VICTORY_SETTLE_INDIRECT=1` (see where it is read).
+fn settle_indirect() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_INDIRECT").is_some_and(|v| v != "0"))
+}
+
+/// Settles for [`settle_indirect`] since the start.
+pub(crate) static SETTLED_INDIRECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Whether anything is in the air.
 fn flying() -> bool {
     if !late() {
@@ -4161,6 +4170,21 @@ impl Host {
             }
         } else if behind && stale_under_flights(runs) {
             let settling = std::time::Instant::now();
+            self.settle(&mut submitted, WHY_STALE);
+            settled += settling.elapsed();
+        }
+        // Experiment (`VICTORY_SETTLE_INDIRECT=1`): a submission with
+        // indirect executions goes behind no flights, so the arguments and
+        // descriptors it reads out of title memory are the ones the flights
+        // before it left (on AMD with `VICTORY_LATE_WAIT=2` an indirect
+        // dispatch read a garbage address otherwise).
+        if behind
+            && flying()
+            && settle_indirect()
+            && runs.iter().any(|l| l.indirect_args.lock().unwrap_or_else(|e| e.into_inner()).is_some())
+        {
+            let settling = std::time::Instant::now();
+            SETTLED_INDIRECT.fetch_add(1, Ordering::Relaxed);
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
