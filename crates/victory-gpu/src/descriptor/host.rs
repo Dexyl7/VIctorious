@@ -2242,10 +2242,20 @@ fn raw_own_only(start: u64) -> bool {
 /// ones are left null by default: with them made, the title overran a stack
 /// buffer just before the prologue's boat (a size it read had become real).
 fn raw_own_copy(unordered: bool) -> bool {
-    match std::env::var("VICTORY_RAW_OWN_COPY").ok().as_deref().map(str::trim) {
-        Some("0") => false,
-        Some("srv") => !unordered,
-        Some("1" | "all") => true,
+    // Read once: asked per view, and reading the environment takes the
+    // process's lock for it (2.5 s of the recording threads in a
+    // three-minute profile).
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_RAW_OWN_COPY").ok().as_deref().map(str::trim) {
+        Some("0") => 0,
+        Some("srv") => 1,
+        Some("1" | "all") => 2,
+        _ => 3,
+    });
+    match mode {
+        0 => false,
+        1 => !unordered,
+        2 => true,
         _ => unordered,
     }
 }

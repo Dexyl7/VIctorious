@@ -210,7 +210,7 @@ pub(crate) fn retire<T: 'static>(object: T) {
     let started = STARTED.load(Ordering::Acquire);
     if started <= FINISHED.load(Ordering::Acquire) {
         RETIREMENTS[0].fetch_add(1, Ordering::Relaxed);
-        drop(object);
+        reap(vec![Retired(Box::new(object))]);
         return;
     }
     RETIREMENTS[1].fetch_add(1, Ordering::Relaxed);
@@ -233,7 +233,45 @@ fn bury(finished: u64) {
         *retired = keep;
         done
     };
-    drop(done);
+    reap(done.into_iter().map(|(_, r)| r).collect());
+}
+
+/// Drops what [`retire`] let go, on a thread of its own
+/// (`victory-reaper`) unless `VICTORY_REAPER=0`. Destroying a host texture
+/// is a kernel call (the allocation goes): in a gameplay profile the
+/// title's render thread spent 11 ms of every 156 ms frame in it, through
+/// `resource::let_go_idle` under its submissions. What is retired has
+/// finished on the card already; when it goes changes nothing else.
+fn reap(objects: Vec<Retired>) {
+    if objects.is_empty() {
+        return;
+    }
+    static REAPER: OnceLock<Option<std::sync::mpsc::Sender<Vec<Retired>>>> = OnceLock::new();
+    let reaper = REAPER.get_or_init(|| {
+        if std::env::var_os("VICTORY_REAPER").is_some_and(|v| v == "0") {
+            return None;
+        }
+        let (send, receive) = std::sync::mpsc::channel::<Vec<Retired>>();
+        std::thread::Builder::new()
+            .name("victory-reaper".into())
+            .spawn(move || {
+                for objects in receive {
+                    drop(objects);
+                }
+            })
+            .inspect_err(|e| tracing::warn!(error = %e, "no reaper thread: retired objects are dropped where they are let go"))
+            .ok()
+            .map(|_| send)
+    });
+    match reaper {
+        // A send fails only once the thread is gone: then here.
+        Some(send) => {
+            if let Err(back) = send.send(objects) {
+                drop(back.0);
+            }
+        }
+        None => drop(objects),
+    }
 }
 
 /// Objects [`retire`] dropped at once (no submission was running) and
