@@ -1,3 +1,33 @@
+# VIctorious: VIctory on AMD
+
+**Every shader the title used in play translates, and every compute pipeline builds on an AMD
+Radeon RX 9070 XT** (RDNA 4). No driver compiler crashes, no shader left untranslated, no
+dispatch dropped.
+
+| | Before | Now |
+|---|---|---|
+| Compute shaders that crash AMD's driver compiler | 66+ (skipped, with their effects) | **0** |
+| Shaders that do not translate during play | 1 (the submerged water volumetrics) | **0** |
+| Dispatches dropped without a pipeline | the water volumetrics, whenever it ran | **0** |
+| Frame rate in the world | ~3.7 fps | **5–8 fps** (up to ~10) |
+| Fastest mode (`fast2`) without a device loss | a few minutes | **25+ min** |
+
+What made the difference:
+- **AMD's DXIL compiler crash fixed:** buffer-size queries on heap-indexed raw buffers get a
+  handle of their own, marked non-uniform (after Kyle's commit in fork PR #697).
+- **A new translator case for 64-lane hosts:** lane masks holding lanes outside EXEC are read as
+  ballots taken where every lane runs, exact on a host whose wave is the console's. The water
+  volumetrics compute translates for the first time on any card.
+- **GPU results no longer dropped:** writable raw buffer views that do not start on 16 bytes get
+  a copy of their own instead of being left null.
+- Faster: fork PRs #665 (copy queue for the relay) and #220 (cheaper indirect draws), relay stage 2,
+  and the two AMD-faulting culling shaders skipped.
+
+Details, switches, scripts and what is still open: **[AMD.md](AMD.md)**.
+Tested on: RX 9070 XT 16 GB, Adrenalin 26.11.2, Ryzen 7 9800X3D, 32 GB, Windows 11.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

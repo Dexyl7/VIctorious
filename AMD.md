@@ -5,11 +5,20 @@ Private working branch on top of [fxceless/victory-fork](https://github.com/fxce
 tested on an **RX 9070 XT (RDNA 4, 16 GB), Adrenalin 26.11.2, Ryzen 7 9800X3D, 32 GB, Windows 11**.
 No game files, logs or dumps are in this repository.
 
+## Highlights
+
+- **0** compute shaders crash AMD's driver compiler (66+ before): the `getDimensions` fix.
+- **0** shaders fail to translate during play, and **0** dispatches are dropped: the
+  native-wave mask fix brings in the water volumetrics, the last one that failed.
+- Writable raw views off 16 bytes now get their own copy, instead of silently losing every
+  shader write through them.
+
 ## Status
 
 | | |
 |---|---|
 | Driver compiler crashes (`amdxc64.dll+0x861b9f`) | **fixed**: every compute pipeline of the title builds |
+| Shader translation in play | **every shader used translates**; no dispatch dropped |
 | Stable mode | `fast`: ~6 fps in the world |
 | Fast mode | `fast2`: 5–8 fps, up to ~10 in light scenes, 25+ min with no device loss |
 | Furthest point | the first boat mission: the boat sinks and the player cannot swim (open, see below) |
