@@ -194,6 +194,8 @@ fn card_limits() -> (u64, u64) {
 fn merge_card_only() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_CARD_ONLY").is_some_and(|v| v != "0"))
+}
+
 /// Title buffers' host copies made since the start, by where they went
 /// and by size: in the card's memory; in the PC's memory of 64 KiB (the
 /// least a copy is), up to 256 KiB, up to 1 MiB, larger; each as (copies,
