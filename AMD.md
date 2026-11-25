@@ -1,6 +1,7 @@
 # AMD notes (`amd-work` branch)
 
-Private working branch on top of [fxceless/victory-fork](https://github.com/fxceless/victory-fork),
+Private working branch on top of [fxceless/victory-fork](https://github.com/fxceless/victory-fork)
+(merged up to its commit `9376fd6`),
 tested on an **RX 9070 XT (RDNA 4, 16 GB), Adrenalin 26.11.2, Ryzen 7 9800X3D, 32 GB, Windows 11**.
 No game files, logs or dumps are in this repository.
 
@@ -51,6 +52,28 @@ sibling) page-fault in their indirect dispatch on AMD (fork issue #3). `play.ps1
 | `VICTORY_TRANSLATE_ONLY` / `_SKIP` / `_SKIP_FILE` / `_NAME` / `_CS_ONLY` / `_TRACE` | `translate` filters and tracing |
 | `VICTORY_FAKE_STORE_HASH=h,...` + `VICTORY_FAKE_STORE_VALUE=f` | those shaders' raw buffer stores, texture stores and pixel outputs write a fixed value (does a GPU result reach the title?) |
 | `VICTORY_SETTLE_INDIRECT=1`, `VICTORY_MERGE_CARD_ONLY=1` | relay stage-2 experiments |
+
+## Play modes (`play.ps1 -Mode …`)
+
+| Mode | Switches | Result here |
+|---|---|---|
+| `default` | the fork's defaults (relay stage 2, late wait stage 3) | faults on AMD in the `_Prev` culling dispatch without the skips |
+| `fast` | `VICTORY_RELAY=1`, `VICTORY_LATE_WAIT=1`, `VICTORY_WIDE_MERGE=1`, `VICTORY_INDIRECT_WINDOW=1` | stable, ~6 fps |
+| `fast2` | as `fast` with `VICTORY_LATE_WAIT=2` | 5–8 fps (up to ~10); stable with the two culling shaders skipped |
+| `fast2debug` | `fast2` with the D3D12 debug layer and GPU-based validation | too slow: the title gives up while loading |
+
+Every mode turns on DRED (`VICTORY_D3D12_DRED=1`) and skips the shaders in `crashers_list.txt`.
+
+## Warming the shader cache
+
+Translates every shader of the pack into the run's cache ahead of play (about 3–4 minutes; the
+host values are what a run's log reports for this card):
+
+```powershell
+$env:VICTORY_HOST_WAVE = "64"
+$env:VICTORY_VIEW_LIMIT = "2097152"
+.\target\diag\victory.exe translate --warm all --jobs 16 "<the title's shaders.rpf>"
+```
 
 ## Scripts
 
