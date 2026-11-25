@@ -159,6 +159,12 @@ fn card_limits() -> (u64, u64) {
     })
 }
 
+/// `VICTORY_MERGE_CARD_ONLY=1` (see where it is read).
+fn merge_card_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MERGE_CARD_ONLY").is_some_and(|v| v != "0"))
+}
+
 /// Bytes alive of copies' card sides, and of their "before" twins.
 static CARD_BYTES: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -2747,6 +2753,14 @@ impl Shadow {
                         MERGED[2].fetch_add(m as u64, Ordering::Relaxed);
                     }
                 } else {
+                    // Experiment (`VICTORY_MERGE_CARD_ONLY=1`): a copy the
+                    // card reads in place is not written under a flight
+                    // that may still read it; the flights are settled
+                    // instead (on AMD an indirect dispatch read a garbage
+                    // address with the title's newer bytes put in early).
+                    if merge_card_only() {
+                        return true;
+                    }
                     let Some(snapshot) = before.as_mut() else {
                         return true;
                     };
