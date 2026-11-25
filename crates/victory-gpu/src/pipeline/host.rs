@@ -1099,6 +1099,12 @@ mod tests {
             eprintln!("no host depth bounds support; skipped");
             return;
         }
+        // GitHub's runners have no card: the software adapter reports depth
+        // bounds but passes every fragment (also without this fork's changes).
+        if std::env::var_os("GITHUB_ACTIONS").is_some() {
+            eprintln!("hosted runner (software adapter); skipped");
+            return;
+        }
         let Some(dxc) = dxc() else {
             eprintln!("no PC dxc.exe; skipped");
             return;
