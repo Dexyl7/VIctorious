@@ -16,7 +16,7 @@
 //! indexed heaps keep what their first use copied.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use windows::Win32::Graphics::Direct3D12::ID3D12Resource;
@@ -99,6 +99,18 @@ struct Card {
     /// ([`card_dirty`]), kept until a fetch sent after it has been merged.
     /// Locked inside `dirty`'s lock.
     sent: Mutex<Vec<(usize, usize, u64)>>,
+    /// With `crate::inplace::feed`: offsets `[from, to)` of the copy the
+    /// card fills itself before the next submission, from `offset` of a
+    /// committed section: `(from, to, section, offset)`. Never overlaps
+    /// `dirty` (each takes its ranges out of the other). Locked inside
+    /// `dirty`'s lock.
+    fed: Mutex<Vec<(usize, usize, usize, u64)>>,
+    /// Some of the copy was fed: the CPU's side is not what the card's
+    /// side holds there.
+    fed_ever: AtomicBool,
+    /// Shaders declared writes to the copy: it is fed no more (merges
+    /// take the CPU's side for what the card held).
+    no_feed: AtomicBool,
     /// The buffers' bytes (the title buffer's, rounded up to 64 KiB).
     size: u64,
 }
@@ -400,6 +412,79 @@ pub(crate) fn card_dirty(sent_as: u64) -> Vec<(Arc<Shadow>, Vec<(usize, usize)>)
         }
         true
     });
+    out
+}
+
+/// Takes `[from, to)` out of `ranges`.
+fn cut_ranges(ranges: &mut Vec<(usize, usize)>, from: usize, to: usize) {
+    if !ranges.iter().any(|&(a, b)| a < to && b > from) {
+        return;
+    }
+    let mut out = Vec::with_capacity(ranges.len() + 1);
+    for &(a, b) in ranges.iter() {
+        if b <= from || a >= to {
+            out.push((a, b));
+            continue;
+        }
+        if a < from {
+            out.push((a, from));
+        }
+        if b > to {
+            out.push((to, b));
+        }
+    }
+    *ranges = out;
+}
+
+/// Takes `[from, to)` out of fed runs (a cut run keeps its place in its
+/// section).
+fn cut_fed(fed: &mut Vec<(usize, usize, usize, u64)>, from: usize, to: usize) {
+    if !fed.iter().any(|&(a, b, ..)| a < to && b > from) {
+        return;
+    }
+    let mut out = Vec::with_capacity(fed.len() + 1);
+    for &(a, b, section, offset) in fed.iter() {
+        if b <= from || a >= to {
+            out.push((a, b, section, offset));
+            continue;
+        }
+        if a < from {
+            out.push((a, from, section, offset));
+        }
+        if b > to {
+            out.push((to, b, section, offset + (to - a) as u64));
+        }
+    }
+    *fed = out;
+}
+
+/// With `crate::inplace::feed`: the runs the card is to copy from title
+/// sections into copies in its memory before the next submission, by
+/// copy, taken (`(from, to, section, offset)`).
+pub(crate) fn card_fed() -> Vec<(Arc<Shadow>, Vec<(usize, usize, usize, u64)>)> {
+    if !crate::inplace::feed() {
+        return Vec::new();
+    }
+    let carded = CARDED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = Vec::new();
+    for weak in carded.iter() {
+        let Some(shadow) = weak.upgrade() else {
+            continue;
+        };
+        let Some(card) = &shadow.card else {
+            continue;
+        };
+        if !card.fed_ever.load(Ordering::Relaxed) {
+            continue;
+        }
+        let runs = {
+            let _dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::take(&mut *card.fed.lock().unwrap_or_else(|e| e.into_inner()))
+        };
+        if !runs.is_empty() {
+            out.push((shadow, runs));
+        }
+    }
     out
 }
 
@@ -2379,6 +2464,7 @@ impl Shadow {
             return;
         }
         crate::inplace::note_shader_written(self.id);
+        self.stop_feeding();
         // In the card's memory: no snapshot. What shaders wrote is found on
         // the card (`Host::card_before` reads the declared ranges from the
         // lists).
@@ -3158,6 +3244,11 @@ impl Shadow {
     fn copy(&self, from: usize, to: usize) -> usize {
         let (start, end) = (self.start as usize, (self.start + self.len) as usize);
         let (from, to) = (from.max(start), to.min(end));
+        if from < to && self.feed(from, to) {
+            crate::inplace::note_copied(self.id, self.start, self.len, self.window, to - from, true);
+            self.changed(from - start, to - start);
+            return to - from;
+        }
         // SAFETY: inside the mapping (`from` and `to` are within the buffer).
         let at = unsafe { self.data.add(from - start) };
         crate::host::copy_mapped(at, from as *const u8, to - from, false);
@@ -3184,10 +3275,82 @@ impl Shadow {
             return;
         }
         let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        if card.fed_ever.load(Ordering::Relaxed) {
+            cut_fed(&mut card.fed.lock().unwrap_or_else(|e| e.into_inner()), from, to);
+        }
         match dirty.last_mut() {
             Some(last) if from <= last.1 && to >= last.0 => *last = (last.0.min(from), last.1.max(to)),
             _ => dirty.push((from, to)),
         }
+    }
+
+    /// With `crate::inplace::feed`: title memory `[from, to)` (inside the
+    /// buffer) goes to the card's side by the card's own copy from the
+    /// title's sections, if this is a copy in the card's memory that
+    /// shaders never wrote and all of it is view memory of committed
+    /// sections. Whether it was taken so.
+    fn feed(&self, from: usize, to: usize) -> bool {
+        let Some(card) = &self.card else {
+            return false;
+        };
+        if !crate::inplace::feed() || card.no_feed.load(Ordering::Relaxed) {
+            return false;
+        }
+        let Some(runs) = crate::inplace::section_runs(from, to - from) else {
+            return false;
+        };
+        let start = self.start as usize;
+        let (lo, hi) = (from - start, to - start);
+        let mut dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+        // Checked again under the lock `writing` takes it in.
+        if card.no_feed.load(Ordering::Relaxed) {
+            return false;
+        }
+        cut_ranges(&mut dirty, lo, hi);
+        let mut fed = card.fed.lock().unwrap_or_else(|e| e.into_inner());
+        cut_fed(&mut fed, lo, hi);
+        let mut at = lo;
+        for (section, offset, n) in runs {
+            fed.push((at, at + n, section, offset));
+            at += n;
+        }
+        card.fed_ever.store(true, Ordering::Relaxed);
+        crate::inplace::FED[0].fetch_add((hi - lo) as u64, Ordering::Relaxed);
+        true
+    }
+
+    /// Offsets `[from, to)` of the copy from title memory into the CPU's
+    /// side, nothing else (a fed run whose section the card cannot read).
+    pub(crate) fn refill_cpu(&self, from: usize, to: usize) {
+        let to = to.min(self.len as usize);
+        if from >= to {
+            return;
+        }
+        // SAFETY: inside the mapping and inside the title buffer.
+        unsafe { crate::host::copy_mapped(self.data.add(from), (self.start as usize + from) as *const u8, to - from, false) };
+    }
+
+    /// Shaders are to write this copy: it is fed no more, and if any of it
+    /// was fed the CPU's side takes all of title memory now and goes up
+    /// whole (a merge takes the CPU's side for what the card held).
+    fn stop_feeding(&self) {
+        let Some(card) = &self.card else {
+            return;
+        };
+        {
+            let dirty = card.dirty.lock().unwrap_or_else(|e| e.into_inner());
+            if card.no_feed.swap(true, Ordering::Relaxed) {
+                return;
+            }
+            drop(dirty);
+        }
+        if !card.fed_ever.load(Ordering::Relaxed) {
+            return;
+        }
+        crate::host::copy_mapped(self.data, self.start as usize as *const u8, self.len as usize, false);
+        self.changed(0, self.len as usize);
+        self.card_changed(0, self.len as usize);
+        crate::inplace::FED[2].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
@@ -3566,6 +3729,9 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
+                    fed: Mutex::default(),
+                    fed_ever: AtomicBool::new(false),
+                    no_feed: AtomicBool::new(false),
                     size,
                 };
                 (on_card, Some(card))
@@ -3782,6 +3948,9 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),
+                fed: Mutex::default(),
+                fed_ever: AtomicBool::new(false),
+                no_feed: AtomicBool::new(false),
                 size: len,
             };
             (on_card, Some(card))
@@ -4061,6 +4230,9 @@ mod card_merge_tests {
                 before: Mutex::new(None),
                 dirty: Mutex::default(),
                 sent: Mutex::new(vec![(title_byte, title_byte + 1, 7)]),
+                fed: Mutex::default(),
+                fed_ever: AtomicBool::new(false),
+                no_feed: AtomicBool::new(false),
                 // 0: no card bytes counted (`Drop` takes them off again).
                 size: 0,
             });

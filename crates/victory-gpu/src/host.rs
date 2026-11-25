@@ -4153,6 +4153,7 @@ impl Host {
             None => 0,
         };
         let mut dirty = crate::shadow::card_dirty(sent_as);
+        let fed = crate::shadow::card_fed();
         // With fetches on a copy queue (`crate::queue2`, bit 1 of
         // `VICTORY_QUEUE2`): the send's number is signalled on the direct
         // queue behind the send, so that a fetch knows which sends the card
@@ -4164,7 +4165,7 @@ impl Host {
                 second.sent_up(&self.queue, sent_as);
             }
         };
-        if declared.is_empty() && dirty.is_empty() {
+        if declared.is_empty() && dirty.is_empty() && fed.is_empty() {
             numbered();
             return None;
         }
@@ -4233,7 +4234,7 @@ impl Host {
                 landed = Some(landing);
             }
         }
-        if !dirty.is_empty() {
+        if !dirty.is_empty() || !fed.is_empty() {
             let Some(sync) = work.sync.pop().or_else(|| self.make_prelude()) else {
                 fail(format_args!("no host list to bring host copies in the card's memory up to date"));
             };
@@ -4246,6 +4247,35 @@ impl Host {
                     allocator.Reset()?;
                     list.Reset(allocator, None)?;
                     let timed = crate::cardmeter::begin(list, crate::cardmeter::Kind::Sync);
+                    // Fed copies (`crate::inplace::feed`): the card copies
+                    // title memory from its sections itself. Disjoint from
+                    // `dirty`'s ranges, so the order does not matter.
+                    let mut sections: Vec<(usize, Option<ID3D12Resource>)> = Vec::new();
+                    for (shadow, runs) in &fed {
+                        let Some((staging, _, _)) = shadow.card_sides() else {
+                            continue;
+                        };
+                        for &(a, b, section, offset) in runs {
+                            let source = match sections.iter().find(|s| s.0 == section) {
+                                Some(s) => s.1.clone(),
+                                None => {
+                                    let made = crate::inplace::section_buffer(section);
+                                    sections.push((section, made.clone()));
+                                    made
+                                }
+                            };
+                            match source {
+                                Some(source) => list.CopyBufferRegion(&shadow.buffer, a as u64, &source, offset, (b - a) as u64),
+                                None => {
+                                    // The section cannot be read by the
+                                    // card: through the CPU's side.
+                                    shadow.refill_cpu(a, b);
+                                    list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                }
+                            }
+                            crate::inplace::FED[1].fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
                     // Where the next range lies in the landing buffer.
                     let mut at = 0u64;
                     for (shadow, ranges) in &dirty {
@@ -4314,7 +4344,7 @@ impl Host {
         let mut plan = CardPlan {
             ranges: Vec::new(),
             check: None,
-            _synced: dirty.into_iter().map(|(shadow, _)| shadow).collect(),
+            _synced: dirty.into_iter().map(|(shadow, _)| shadow).chain(fed.into_iter().map(|(shadow, _)| shadow)).collect(),
             lists: used,
             sent_as,
             inflight: false,

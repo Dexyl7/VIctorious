@@ -153,24 +153,97 @@ struct SectionHeap(ID3D12Heap);
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for SectionHeap {}
 
+/// The heap opened on a whole committed section (once per section).
+static HEAPS: Mutex<Vec<(usize, SectionHeap)>> = Mutex::new(Vec::new());
+static BUFFERS: Mutex<Vec<(usize, Option<SectionBuffer>)>> = Mutex::new(Vec::new());
+
+fn section_heap(device: &ID3D12Device, section: usize) -> windows::core::Result<ID3D12Heap> {
+    let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(h) = heaps.iter().find(|h| h.0 == section) {
+        return Ok(h.1.0.clone());
+    }
+    let heap = open(device, From::Section(section))?;
+    tracing::info!(section = format_args!("{section:#x}"), "a section of physical pages opened as one heap");
+    heaps.push((section, SectionHeap(heap.clone())));
+    Ok(heap)
+}
+
+/// Whether host copies in the card's memory that shaders never wrote are
+/// filled by the card itself, copying from the title's committed sections
+/// (`VICTORY_GPU_FEED=1`, needs `VICTORY_POOL_COMMIT=1`): no CPU copy
+/// into the staging side, no upload of it.
+pub(crate) fn feed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_GPU_FEED").is_some_and(|v| v != "0");
+        if on {
+            tracing::info!("host copies in the card's memory that shaders never wrote: the card copies them from title memory itself (VICTORY_GPU_FEED)");
+        }
+        on
+    })
+}
+
+/// Fed bytes and runs, for the frame log.
+pub(crate) static FED: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// `[at, at + len)` of title memory as runs of committed sections:
+/// `(section, offset, bytes)` in address order, or `None` if any of it is
+/// not view memory of a committed section.
+pub(crate) fn section_runs(at: usize, len: usize) -> Option<Vec<(usize, u64, usize)>> {
+    let v = views();
+    let end = at.checked_add(len)?;
+    let mut out: Vec<(usize, u64, usize)> = Vec::new();
+    let mut here = at;
+    while here < end {
+        let (&base, &(bytes, section, offset)) = v.views.range(..=here).next_back()?;
+        if base + bytes <= here {
+            return None;
+        }
+        if !v.sections.iter().any(|s| s.0 == section && s.2) {
+            return None;
+        }
+        let n = (base + bytes).min(end) - here;
+        let off = offset + (here - base) as u64;
+        match out.last_mut() {
+            Some(last) if last.0 == section && last.1 + last.2 as u64 == off => last.2 += n,
+            _ => out.push((section, off, n)),
+        }
+        here += n;
+    }
+    Some(out)
+}
+
+/// A buffer over the whole of a committed section, for the card to copy
+/// from (once per section; `None` if it cannot be opened).
+pub(crate) fn section_buffer(section: usize) -> Option<ID3D12Resource> {
+    let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(b) = buffers.iter().find(|b| b.0 == section) {
+        return b.1.as_ref().map(|b| b.0.clone());
+    }
+    let bytes = views().sections.iter().find(|s| s.0 == section).map(|s| s.1)?;
+    let made = (|| {
+        let host = crate::host::host()?;
+        let heap = section_heap(&host.device, section)
+            .map_err(|e| tracing::warn!(error = %e, "a section could not be opened as a heap: its copies stay on the CPU"))
+            .ok()?;
+        place(&host.device, &heap, 0, bytes)
+            .map_err(|e| tracing::warn!(error = %e, bytes, "no buffer over a section: its copies stay on the CPU"))
+            .ok()
+    })();
+    buffers.push((section, made.clone().map(SectionBuffer)));
+    made
+}
+
+struct SectionBuffer(ID3D12Resource);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for SectionBuffer {}
+
 /// Stage 3 ([`level`] 3): title memory that is one run of a committed
 /// section, `len` bytes from `offset` in it, as a buffer placed in the
 /// section's heap (opened once per section; the heap is the section, so
 /// the title's views may change while it stands: the probe's verdict).
 fn place_in_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
-    static HEAPS: Mutex<Vec<(usize, SectionHeap)>> = Mutex::new(Vec::new());
-    let heap = {
-        let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
-        match heaps.iter().find(|h| h.0 == section) {
-            Some(h) => h.1.0.clone(),
-            None => {
-                let heap = open(device, From::Section(section)).map_err(Some)?;
-                tracing::info!(section = format_args!("{section:#x}"), "a section of physical pages opened as one heap: its runs go in place (VICTORY_INPLACE=3)");
-                heaps.push((section, SectionHeap(heap.clone())));
-                heap
-            }
-        }
-    };
+    let heap = section_heap(device, section).map_err(Some)?;
     let at = offset & !(K64 as u64 - 1);
     let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
     let buffer = place(device, &heap, at, bytes).map_err(Some)?;
@@ -356,6 +429,20 @@ fn views() -> std::sync::MutexGuard<'static, Views> {
 /// The runtime made a section of `bytes` for physical pages; `committed`
 /// if with `SEC_COMMIT` (only such a section can be opened as a heap).
 pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
+    // A handle may be a closed section's again: what was opened on that
+    // one is not this one's.
+    // Retired, not dropped: copies recorded from them may still be on
+    // the card.
+    {
+        let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(i) = heaps.iter().position(|h| h.0 == section) {
+            crate::host::retire(heaps.swap_remove(i));
+        }
+        let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+        while let Some(i) = buffers.iter().position(|b| b.0 == section) {
+            crate::host::retire(buffers.swap_remove(i));
+        }
+    }
     let mut v = views();
     v.sections.retain(|s| s.0 != section);
     v.sections.push((section, bytes, committed));
@@ -1314,6 +1401,22 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
 pub(crate) fn tick() {
     if level() > 0 {
         say();
+    }
+    if feed() {
+        static LAST: AtomicU64 = AtomicU64::new(0);
+        let now = crate::host::now_ms();
+        let last = LAST.load(Ordering::Relaxed);
+        if now >= last + 5_000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+            let (bytes, runs, stopped) = (FED[0].swap(0, Ordering::Relaxed), FED[1].swap(0, Ordering::Relaxed), FED[2].load(Ordering::Relaxed));
+            let frames = crate::frame::current();
+            static FRAMES: AtomicU64 = AtomicU64::new(0);
+            let n = frames.saturating_sub(FRAMES.swap(frames, Ordering::Relaxed)).max(1);
+            tracing::info!(
+                "fed by the card from title sections: {:.1} MB a frame in {} copies a frame; copies fed once and then written by shaders since the start: {stopped}",
+                bytes as f64 / n as f64 / 1048576.0,
+                runs / n
+            );
+        }
     }
     if probe_level() == 0 {
         return;
