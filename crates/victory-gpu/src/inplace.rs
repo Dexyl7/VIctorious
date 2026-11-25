@@ -67,7 +67,9 @@ pub(crate) fn probe_level() -> u8 {
 /// buffers that lies in private memory committed whole is not copied: a
 /// part of the title's allocation is opened as a host heap and the window
 /// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
+/// except the big ones in the card's memory. 3: also title memory that
+/// is one run of a section the runtime made committed
+/// (`VICTORY_POOL_COMMIT=1`), placed in the section's heap.
 ///
 /// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
 /// memory (the page pool) is turned down here: its section is made
@@ -101,8 +103,10 @@ fn most() -> u64 {
 /// In place now: windows and their bytes, title buffers and their bytes;
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+/// because of [`most`]; and what was let go because its memory changed;
+/// then of those placed, since the start, the ones in a section's heap
+/// (stage 3) and their bytes.
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -131,6 +135,50 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// Whether title buffers big enough for a copy in the card's memory are
+/// put in place too (`VICTORY_INPLACE_BIG=1`, with [`level`] 2 or more).
+pub(crate) fn big_too() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_BIG").is_some_and(|v| v != "0"))
+}
+
+/// Whether the runtime made `section` committed (only such a section can
+/// be opened as a heap).
+fn section_committed(section: usize) -> bool {
+    views().sections.iter().any(|s| s.0 == section && s.2)
+}
+
+/// A heap opened on a whole section, kept for every buffer placed in it.
+struct SectionHeap(ID3D12Heap);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for SectionHeap {}
+
+/// Stage 3 ([`level`] 3): title memory that is one run of a committed
+/// section, `len` bytes from `offset` in it, as a buffer placed in the
+/// section's heap (opened once per section; the heap is the section, so
+/// the title's views may change while it stands: the probe's verdict).
+fn place_in_section(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+    static HEAPS: Mutex<Vec<(usize, SectionHeap)>> = Mutex::new(Vec::new());
+    let heap = {
+        let mut heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        match heaps.iter().find(|h| h.0 == section) {
+            Some(h) => h.1.0.clone(),
+            None => {
+                let heap = open(device, From::Section(section)).map_err(Some)?;
+                tracing::info!(section = format_args!("{section:#x}"), "a section of physical pages opened as one heap: its runs go in place (VICTORY_INPLACE=3)");
+                heaps.push((section, SectionHeap(heap.clone())));
+                heap
+            }
+        }
+    };
+    let at = offset & !(K64 as u64 - 1);
+    let bytes = (offset + len.max(1)).next_multiple_of(K64 as u64) - at;
+    let buffer = place(device, &heap, at, bytes).map_err(Some)?;
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (offset - at);
+    Ok(Placed { buffer, heap, gpu, bias: offset - at })
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -138,17 +186,30 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
         return None;
     }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
+    // View memory: known from the runtime without asking Windows. With 3,
+    // one run of a committed section is placed in the section's heap.
+    let run = match cover(start as usize, len as usize) {
+        Cover::None => None,
+        Cover::Run(section, offset) if level() >= 3 && section_committed(section) => Some((section, offset)),
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+    };
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
+    let placed = match run {
+        Some((section, offset)) => place_in_section(&host.device, section, offset, len),
+        None => place_part(&host.device, start, len),
+    };
+    if run.is_some() && placed.is_ok() {
+        STATS[8].fetch_add(1, Ordering::Relaxed);
+        STATS[9].fetch_add(len, Ordering::Relaxed);
+    }
+    match placed {
         Ok(placed) => {
             let at = if window { 0 } else { 2 };
             STATS[at].fetch_add(1, Ordering::Relaxed);
@@ -161,7 +222,14 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
         }
         Err(Some(e)) => {
             if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
+                tracing::warn!(
+                    start = format_args!("{start:#x}"),
+                    len,
+                    window,
+                    in_section = ?run.map(|(s, o)| (format!("{s:#x}"), format!("{o:#x}"))),
+                    error = %e,
+                    "title memory not opened in place: a copy instead"
+                );
             }
             None
         }
@@ -200,7 +268,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; placed in a section's heap since the start: {} of {} MB",
         s[0],
         s[1] >> 20,
         s[2],
@@ -208,7 +276,9 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        s[8],
+        s[9] >> 20
     );
 }
 
@@ -1072,6 +1142,47 @@ fn kind_of(at: usize, len: usize, known: &mut Vec<(usize, usize)>) -> usize {
         mem::MEM_MAPPED => 3,
         _ => 5,
     }
+}
+
+/// Diagnostics (`VICTORY_INPLACE_PROBE` 1 or more): the bytes copies of
+/// title memory refresh, by the kind of memory the copy lies over
+/// ([`KINDS`], told once per copy by its number) and whether it is a window
+/// outside buffers; a line every ten seconds, per frame. What a stage in
+/// place would take off the copying, where the census says only what
+/// exists.
+pub(crate) fn note_copied(id: u64, start: u64, len: u64, window: bool, bytes: usize) {
+    if probe_level() == 0 || bytes == 0 {
+        return;
+    }
+    use std::collections::HashMap;
+    static KIND: Mutex<Option<HashMap<u64, u8>>> = Mutex::new(None);
+    static BYTES: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+    static SINCE: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+    let kind = {
+        let mut known = KIND.lock().unwrap_or_else(|e| e.into_inner());
+        let map = known.get_or_insert_with(HashMap::new);
+        *map.entry(id).or_insert_with(|| kind_of(start as usize, len as usize, &mut Vec::new()) as u8)
+    };
+    BYTES[usize::from(kind) + if window { 6 } else { 0 }].fetch_add(bytes as u64, Ordering::Relaxed);
+    let now = crate::host::now_ms();
+    let frame = crate::frame::current();
+    let mut since = SINCE.lock().unwrap_or_else(|e| e.into_inner());
+    let (at, first) = *since.get_or_insert((now, frame));
+    if now < at + 10_000 {
+        return;
+    }
+    *since = Some((now, frame));
+    drop(since);
+    let frames = frame.saturating_sub(first).max(1) as f64;
+    let mb: Vec<f64> = BYTES.iter().map(|b| b.swap(0, Ordering::Relaxed) as f64 / 1e6 / frames).collect();
+    let part = |o: usize| {
+        KINDS.iter().zip(&mb[o..o + 6]).map(|(k, m)| format!("{k} {m:.1}")).collect::<Vec<_>>().join("; ")
+    };
+    tracing::info!(
+        "in place census, MB copied per frame by memory: title buffers: {}; windows outside buffers: {}",
+        part(0),
+        part(6)
+    );
 }
 
 /// The census lines for `spans` (start, bytes, whether a window outside
