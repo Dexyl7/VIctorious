@@ -2073,6 +2073,40 @@ extern "system" fn wait_value64(this: This, address: u64, comparison: u32, refer
     wait_for(this, address, comparison, reference, true);
 }
 
+/// Measuring only (`VICTORY_TITLE_BARRIERS`: 1, the default, records the
+/// title's barrier groups; 0 leaves them out; `alt` 20 s with, 20 s
+/// without, for an A/B within one run). Without them a shader may read what
+/// another has not finished writing: the picture may break; what it tells
+/// is how much of the card's frame the waits cost.
+#[cfg(windows)]
+fn title_barriers() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = match std::env::var("VICTORY_TITLE_BARRIERS").as_deref() {
+            Ok("0") => 0,
+            Ok("alt") => 2,
+            _ => 1,
+        };
+        if mode != 1 {
+            tracing::info!(mode, "the title's barrier groups left out, for measuring (VICTORY_TITLE_BARRIERS; 2: in turn)");
+        }
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(barriers = on, "the title's barrier groups switched (VICTORY_TITLE_BARRIERS=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// The enhanced barriers `(group count, groups)`: buffer, texture and
 /// global barriers with layouts instead of states. Every host use of a
 /// title texture (clears, copies) moves its host copy to the state it needs
@@ -2089,6 +2123,7 @@ extern "system" fn barrier_groups(this: This, count: u32, _groups: *const u8) {
     }
     #[cfg(windows)]
     if count > 0
+        && title_barriers()
         && let Some(list) = host_list(this)
     {
         use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_BARRIER;
