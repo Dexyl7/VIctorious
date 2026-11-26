@@ -57,18 +57,41 @@ unsafe extern "C" {
 /// Whether copies of title memory into host memory are made in place
 /// (`VICTORY_COPY_PLAIN=1`).
 pub(crate) fn on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| {
-        let on = cfg!(target_arch = "x86_64") && std::env::var_os("VICTORY_COPY_PLAIN").is_some_and(|v| v == "1");
-        if on {
+    // 0 off, 1 on, 2 in turn (`alt`: 20 s on, 20 s off, for an A/B in one run).
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        let mode = if !cfg!(target_arch = "x86_64") {
+            0
+        } else {
+            match std::env::var("VICTORY_COPY_PLAIN").as_deref() {
+                Ok("1") => 1,
+                Ok("alt") => 2,
+                _ => 0,
+            }
+        };
+        if mode != 0 {
             install();
             tracing::info!(
+                alternating = mode == 2,
                 "copies of title memory into host buffers are made in place, with the kernel's copy behind them for a \
                  page that is not there (VICTORY_COPY_PLAIN=1)"
             );
         }
-        on
-    })
+        mode
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(plain = on, "copies in place switched (VICTORY_COPY_PLAIN=alt)");
+            }
+            on
+        }
+    }
 }
 
 /// Copies made in place, their bytes, the copies that met a page that was
