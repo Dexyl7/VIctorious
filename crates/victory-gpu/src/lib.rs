@@ -94,6 +94,10 @@ pub mod signature;
 mod texture;
 #[cfg(windows)]
 mod watch;
+mod kmeter;
+/// Renderer port #2 (avatarmanz): the title's descriptor record stores mark their slots.
+#[cfg(windows)]
+pub mod port_descriptors;
 #[cfg(windows)]
 mod texback;
 

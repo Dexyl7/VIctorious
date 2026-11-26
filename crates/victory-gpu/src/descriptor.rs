@@ -160,6 +160,8 @@ fn shader_slot<'a>(handle: u64) -> Option<(&'a Heap, u32)> {
 /// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    // Renderer port #2: its record is looked at again with the title's own.
+    crate::port_descriptors::mark(handle);
     let Some((heap, index)) = shader_slot(handle) else {
         return;
     };
@@ -222,7 +224,46 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        let mut ranges = written.take(start as usize, end as usize);
+        // Renderer port #2 (`crate::port_descriptors`, `VICTORY_PORT_DESCRIPTORS=1`):
+        // the slots the title's patched record stores and our own calls
+        // marked, in place of the write watch's changed pages; and, as the
+        // fallback, every few frames the watch asked and a few of its pages
+        // looked at whole (a record no mark told of is made there).
+        let port = crate::port_descriptors::adopted(start) && port_turn();
+        let wide = port && wide_reads();
+        let mut ranges = if port {
+            let mut marked: Vec<(usize, usize)> = crate::port_descriptors::take(start)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(first, n)| {
+                    let from = start as usize + first as usize * step as usize;
+                    (from, from + n as usize * step as usize)
+                })
+                .collect();
+            if crate::port_descriptors::ask_due(frame) {
+                let taken = written.take(start as usize, end as usize);
+                crate::port_descriptors::asked(&taken);
+            }
+            for page in crate::port_descriptors::to_check(frame) {
+                let range = (page.max(start as usize), (page + crate::watch::PAGE).min(end as usize));
+                marked.push(range);
+            }
+            // Whole pages (`wide_reads`): a marked run is a few records, and
+            // each run was a read through the kernel of its own (some 6,700
+            // a frame); widened to its pages, the runs join, and a joined
+            // range is read in one go below. The records on a page that
+            // did not change are the ones last seen there: passed over.
+            if wide {
+                let page_mask = crate::watch::PAGE - 1;
+                for range in &mut marked {
+                    range.0 = (range.0 & !page_mask).max(start as usize);
+                    range.1 = ((range.1 + page_mask) & !page_mask).min(end as usize);
+                }
+            }
+            marked
+        } else {
+            written.take(start as usize, end as usize)
+        };
         if check && let Some(held) = pending.remove(&at) {
             // The same pages come back every frame: each byte once.
             ranges.extend(held);
@@ -236,13 +277,37 @@ pub(crate) fn sync_heaps() {
             }
             ranges = joined;
         }
+        if port {
+            // Marked runs and fallback pages may overlap: each byte once.
+            ranges.sort_unstable();
+            let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+            for (a, b) in ranges {
+                match joined.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => joined.push((a, b)),
+                }
+            }
+            ranges = joined;
+        }
         for (range_from, range_end) in ranges {
+            // With `wide`: the range in one read through the kernel, its
+            // pages taken from that below; page by page as before if the
+            // read fails (a page of it unmapped meanwhile).
+            let whole = wide.then(|| {
+                let mut bytes = vec![0u8; range_end - range_from];
+                let began = std::time::Instant::now();
+                let ok = crate::host::read_into(range_from as *const u8, &mut bytes);
+                SYNC_READS[0].fetch_add(1, Relaxed);
+                SYNC_READS[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+                ok.then_some(bytes)
+            }).flatten();
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
-                // A quiet page (`quiet_pages`): held for the next check.
-                if !check && page_at_once() && quiet.get(&page).is_some_and(|&q| q >= QUIET_AFTER) {
+                // A quiet page (`quiet_pages`): held for the next check
+                // (not marked slots: a mark says the slot changed).
+                if !port && !check && page_at_once() && quiet.get(&page).is_some_and(|&q| q >= QUIET_AFTER) {
                     let held = pending.entry(at).or_default();
                     if !held.contains(&(from, to)) {
                         held.push((from, to));
@@ -254,8 +319,19 @@ pub(crate) fn sync_heaps() {
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
-                page_bytes.resize(to - from, 0);
-                if crate::host::read_into(from as *const u8, &mut page_bytes) {
+                let read = if let Some(whole) = &whole {
+                    page_bytes.clear();
+                    page_bytes.extend_from_slice(&whole[from - range_from..to - range_from]);
+                    true
+                } else {
+                    page_bytes.resize(to - from, 0);
+                    let began = std::time::Instant::now();
+                    let ok = crate::host::read_into(from as *const u8, &mut page_bytes);
+                    SYNC_READS[0].fetch_add(1, Relaxed);
+                    SYNC_READS[1].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
+                    ok
+                };
+                if read {
                     pages += 1;
                     let slots = changed_slots(from, to, start as usize, step, mirrored_count);
                     // The page's records in one go, under one lock
@@ -333,7 +409,9 @@ pub(crate) fn sync_heaps() {
                 }) as Box<dyn FnOnce() + Send>
             })
             .collect();
+        let began = std::time::Instant::now();
         crate::shadow::wide_run(jobs);
+        SYNC_READS[2].fetch_add(began.elapsed().as_nanos() as u64, Relaxed);
         looked += COUNTS[0].swap(0, Relaxed);
         mirrored += COUNTS[1].swap(0, Relaxed);
     }
@@ -400,6 +478,26 @@ fn parallel_sync() -> bool {
 #[cfg(windows)]
 const SYNC_BATCH: usize = 16;
 
+/// With renderer port #2: whether the heap sync takes the marks this time
+/// (`VICTORY_PORT_DESCRIPTORS_ALT=1`: 20 s with them, 20 s with the write
+/// watch's pages as before, in turn; both stay right across a change: the
+/// marks are kept until taken, and the watch keeps what was written since
+/// it was last asked).
+#[cfg(windows)]
+fn port_turn() -> bool {
+    static ALT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ALT.get_or_init(|| std::env::var_os("VICTORY_PORT_DESCRIPTORS_ALT").is_some_and(|v| v == "1")) {
+        return true;
+    }
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+        tracing::info!(on, "renderer port 2's marks taken by the heap sync (VICTORY_PORT_DESCRIPTORS_ALT=1)");
+    }
+    on
+}
+
 /// Whether [`sync_heaps`] skips quiet pages (`VICTORY_HEAP_SYNC_QUIET=1`;
 /// off: in the world no page was ever quiet, every one held new records): a page whose last `QUIET_AFTER` looks mirrored nothing (the
 /// title rewrites its per-draw tables every frame, and the draws that read
@@ -433,14 +531,55 @@ static QUIET_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 #[cfg(windows)]
 pub(crate) static SYNCED: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// Since the last frame line, of [`sync_heaps`]: reads through the kernel,
+/// the nanoseconds in them, and the nanoseconds waiting for the parallel
+/// mirror (`parallel_sync`) to make the records read.
+#[cfg(windows)]
+static SYNC_READS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// With renderer port #2: whether the heap sync reads marked runs as whole
+/// pages, a joined range in one read (`VICTORY_SYNC_WIDE`: `1` on, `alt`
+/// 20 s on and 20 s off in turn; off otherwise).
+#[cfg(windows)]
+fn wide_reads() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SYNC_WIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(on, "heap sync reads whole pages (VICTORY_SYNC_WIDE=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// With the frame line: what [`sync_heaps`] did per frame over `frames`.
 /// Nothing while no heap page changed.
 #[cfg(windows)]
 pub(crate) fn sync_line(frames: f64) {
+    crate::port_descriptors::line(frames);
     let [pages, looked, mirrored, micros] = [0, 1, 2, 3].map(|i| SYNCED[i].swap(0, std::sync::atomic::Ordering::Relaxed));
     if pages == 0 {
         return;
     }
+    let [reads, read_ns, wait_ns] = [0, 1, 2].map(|i| SYNC_READS[i].swap(0, std::sync::atomic::Ordering::Relaxed));
+    tracing::info!(
+        "heap sync split per frame: {:.0} reads through the kernel, {:.2} ms in them; {:.2} ms waiting for the parallel mirror \
+         to make the records; {:.2} ms in all",
+        reads as f64 / frames,
+        read_ns as f64 / 1e6 / frames,
+        wait_ns as f64 / 1e6 / frames,
+        micros as f64 / 1000.0 / frames
+    );
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms; {:.1} quiet pages held for \
@@ -452,6 +591,26 @@ pub(crate) fn sync_line(frames: f64) {
         micros as f64 / 1000.0 / frames,
         QUIET_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
+    #[cfg(feature = "diagnostics")]
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let n = host::MIRRORED.each_ref().map(|a| a.swap(0, Relaxed) as f64 / frames);
+        let t = |i: usize| n[7 + i] / 1e6;
+        let inside = host::MIRROR_NS.each_ref().map(|a| a.swap(0, Relaxed) as f64 / 1e6 / frames);
+        tracing::info!(
+            "heap sync's records made, per frame, by what making them did (count, ms summed over threads): made already {:.0} {:.2}, \
+             not a view of ours {:.0} {:.2}, the same view as made {:.0} {:.2}, the old view kept {:.0} {:.2}, \
+             left for later (a null view made) {:.0} {:.2}, a view created {:.0} {:.2}, other {:.0} {:.2}; inside: \
+             buffer notes and stale slots {:.2} ms, creating views {:.2} ms, keeping the slots' resources {:.2} ms, waiting for slot locks {:.2} ms",
+            n[0], t(0), n[1], t(1), n[2], t(2), n[3], t(3), n[4], t(4), n[5], t(5), n[6], t(6), inside[0], inside[1], inside[2], inside[3]
+        );
+        let [batched, passed] = [0, 1].map(|i| host::NOTE_BATCHED[i].swap(0, Relaxed) as f64 / frames);
+        if batched > 0.0 {
+            tracing::info!(
+                "heap sync's notes batched by page (VICTORY_NOTE_BATCH), per frame: {batched:.0} records, {passed:.1} of them written again before their page's notes"
+            );
+        }
+    }
 }
 
 /// Whether [`sync_heaps`] hands a changed page's records to the host heap
@@ -497,6 +656,7 @@ pub(crate) fn release_dynamic(heap: usize, first: u32, n: u32) {
 #[cfg(windows)]
 impl Drop for Heap {
     fn drop(&mut self) {
+        crate::port_descriptors::let_go(self.start);
         let at = std::ptr::from_ref::<Heap>(self) as usize;
         let mut heaps = SHADER_HEAPS.write().unwrap_or_else(|e| e.into_inner());
         heaps.retain(|&(_, _, h)| h != at);
@@ -691,7 +851,7 @@ static VIEWS: std::sync::RwLock<Views> = std::sync::RwLock::new(Views {
     shapes: Vec::new(),
     shape_index: std::collections::BTreeMap::new(),
 });
-const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
+pub(crate) const VIEW_TAG: u32 = u32::from_le_bytes(*b"vVIE");
 
 /// A record is the tag and two words, `i` and `generation` (the host keeps
 /// them as one 64-bit key per slot). The top two bits of `generation` say
@@ -1171,11 +1331,19 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 }
 
 /// Device method.
+///
+/// A null `desc` writes a null CBV (`Constant(0, 0)`), matching D3D12's
+/// `CreateConstantBufferView` with a null description. Leaving the slot
+/// untouched would keep a stale view active. (Upstream VIctory 78ed12e, #2449.)
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let view = match words(desc) {
+        Some([lo, hi, size, _]) => {
+            let address = u64::from(lo) | u64::from(hi) << 32;
+            View::Constant(address, size)
+        }
+        None => View::Constant(0, 0),
+    };
+    record(handle, view);
 }
 
 /// Device method.
@@ -1370,6 +1538,11 @@ pub(crate) extern "system" fn create_heap(
             .then(|| crate::watch::track(start as usize, size as usize, true))
             .flatten(),
     });
+    // Renderer port #2: the title's own record stores tell this heap's slots.
+    #[cfg(windows)]
+    if placed && visible && desc.kind == VIEWS_KIND {
+        crate::port_descriptors::adopt(start, desc.count);
+    }
     #[cfg(windows)]
     if visible {
         let at = std::ptr::from_ref::<Heap>(&heap) as usize;

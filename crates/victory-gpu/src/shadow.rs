@@ -1525,26 +1525,36 @@ struct Workers {
     more: std::sync::Condvar,
 }
 
-fn workers() -> &'static Workers {
-    static WORKERS: std::sync::OnceLock<Workers> = std::sync::OnceLock::new();
-    static STARTED: std::sync::Once = std::sync::Once::new();
-    let workers = WORKERS.get_or_init(|| Workers {
+/// The kept threads of pool `pool`: 0 the submitting thread's work and
+/// everything else; 1 the heap pass of the recording threads
+/// ([`own_pool`]), so that its pieces do not stand in front of the
+/// submitting thread's in one queue.
+fn workers_of(pool: usize) -> &'static Workers {
+    static WORKERS: [std::sync::OnceLock<Workers>; 2] = [const { std::sync::OnceLock::new() }; 2];
+    static STARTED: [std::sync::Once; 2] = [const { std::sync::Once::new() }; 2];
+    let workers = WORKERS[pool].get_or_init(|| Workers {
         jobs: Mutex::new(std::collections::VecDeque::new()),
         more: std::sync::Condvar::new(),
     });
-    STARTED.call_once(|| {
+    STARTED[pool].call_once(|| {
         // `VICTORY_WIDE_THREADS` (1 to 15) sets how many; a quarter of the
         // processors otherwise (4 on 16), which left the heap sync and the
-        // refreshes cut five ways on a machine with eight cores.
-        let n = std::env::var("VICTORY_WIDE_THREADS")
+        // refreshes cut five ways on a machine with eight cores. The heap
+        // pass's own pool: `VICTORY_HEAP_PASS_THREADS`, the same by default.
+        let var = if pool == 0 { "VICTORY_WIDE_THREADS" } else { "VICTORY_HEAP_PASS_THREADS" };
+        let n = std::env::var(var)
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| (1..=15).contains(n))
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6));
-        tracing::info!(threads = n, "threads kept for work cut in pieces (VICTORY_WIDE_THREADS)");
+        tracing::info!(threads = n, pool, "threads kept for work cut in pieces (VICTORY_WIDE_THREADS; pool 1: VICTORY_HEAP_PASS_THREADS)");
         for i in 0..n {
-            let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
-                let workers = WORKERS.get().expect("made above");
+            let name = if pool == 0 { format!("victory-wide-{i}") } else { format!("victory-heap-pass-{i}") };
+            let _ = std::thread::Builder::new().name(name).spawn(move || {
+                crate::kmeter::helper_thread();
+                #[cfg(feature = "diagnostics")]
+                WIDE_HELPER.with(|h| h.set(true));
+                let workers = WORKERS[pool].get().expect("made above");
                 loop {
                     let job = {
                         let mut jobs = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -1565,21 +1575,43 @@ fn workers() -> &'static Workers {
 
 /// Runs `jobs` on the kept threads and on this one, and returns when all
 /// of them are done. The jobs copy and compare memory; they do not panic.
+#[track_caller]
 fn wide(jobs: Vec<Job>) {
+    wide_on(0, jobs);
+}
+
+/// [`wide`] on the kept threads of pool `pool` ([`workers_of`]).
+#[track_caller]
+fn wide_on(pool: usize, jobs: Vec<Job>) {
+    // Diagnostics: how well the pieces run side by side, by caller
+    // (`wide_line`): the time the call took, against the pieces' summed time.
+    #[cfg(feature = "diagnostics")]
+    let meter = WideMeter::start(std::panic::Location::caller(), jobs.len());
     if jobs.len() < 2 {
         for job in jobs {
             job();
         }
         return;
     }
-    let workers = workers();
+    let workers = workers_of(pool);
     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
     {
         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
         for job in jobs {
             let left = left.clone();
+            #[cfg(feature = "diagnostics")]
+            let summed = meter.summed.clone();
             queue.push_back(Box::new(move || {
+                #[cfg(feature = "diagnostics")]
+                let began = std::time::Instant::now();
                 job();
+                #[cfg(feature = "diagnostics")]
+                {
+                    summed.fetch_add(began.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    if WIDE_HELPER.with(|h| h.get()) {
+                        summed.fetch_add(1 << 48, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
                 *n -= 1;
                 if *n == 0 {
@@ -1600,12 +1632,137 @@ fn wide(jobs: Vec<Job>) {
     while *n > 0 {
         n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
     }
+    drop(n);
+    #[cfg(feature = "diagnostics")]
+    meter.end();
 }
 
 /// [`wide`], for the host's own work on host copies (a submission's
 /// refreshes, the merge of what shaders wrote to card copies).
+#[track_caller]
 pub(crate) fn wide_run(jobs: Vec<Box<dyn FnOnce() + Send>>) {
     wide(jobs);
+}
+
+/// [`wide_run`] for the heap pass of the recording threads: on threads of
+/// its own with [`own_pool`], on the shared ones otherwise.
+#[track_caller]
+pub(crate) fn wide_run_heap_pass(jobs: Vec<Box<dyn FnOnce() + Send>>) {
+    wide_on(usize::from(own_pool()), jobs);
+}
+
+/// Whether the recording threads' heap pass has kept threads of its own
+/// (`VICTORY_HEAP_PASS_POOL=1`; `alt`: twenty seconds with, twenty without,
+/// in turn, each change said in the log; off otherwise). Measured before:
+/// its pieces (36 a frame of some 2 ms each) stood in the shared queue in
+/// front of the submitting thread's heap sync and texture checks, which ran
+/// side by side x2.6 and x2.0 against the pass's own x5.7.
+pub(crate) fn own_pool() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_PASS_POOL").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(on, "the heap pass has threads of its own (VICTORY_HEAP_PASS_POOL=alt)");
+            }
+            on
+        }
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// This thread is one of the kept threads of [`wide`].
+    static WIDE_HELPER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// One [`wide`] call being measured: where from, how many pieces, when it
+/// began, and the pieces' summed nanoseconds (in the low 48 bits; the
+/// pieces a kept thread ran counted above them).
+#[cfg(feature = "diagnostics")]
+struct WideMeter {
+    at: &'static std::panic::Location<'static>,
+    jobs: usize,
+    began: std::time::Instant,
+    summed: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// By caller (file and line): calls, pieces, the calls' time, the pieces'
+/// summed time (ns), pieces a kept thread ran; since the last frame line.
+#[cfg(feature = "diagnostics")]
+static WIDE_STATS: Mutex<Vec<(&'static std::panic::Location<'static>, [u64; 5])>> = Mutex::new(Vec::new());
+
+#[cfg(feature = "diagnostics")]
+impl WideMeter {
+    fn start(at: &'static std::panic::Location<'static>, jobs: usize) -> WideMeter {
+        WideMeter { at, jobs, began: std::time::Instant::now(), summed: Arc::new(std::sync::atomic::AtomicU64::new(0)) }
+    }
+
+    fn end(self) {
+        let wall = self.began.elapsed().as_nanos() as u64;
+        let raw = self.summed.load(std::sync::atomic::Ordering::Relaxed);
+        let (summed, helped) = (raw & ((1 << 48) - 1), raw >> 48);
+        let mut stats = WIDE_STATS.lock().unwrap_or_else(|e| e.into_inner());
+        let i = match stats.iter().position(|(at, _)| std::ptr::eq(*at, self.at)) {
+            Some(i) => i,
+            None => {
+                stats.push((self.at, [0; 5]));
+                stats.len() - 1
+            }
+        };
+        let s = &mut stats[i].1;
+        s[0] += 1;
+        s[1] += self.jobs as u64;
+        s[2] += wall;
+        s[3] += summed;
+        s[4] += helped;
+    }
+}
+
+/// With the frame line: per frame over `frames`, each caller of [`wide`]:
+/// calls, pieces, the time the calls took on the calling thread, the
+/// pieces' summed time, and the ratio of the two (how many threads' worth
+/// of work ran side by side: 1 is none of it; the kept threads are
+/// `VICTORY_WIDE_THREADS`, and the calling thread works too).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn wide_line(frames: f64) {
+    let stats = std::mem::take(&mut *WIDE_STATS.lock().unwrap_or_else(|e| e.into_inner()));
+    if stats.is_empty() || frames <= 0.0 {
+        return;
+    }
+    let mut parts: Vec<(f64, String)> = stats
+        .iter()
+        .map(|(at, s)| {
+            let (wall, summed) = (s[2] as f64 / 1e6 / frames, s[3] as f64 / 1e6 / frames);
+            let file = at.file().rsplit(['/', '\\']).next().unwrap_or(at.file());
+            (
+                wall,
+                format!(
+                    "{file}:{} {:.1} calls {:.0} pieces ({:.0} on kept threads): {:.2} ms taken, {:.2} ms of work, x{:.2}",
+                    at.line(),
+                    s[0] as f64 / frames,
+                    s[1] as f64 / frames,
+                    s[4] as f64 / frames,
+                    wall,
+                    summed,
+                    if wall > 0.0 { summed / wall } else { 0.0 }
+                ),
+            )
+        })
+        .collect();
+    parts.sort_by(|a, b| b.0.total_cmp(&a.0));
+    tracing::info!(
+        "work cut in pieces per frame, by caller (how far it ran side by side): {}",
+        parts.into_iter().map(|p| p.1).collect::<Vec<_>>().join("; ")
+    );
 }
 
 /// About this many bytes to a piece of work for [`wide`].
@@ -2472,6 +2629,49 @@ impl Drop for Shadow {
             }
         }
     }
+}
+
+/// Diagnostics (`VICTORY_RING_TRACE=1`): for copies of 16 MB and more, from
+/// 90 s into the run, which of their 64 KiB pages each refresh found
+/// written by this asking (runs of page numbers from the copy's start), a
+/// few hundred lines in all: whether the title writes such memory as a ring
+/// (a window that moves on and wraps) or here and there.
+#[cfg(feature = "diagnostics")]
+fn ring_trace(start: u64, len: u64, from: usize, to: usize, now: u64, written: &[(usize, u64)]) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RING_TRACE").is_some_and(|v| v == "1")) || len < 16 << 20 {
+        return;
+    }
+    static BEGAN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    if BEGAN.get_or_init(std::time::Instant::now).elapsed().as_secs() < 90 {
+        return;
+    }
+    static LINES: AtomicU64 = AtomicU64::new(0);
+    if LINES.fetch_add(1, Ordering::Relaxed) >= 600 {
+        return;
+    }
+    let base = start as usize / PAGE;
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    for &(page, w) in written {
+        if w != now {
+            continue;
+        }
+        let p = page - base;
+        match runs.last_mut() {
+            Some(r) if r.1 == p => r.1 = p + 1,
+            _ => runs.push((p, p + 1)),
+        }
+    }
+    let shown: Vec<String> = runs.iter().take(24).map(|&(a, b)| if b - a == 1 { format!("{a}") } else { format!("{a}-{}", b - 1) }).collect();
+    tracing::info!(
+        copy = format_args!("{start:#x}+{len:#x}"),
+        asked = format_args!("{}-{}", from / PAGE - base, to.div_ceil(PAGE) - base - 1),
+        frame = crate::frame::current(),
+        pages = runs.iter().map(|r| r.1 - r.0).sum::<usize>(),
+        runs = runs.len(),
+        written = %shown.join(","),
+        "ring trace: pages of a big copy written since the last asking (VICTORY_RING_TRACE=1)"
+    );
 }
 
 /// Whether a copy's snapshot is kept from one submission to the next and
@@ -3599,6 +3799,8 @@ impl Shadow {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
             if let Some((now, written)) = crate::watch::writes(from, to, true, self.oldest_taken(from, to)) {
                 self.watched.store(1, Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                ring_trace(self.start, self.len, from, to, now, &written);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
                 #[cfg(feature = "diagnostics")]

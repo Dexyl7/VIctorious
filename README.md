@@ -142,6 +142,12 @@ developer or publisher.
   `895a23b`, from darkworldhm's snapshot carrying fork pull request #523; and the
   textures picked by index uploaded by a thread of their own (`VICTORY_HEAP_WORKER`),
   commit `d4a528b`, from fork pull request #1007 (its worker commit `233a65f4`).
+  Ported by hand from its commits of 2026-11-26: the texture checks of a submission run
+  side by side on the helper threads (`VICTORY_PARALLEL_REFRESH`, play.ps1
+  `-ParallelRefresh`), and the heap sync's making split and timed (diagnostics), commit
+  `ceb9e1f`; twice the lists in the air before flights are settled
+  (`VICTORY_SETTLE_ROOM`, play.ps1 `-SettleRoom`; its other half, eight times the merged
+  runs, is what `smooth2` sets already), commit `06702fe`.
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
   the Series S pieces, ported here and adapted to this tree's presents:
   - the interface plane laid over the game (`compose.rs`, `VICTORY_COMPOSE`), its
@@ -160,10 +166,16 @@ developer or publisher.
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: renderer port 1
   (commits `86dc109`, `4b82f6c`, `9c23e8d`): the game's 32-bit graphics heap opened as a host heap
   through a view of our own and used in place (`VICTORY_PORT_CONSTANTS=1`, play.ps1 `-PortConstants`).
-  Merged by hand; the page-order half rewritten for our page table.
+  Merged by hand; the page-order half rewritten for our page table. Renderer port 2 (commits
+  `9997d255`, `4cb90bee`): the title's six descriptor record stores patched to mark the slots
+  they write, so the heap sync takes those marks instead of scanning its pages
+  (`VICTORY_PORT_DESCRIPTORS=1`, play.ps1 `-PortDescriptors`). Brought over by hand, its tests
+  left out.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the
   indirect clamps hoisted to a list before their draws (`VICTORY_HOIST_CLAMPS`, done here
   after that fork's approach), and its ambient light and quad-read fixes.
+- **Matsvey Makushenka**: a constant buffer view made with no description is a null one
+  (upstream VIctory commit `78ed12e`, pull request #2449), brought over by hand.
 - **romainhedouin**: pull request #27 (the host heap behind a descriptor heap returned
   without taking the pending lock once it is made).
 - **Kyle** (the commit in fork pull request #697 the AMD compiler fix follows) and the

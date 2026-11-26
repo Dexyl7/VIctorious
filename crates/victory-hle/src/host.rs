@@ -117,7 +117,13 @@ mod imp {
             // SAFETY: MAKEINTRESOURCE-style ordinal lookup on a valid module.
             ImportSymbol::Ordinal(o) => unsafe { GetProcAddress(module as _, *o as usize as _) },
         };
-        proc.map(|f| f as *const () as usize)
+        let found = proc.map(|f| f as *const () as usize)?;
+        // Renderer port #2: the title's memcpy/memmove mark the view records
+        // they copy into its view heap (`victory_gpu::port_descriptors`).
+        Some(match symbol {
+            ImportSymbol::Name { name, .. } => victory_gpu::port_descriptors::import(name, found),
+            ImportSymbol::Ordinal(_) => found,
+        })
     }
 
     fn module(dll: &str) -> Option<usize> {

@@ -24,6 +24,9 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+/// Renderer port #2 (avatarmanz): the title's descriptor record stores patched.
+#[cfg(windows)]
+pub mod descriptor_sites;
 // Title patches for the 1.0.2.1 executable (render scale, own upscaler,
 // watchdog), ported from trustno1-coder/VIctory-NVIDIA.
 #[cfg(windows)]

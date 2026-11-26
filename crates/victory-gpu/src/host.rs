@@ -167,6 +167,37 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
 /// (`HostHeap::kept`) and no list (`HostList::keep`).
+/// Lists closed with their copies refreshed early, and the bytes copied
+/// then ([`HostList::refresh_early`]).
+static EARLY: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// `VICTORY_EARLY_REFRESH`: `1` brings a list's copies of title memory up
+/// to date when the title closes it, on the title's thread
+/// ([`HostList::refresh_early`]); `alt` on and off by turns, 20 s each; off
+/// unless set. Driving, the submitting thread was busy ~62 ms of a ~63 ms
+/// frame (timeline, run of 2026-11-26 evening) while each of the title's
+/// recording threads was busy ~37 ms: the copying moves to those.
+fn early_refresh() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_EARLY_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(on, "copies refreshed at list close (VICTORY_EARLY_REFRESH=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// `VICTORY_BUFFER_POOL`: `1` keeps shared buffers (`Host::shared_buffer`)
 /// that host copies of title memory let go, by size, for the next copy of
 /// that size, up to `VICTORY_BUFFER_POOL_MB` (512) in all; off unless set.
@@ -2622,9 +2653,44 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// Whether the flights get twice the room before "lists in the air"
+/// settles them ([`late_most`]) (`VICTORY_SETTLE_ROOM=1`; off by default:
+/// the cap as set; `alt`: twenty seconds with, twenty without, in turn,
+/// each change said in the log). From fxceless 06702fe, whose switch also
+/// raises `VICTORY_MERGE_RUNS` eight times, to 4,096: smooth2 sets 4,096
+/// already, so here it doubles the lists only. Measured there: the thread
+/// that prepares submissions waited for the card 4.6 ms a frame instead of
+/// 17.7, 11.5 ms less of its work at equal draws. Watch the tables line
+/// ("N refused": dynamic slots are held while lists fly).
+fn settle_room() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SETTLE_ROOM").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "flights get more room (lists in the air x2) before they are settled from now (VICTORY_SETTLE_ROOM=alt): {}",
+                    if on { "ON" } else { "off, the cap as set" }
+                );
+            }
+            on
+        }
+    }
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -5982,6 +6048,7 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        crate::kmeter::submitting_thread();
         let mut _timeline = crate::timeline::span("we prepare and send", 0);
         crate::timeline::slow_test_submit();
         #[cfg(feature = "diagnostics")]
@@ -6024,8 +6091,11 @@ impl Host {
         if beside {
             heap_sync_begin();
         } else {
+            let syncing = std::time::Instant::now();
             crate::descriptor::sync_heaps();
+            crate::framelog::add(crate::framelog::T::SubHeapSyncUs, syncing.elapsed().as_micros() as u64);
         }
+        let sweeping = std::time::Instant::now();
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
@@ -6053,6 +6123,7 @@ impl Host {
         if !beside {
             crate::descriptor::make_waiting();
         }
+        crate::framelog::add(crate::framelog::T::SubSweepUs, sweeping.elapsed().as_micros() as u64);
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -6117,6 +6188,8 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        crate::framelog::add(crate::framelog::T::SubAskUs, started.elapsed().as_micros() as u64);
+        let stepping = std::time::Instant::now();
         for list in runs {
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
@@ -6125,8 +6198,11 @@ impl Host {
             }
             lists.push(list.list.cast().ok());
         }
+        crate::framelog::add(crate::framelog::T::SubStepsUs, stepping.elapsed().as_micros() as u64);
+        let flushing = std::time::Instant::now();
         batch.flush();
         crate::watch::ask_once_end();
+        crate::framelog::add(crate::framelog::T::SubFlushUs, flushing.elapsed().as_micros() as u64);
         if beside {
             heap_sync_end();
             crate::descriptor::make_waiting();
@@ -6135,12 +6211,13 @@ impl Host {
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
-            #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::SubSnapUs, snapshots.elapsed().as_micros() as u64);
         }
+        let carding = std::time::Instant::now();
         // Copies in the card's memory: what changed on their CPU side goes
         // up ahead of the lists, and a compare of what the shaders may
         // write follows them in the same submission.
@@ -6154,6 +6231,7 @@ impl Host {
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
+        crate::framelog::add(crate::framelog::T::SubCardUs, carding.elapsed().as_micros() as u64);
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
@@ -6162,6 +6240,8 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            crate::framelog::add(crate::framelog::T::SubExecUs, prepared.elapsed().as_micros() as u64);
+            crate::framelog::add(crate::framelog::T::SubSettleUs, settled.as_micros() as u64);
             _timeline.set_arg(*submitted);
             self.card_sent();
             if let Err(e) = signalled {
@@ -6690,6 +6770,43 @@ impl HostList {
             fail(format_args!(
                 "a host command list did not close ({e}): a command recorded into it was invalid"
             ));
+        }
+        if early_refresh() {
+            self.refresh_early();
+        }
+    }
+
+    /// With [`early_refresh`], on the title's thread that closes the list:
+    /// the copies of title memory the list reads are brought up to date now,
+    /// ahead of its submission, so that the submitting thread finds most of
+    /// their pages current and copies little. Only the refreshes before the
+    /// list's first step that writes title memory (a copy or a run of ours:
+    /// what comes after must see it), and only copies no shader in the air
+    /// writes (`Shadow::writes_pending`). The submission's own refresh runs
+    /// as before and takes whatever the title wrote meanwhile.
+    fn refresh_early(&self) {
+        let steps: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = {
+            let deferred = self.deferred();
+            let mut steps = Vec::new();
+            for step in &deferred.copies {
+                match step {
+                    Step::Copy(..) | Step::Run(_) => break,
+                    Step::Refresh(shadow, address, len) if !shadow.writes_pending() => {
+                        steps.push((shadow.clone(), *address, *len));
+                    }
+                    _ => {}
+                }
+            }
+            steps
+        };
+        let mut bytes = 0u64;
+        for (shadow, address, len) in steps {
+            bytes += shadow.update(address, len) as u64;
+        }
+        let calls = EARLY[0].fetch_add(1, Ordering::Relaxed) + 1;
+        let all = EARLY[1].fetch_add(bytes, Ordering::Relaxed) + bytes;
+        if calls.is_multiple_of(16384) {
+            tracing::info!(calls, mb = all >> 20, "lists' copies brought up to date at close, on the title's threads (VICTORY_EARLY_REFRESH)");
         }
     }
 
@@ -7804,8 +7921,30 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
+        /// The step's time, by kind, on the frame log whichever way it ends.
+        struct Kind(crate::framelog::T, std::time::Instant);
+        impl Drop for Kind {
+            fn drop(&mut self) {
+                crate::framelog::add(self.0, self.1.elapsed().as_micros() as u64);
+            }
+        }
         for step in &self.deferred().copies {
             let started = std::time::Instant::now();
+            let _kind = Kind(
+                match step {
+                    Step::Copy(..) => crate::framelog::T::StepCopyUs,
+                    Step::Fill(..) => {
+                        crate::framelog::add(crate::framelog::T::StepFills, 1);
+                        crate::framelog::T::StepFillUs
+                    }
+                    Step::Refresh(..) => crate::framelog::T::StepRefreshNoteUs,
+                    Step::Run(_) => crate::framelog::T::StepRunUs,
+                    Step::Host(_) => crate::framelog::T::StepHostUs,
+                    Step::GpuWrite(..) => crate::framelog::T::StepGpuWriteUs,
+                    Step::Texture(_) => crate::framelog::T::StepTextureUs,
+                },
+                started,
+            );
             let copied = match step {
                 &Step::Copy(dst, src, len) => {
                     #[cfg(feature = "diagnostics")]
@@ -7882,7 +8021,14 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if parallel_refresh() {
+                            // Checked with the others of the batch, several
+                            // at a time, before the next step that writes
+                            // title memory ([`Batch::check_textures`]).
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -7910,6 +8056,46 @@ impl HostList {
 /// turn, each change said in the log (run 112 measured the switch worse,
 /// copies 52 -> 68 ms, in a build whose copies went through the kernel one
 /// by one; they are plain copies with one asking ahead now).
+/// Whether a submission's texture checks (`crate::texture::Staging::refresh`:
+/// the write watch or guards asked, then the memory hashed and detiled if
+/// it may have changed) are gathered between writes of ours and run on the
+/// helper threads side by side (`VICTORY_PARALLEL_REFRESH=1`; off by
+/// default; `alt`: twenty seconds with, twenty without, in turn, each
+/// change said in the log). From fxceless ceb9e1f (measured there at -8.7
+/// and -9.4 ms of the preparing thread's work at equal draws).
+///
+/// What changes: a texture's check moves from its step to the next write
+/// of ours or flush, so it reads title memory a little later in the
+/// preparing, and never after a write of ours that its lists come before.
+fn parallel_refresh() -> bool {
+    /// 0 off, 1 on, 2 in turn.
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_PARALLEL_REFRESH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "a submission's texture checks run side by side from now (VICTORY_PARALLEL_REFRESH=alt): {}",
+                    if on { "ON" } else { "off, one after the other as usual" }
+                );
+            }
+            on
+        }
+    }
+}
+
+/// Since the start, of [`Batch::check_textures`]: batches, textures, the
+/// threads' summed microseconds, the microseconds taken.
+static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -8006,6 +8192,10 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`parallel_refresh`]: textures due a check, not checked yet
+    /// ([`Batch::check_textures`], before any write of ours and at every
+    /// flush).
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
@@ -8094,6 +8284,7 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
@@ -8105,6 +8296,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         let end = at + len;
@@ -8123,7 +8315,52 @@ impl Batch {
         });
     }
 
+    /// With [`parallel_refresh`]: checks the textures due ([`Batch::due_textures`])
+    /// on the helper threads (`crate::shadow::wide_run`, the submitting
+    /// thread among them), all done before it returns. Each check takes
+    /// its texture's own lock, the journal's for its asking, the runtime's
+    /// mapping lock for reading (shared), and a buffer of its thread's own;
+    /// the hashing and detiling run side by side. "textures N ms" counts
+    /// the time it took, not the threads' sum. (fxceless ceb9e1f.)
+    fn check_textures(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        PARALLEL_CHECKS[0].fetch_add(1, Relaxed);
+        PARALLEL_CHECKS[1].fetch_add(due.len() as u64, Relaxed);
+        if due.len() < 2 {
+            for staging in due {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|staging| Box::new(move || staging.refresh()) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[2].fetch_sub(summed.saturating_sub(wall), Relaxed);
+        PARALLEL_CHECKS[2].fetch_add(summed, Relaxed);
+        PARALLEL_CHECKS[3].fetch_add(wall, Relaxed);
+        let batches = PARALLEL_CHECKS[0].load(Relaxed);
+        if batches.is_multiple_of(1 << 14) {
+            let [b, n, sum, w] = [0, 1, 2, 3].map(|i| PARALLEL_CHECKS[i].load(Relaxed));
+            tracing::info!(
+                "texture checks side by side (VICTORY_PARALLEL_REFRESH) so far: {b} batches, {n} textures; the threads' sum {} ms, the time taken {} ms",
+                sum / 1000,
+                w / 1000
+            );
+        }
+    }
+
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -8318,7 +8555,7 @@ fn read_sparse(src: *const u8, dst: *mut u8, len: usize) {
         let remaining = len - offset;
         // SAFETY: the query inspects an address and fills a local structure.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        let size = unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) };
+        let size = crate::kmeter::timed(crate::kmeter::K::Query, || unsafe { VirtualQuery(at.cast(), &mut info, size_of_val(&info)) });
         let n = (info.BaseAddress as usize).saturating_add(info.RegionSize)
             .saturating_sub(at as usize).min(remaining);
         if size != size_of_val(&info) || n == 0 {
@@ -8375,7 +8612,7 @@ fn read(src: *const u8, dst: *mut u8, len: usize) -> bool {
     let mut done = 0;
     // SAFETY: the destination is mapped writable memory of `len` bytes; the
     // kernel checks the source.
-    unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 }
+    crate::kmeter::timed(crate::kmeter::K::Read, || unsafe { ReadProcessMemory(GetCurrentProcess(), src.cast(), dst.cast(), len, &mut done) != 0 })
 }
 
 #[link(name = "ntdll", kind = "raw-dylib")]
@@ -8418,13 +8655,13 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             // SAFETY: as below; the kernel checks the destination and
             // writes nothing it cannot (the caller opened its guards:
             // `crate::watch::writing`).
-            return unsafe {
+            return crate::kmeter::timed(crate::kmeter::K::Write, || unsafe {
                 NtWriteVirtualMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) >= 0
-            };
+            });
         }
         // SAFETY: the source is our mapped host copy; the kernel checks the
         // destination.
-        unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
+        crate::kmeter::timed(crate::kmeter::K::Write, || unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 })
     };
     if len == 0 || write(dst as usize, len) {
         return;
@@ -8657,6 +8894,10 @@ impl Meter {
         }
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::kmeter::line(frames);
+        #[cfg(feature = "diagnostics")]
+        crate::shadow::wide_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);

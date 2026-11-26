@@ -13,6 +13,65 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+/// Diagnostics of the heap sync: of the records it mirrors (a slot whose
+/// record changed), how many name a view (by its print) mirrored somewhere
+/// in the frame before, and how many one mirrored earlier in the same
+/// frame: what a cache of made views by record would spare. Since the
+/// start: records, seen the frame before, seen this frame already. Said
+/// every 2^20 records.
+static REPEATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+struct Seen {
+    frame: u64,
+    now: std::collections::HashSet<u64>,
+    before: std::collections::HashSet<u64>,
+}
+
+static SEEN: [std::sync::Mutex<Option<Seen>>; 64] = [const { std::sync::Mutex::new(None) }; 64];
+
+fn repeat_note(print: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    // `VICTORY_REPEAT_COUNT=1`: counted; off otherwise (it costs a lookup a record).
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_REPEAT_COUNT").is_some_and(|v| v == "1")) {
+        return;
+    }
+    let frame = crate::frame::current();
+    let (mut before, mut again) = (false, false);
+    {
+        let mut shard = SEEN[(print.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 58) as usize]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let seen = shard.get_or_insert_with(|| Seen { frame, now: Default::default(), before: Default::default() });
+        if seen.frame != frame {
+            seen.before = if seen.frame + 1 == frame { std::mem::take(&mut seen.now) } else { Default::default() };
+            seen.now.clear();
+            seen.frame = frame;
+        }
+        if seen.before.contains(&print) {
+            before = true;
+        }
+        if !seen.now.insert(print) {
+            again = true;
+        }
+    }
+    let n = REPEATS[0].fetch_add(1, Relaxed) + 1;
+    if before {
+        REPEATS[1].fetch_add(1, Relaxed);
+    }
+    if again {
+        REPEATS[2].fetch_add(1, Relaxed);
+    }
+    if n.is_multiple_of(1 << 20) {
+        tracing::info!(
+            records = n,
+            seen_frame_before = REPEATS[1].load(Relaxed),
+            seen_this_frame_already = REPEATS[2].load(Relaxed),
+            "heap sync: records mirrored that name a view mirrored the frame before, or earlier in the same frame (since the start)"
+        );
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -1523,6 +1582,13 @@ impl HostHeap {
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+        Self::queue_texture_in(&mut textures, index, texture, seen, read_now, lately, frame);
+    }
+
+    /// [`HostHeap::queue_texture`]'s change of the queue, with the queue
+    /// held (`read_now` and `lately` as worked out there).
+    #[allow(clippy::too_many_arguments)]
+    fn queue_texture_in(textures: &mut TextureQueue, index: u32, texture: bool, seen: bool, read_now: bool, lately: bool, frame: u64) {
         if texture && !read_now {
             let due = if lately && !seen {
                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1899,7 +1965,7 @@ impl HostHeap {
     ) -> (u64, u64) {
         let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due: Vec<(u32, u64, u64)> = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1934,13 +2000,112 @@ impl HostHeap {
                     continue;
                 }
                 *last = print;
-                due.push((index as u32, handle));
+                due.push((index as u32, handle, print));
             }
         }
-        for &(index, handle) in &due {
+        let batching = note_batch() && !due.is_empty();
+        if batching {
+            NOTE_BATCH.with(|batch| *batch.borrow_mut() = Some(Vec::with_capacity(due.len())));
+        }
+        for &(index, handle, print) in &due {
+            repeat_note(print);
+            #[cfg(feature = "diagnostics")]
+            MIRROR_HOW.with(|how| how.set(MIRROR_UNSET));
+            #[cfg(feature = "diagnostics")]
+            let one = std::time::Instant::now();
             self.mirror(index, handle, false);
+            #[cfg(feature = "diagnostics")]
+            mirror_counted(one.elapsed().as_nanos() as u64);
+        }
+        if batching {
+            let batch = NOTE_BATCH.with(|batch| batch.borrow_mut().take()).unwrap_or_default();
+            #[cfg(feature = "diagnostics")]
+            let noting = std::time::Instant::now();
+            self.note_batched(batch);
+            #[cfg(feature = "diagnostics")]
+            MIRROR_NS[0].fetch_add(noting.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         (looked, due.len() as u64)
+    }
+
+    /// [`HostHeap::note_buffer`] for the records of a page the heap sync
+    /// mirrored (`note_batch`): none of them a placed texture view, so none
+    /// makes a slot stale. Each shared lock (the texture queue, the placed
+    /// spans, the buffer slots, the changed slots) is taken once for all of
+    /// them, in the order `note_buffer` takes them, instead of once a
+    /// record: the heap sync's threads stood in line for those locks
+    /// (24 ms a frame summed over them, of 37 for the records left for
+    /// later). A record the title wrote again since it was mirrored is
+    /// passed over: whoever mirrors the new one notes it.
+    fn note_batched(&self, batch: Vec<(u32, u64, u64, View)>) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if batch.is_empty() {
+            return;
+        }
+        let frame = crate::frame::current();
+        // Still the record that was mirrored (`mirror`'s key).
+        let current: Vec<(u32, &View)> = batch
+            .iter()
+            .filter(|(_, handle, key, _)| {
+                // SAFETY: as in `mirror`: the handle is a descriptor slot in title memory.
+                let [tag, i, generation] = unsafe { (*handle as *const [u32; 3]).read_unaligned() };
+                tag == VIEW_TAG && (u64::from(generation) << 32 | u64::from(i)) == *key
+            })
+            .map(|(index, _, _, view)| (*index, view))
+            .collect();
+        NOTE_BATCHED[0].fetch_add(batch.len() as u64, Relaxed);
+        NOTE_BATCHED[1].fetch_add((batch.len() - current.len()) as u64, Relaxed);
+        if !PUBLISHING.get() {
+            // What `queue_texture` works out before its lock, for each.
+            let tabled = tabled_out();
+            let now = (frame as u32).wrapping_add(1) & !TABLED_READ;
+            let plans: Vec<(u32, bool, bool, bool)> = current
+                .iter()
+                .map(|&(index, view)| {
+                    let texture = match view {
+                        View::Shader(r, _) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
+                            OBJECT_TEXTURE_SLOTS.fetch_add(1, Relaxed);
+                            true
+                        }
+                        _ => false,
+                    };
+                    let stamp = if tabled { self.tabled_stamp(index) } else { 0 };
+                    let lately = stamp != 0 && u64::from(now.wrapping_sub(stamp & !TABLED_READ)) <= TABLED_FRAMES;
+                    // `seen` is false here (not a draw's): nothing is read now.
+                    (index, texture, false, lately)
+                })
+                .collect();
+            let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+            for (index, texture, read_now, lately) in plans {
+                Self::queue_texture_in(&mut textures, index, texture, false, read_now, lately, frame);
+            }
+        }
+        {
+            let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
+            for &(index, _) in &current {
+                placed.forget(index);
+            }
+        }
+        let strides: Vec<(u32, Option<u32>)> = current.iter().map(|&(index, view)| (index, view_stride(view))).collect();
+        if let Some((_, _, data)) = &self.strides {
+            for &(index, stride) in &strides {
+                if index < victory_shader::emit::SLOT_STRIDES_COUNT {
+                    // SAFETY: as in `note_buffer`.
+                    unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+                }
+            }
+        }
+        let changed: Vec<u32> = {
+            let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
+            strides
+                .iter()
+                .filter(|&&(index, stride)| if stride.is_some() { buffers.insert(index); true } else { buffers.remove(&index) })
+                .map(|&(index, _)| index)
+                .collect()
+        };
+        if !changed.is_empty() {
+            self.changed.lock().unwrap_or_else(|e| e.into_inner()).extend(changed);
+        }
     }
 
     /// Makes host slot `index` from the record at `handle` if it is still
@@ -1990,13 +2155,27 @@ impl HostHeap {
             && self.seen.get(index as usize).is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire) == key)
             && let Some(view) = view_at(i, generation)
         {
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_FAST);
             return Some(view);
         }
+        // (Timed only inside the heap sync's making, `mirror_timing`: draws
+        // mirror too, far more often.)
+        #[cfg(feature = "diagnostics")]
+        let timing = mirror_timing();
+        #[cfg(feature = "diagnostics")]
+        let locking = timing.then(std::time::Instant::now);
         let slot = self.made.lock(index);
+        #[cfg(feature = "diagnostics")]
+        if let Some(locking) = locking {
+            MIRROR_NS[3].fetch_add(locking.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
+            #[cfg(feature = "diagnostics")]
+            mirror_how(MIRROR_NOT_VIEW);
             if self.made.get(index) != 0 {
                 self.made.set(index, 0);
                 self.seen_set(index, 0);
@@ -2016,13 +2195,36 @@ impl HostHeap {
             // could each wait for the other), and only if it still holds
             // the record it held now: another thread may have made it
             // anew meanwhile, from a write that is not stale.
-            let stale: Vec<(u32, u64)> = self
-                .note_buffer(index, Some(&view), for_draw)
+            #[cfg(feature = "diagnostics")]
+            let noting = timing.then(std::time::Instant::now);
+            // With the heap sync's notes batched (`note_batch`): a view that
+            // can make no slot stale (not a placed texture view) is noted
+            // with the rest of its page, each shared lock taken once
+            // (`HostHeap::note_batched`).
+            let deferred = !for_draw
+                && !self.sampler
+                && !matches!(&view, View::Placed(false, resource, _) if resource[0] != 1)
+                && NOTE_BATCH.with(|batch| {
+                    let mut batch = batch.borrow_mut();
+                    match batch.as_mut() {
+                        Some(batch) => {
+                            batch.push((index, handle, key, view.clone()));
+                            true
+                        }
+                        None => false,
+                    }
+                });
+            let noted = if deferred { Vec::new() } else { self.note_buffer(index, Some(&view), for_draw) };
+            let stale: Vec<(u32, u64)> = noted
                 .into_iter()
                 .filter(|&stale| stale != index)
                 .map(|stale| (stale, self.made.get(stale)))
                 .filter(|&(_, key)| key != 0)
                 .collect();
+            #[cfg(feature = "diagnostics")]
+            if let Some(noting) = noting {
+                MIRROR_NS[0].fetch_add(noting.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
             let unmake_stale = |stale: &[(u32, u64)]| {
                 for &(other, was) in stale {
                     let _other = self.made.lock(other);
@@ -2053,6 +2255,8 @@ impl HostHeap {
                 && view_at(old as u32, (old >> 32) as u32).is_some_and(|old| same_placed_texture(&old, &view))
             {
                 KEPT_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                #[cfg(feature = "diagnostics")]
+                mirror_how(MIRROR_KEPT);
                 drop(slot);
                 unmake_stale(&stale);
                 return Some(view);
@@ -2070,6 +2274,10 @@ impl HostHeap {
             // parallel). Held, it made every other mirror wait for it.
             drop(slot);
             unmake_stale(&stale);
+            #[cfg(feature = "diagnostics")]
+            mirror_how(if later { MIRROR_LATER } else { MIRROR_MADE });
+            #[cfg(feature = "diagnostics")]
+            let creating = timing.then(std::time::Instant::now);
             let kept = if later {
                 None
             } else {
@@ -2078,7 +2286,15 @@ impl HostHeap {
             if kept.is_none() && !self.sampler {
                 null_for(&view, self.cpu(index));
             }
+            #[cfg(feature = "diagnostics")]
+            let keeping = timing.then(std::time::Instant::now);
             self.keep(index, kept.flatten());
+            #[cfg(feature = "diagnostics")]
+            if let (Some(creating), Some(keeping)) = (creating, keeping) {
+                use std::sync::atomic::Ordering::Relaxed;
+                MIRROR_NS[1].fetch_add((keeping - creating).as_nanos() as u64, Relaxed);
+                MIRROR_NS[2].fetch_add(keeping.elapsed().as_nanos() as u64, Relaxed);
+            }
             // Up to date for the lock-free check only once written, and
             // only if no other thread made the slot anew meanwhile.
             if now != 0 {
@@ -2088,6 +2304,8 @@ impl HostHeap {
                 }
             }
         }
+        #[cfg(feature = "diagnostics")]
+        mirror_how(MIRROR_SAME);
         Some(view)
     }
 
@@ -2320,6 +2538,103 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    /// While the heap sync mirrors a page with its notes batched
+    /// (`note_batch`): the records whose note waits for the page's end
+    /// (slot, handle, record, view).
+    static NOTE_BATCH: std::cell::RefCell<Option<Vec<(u32, u64, u64, View)>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Since the last frame line: records whose note was batched, and of them
+/// those the title wrote again before their page's notes (passed over).
+pub(crate) static NOTE_BATCHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Whether the heap sync notes a page's records together
+/// ([`HostHeap::note_batched`]; `VICTORY_NOTE_BATCH=1`; `alt` twenty
+/// seconds with, twenty without, in turn, each change said in the log; off
+/// otherwise).
+fn note_batch() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_NOTE_BATCH").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(on, "heap sync notes a page's records together (VICTORY_NOTE_BATCH=alt)");
+            }
+            on
+        }
+    }
+}
+
+// What the heap sync's making does with each record it mirrors
+// (`HostHeap::mirror_copied_page`), by outcome of `HostHeap::mirror`: made
+// already (the lock-free look), not a view of ours, the same view as made
+// (under the lock), the old view kept, left for later (a buffer or a
+// texture with no host copy: a null view made), made (a host view
+// created). Diagnostics only. After fxceless ceb9e1f, in nanoseconds, with
+// the wait for the slot's lock apart.
+#[cfg(feature = "diagnostics")]
+const MIRROR_UNSET: usize = 6;
+/// Not inside the pass's timed `mirror` (draws and other passes mirror too).
+#[cfg(feature = "diagnostics")]
+const MIRROR_IDLE: usize = 7;
+#[cfg(feature = "diagnostics")]
+const MIRROR_FAST: usize = 0;
+#[cfg(feature = "diagnostics")]
+const MIRROR_NOT_VIEW: usize = 1;
+#[cfg(feature = "diagnostics")]
+const MIRROR_SAME: usize = 2;
+#[cfg(feature = "diagnostics")]
+const MIRROR_KEPT: usize = 3;
+#[cfg(feature = "diagnostics")]
+const MIRROR_LATER: usize = 4;
+#[cfg(feature = "diagnostics")]
+const MIRROR_MADE: usize = 5;
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    /// The outcome of the `mirror` call being timed on this thread.
+    static MIRROR_HOW: std::cell::Cell<usize> = const { std::cell::Cell::new(MIRROR_IDLE) };
+}
+/// By outcome (the six above and "other"): records, and their nanoseconds.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRRORED: [std::sync::atomic::AtomicU64; 14] = [const { std::sync::atomic::AtomicU64::new(0) }; 14];
+/// Inside `mirror`, summed over the records: the buffer notes (and the
+/// stale slots found), creating the view (or the null one), keeping the
+/// slot's resource (the old one retired), waiting for the slot's lock.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRROR_NS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+#[cfg(feature = "diagnostics")]
+fn mirror_how(how: usize) {
+    MIRROR_HOW.with(|cell| {
+        if cell.get() == MIRROR_UNSET {
+            cell.set(how);
+        }
+    });
+}
+
+/// Whether this thread is inside the pass's timed `mirror`.
+#[cfg(feature = "diagnostics")]
+fn mirror_timing() -> bool {
+    MIRROR_HOW.with(|cell| cell.get() != MIRROR_IDLE)
+}
+
+#[cfg(feature = "diagnostics")]
+fn mirror_counted(ns: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let how = MIRROR_HOW.with(|cell| cell.replace(MIRROR_IDLE)).min(MIRROR_UNSET);
+    MIRRORED[how].fetch_add(1, Relaxed);
+    MIRRORED[7 + how].fetch_add(ns, Relaxed);
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same

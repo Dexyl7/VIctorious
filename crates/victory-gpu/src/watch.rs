@@ -344,7 +344,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     // SAFETY: the answer buffer holds `count` entries.
-    let failed = unsafe {
+    let failed = crate::kmeter::timed(crate::kmeter::K::Watch, || unsafe {
         GetWriteWatch(
             WRITE_WATCH_FLAG_RESET,
             (first * PAGE) as *const _,
@@ -353,7 +353,7 @@ fn ask_kernel(j: &mut Journal, first: usize, last: usize) -> bool {
             &mut count,
             &mut granularity,
         )
-    } != 0;
+    }) != 0;
     if failed {
         return false;
     }
@@ -446,7 +446,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool, since: u64) -> Opt
     let known_view = guarded && known_view(first * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
-        || unsafe {
+        || crate::kmeter::timed(crate::kmeter::K::Watch, || unsafe {
             GetWriteWatch(
                 WRITE_WATCH_FLAG_RESET,
                 (first * PAGE) as *const _,
@@ -455,7 +455,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool, since: u64) -> Opt
                 &mut count,
                 &mut granularity,
             )
-        } != 0;
+        }) != 0;
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(
         if known_view {
@@ -521,7 +521,7 @@ fn failed_asking(start: usize, end: usize) {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::kmeter::timed(crate::kmeter::K::Query, || unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) });
     let (protected, clean, absent, viewed, aliased) = {
         let b = start / BLOCK;
         let g = guards(b);
@@ -812,7 +812,7 @@ fn is_view(start: usize, end: usize) -> bool {
         // SAFETY: plain data filled in by the query.
         let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         // SAFETY: a valid out pointer of the right size.
-        let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+        let n = crate::kmeter::timed(crate::kmeter::K::Query, || unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) });
         if n == 0 {
             return false;
         }
@@ -905,7 +905,7 @@ fn protect_alias_run(g: &mut Guards, first: usize, last: usize) {
         }
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
-        let set = unsafe { VirtualProtect((start * BLOCK) as *const _, (block - start) * BLOCK, PAGE_READONLY, &mut old) } != 0;
+        let set = crate::kmeter::timed(crate::kmeter::K::Protect, || unsafe { VirtualProtect((start * BLOCK) as *const _, (block - start) * BLOCK, PAGE_READONLY, &mut old) }) != 0;
         if set {
             g.protected.extend(start..block);
             if view_known() {
@@ -950,7 +950,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
     }
     let mut old = 0;
     // SAFETY: title view memory; only its protection changes.
-    if unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) } != 0 {
+    if crate::kmeter::timed(crate::kmeter::K::Protect, || unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READONLY, &mut old) }) != 0 {
         g.protected.insert(block);
         if view_known() {
             g.viewed.insert(block);
@@ -964,14 +964,14 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     let set = |from: usize, to: usize| {
         let mut old = 0;
         // SAFETY: title view memory; only its protection changes.
-        unsafe {
+        crate::kmeter::timed(crate::kmeter::K::Protect, || unsafe {
             VirtualProtect(
                 (from * BLOCK) as *const _,
                 (to - from) * BLOCK,
                 PAGE_READONLY,
                 &mut old,
             ) != 0
-        }
+        })
     };
     let note = |g: &mut Guards, from: usize, to: usize| {
         g.protected.extend(from..to);
@@ -1043,7 +1043,36 @@ pub(crate) fn uncommitted_frame() {
 /// with answers kept per submission.
 fn absent_per_frame() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("VICTORY_ABSENT_CACHE").as_deref() == Ok("frame"))
+    *ON.get_or_init(|| std::env::var("VICTORY_ABSENT_CACHE").as_deref() == Ok("frame")) || kernel_less()
+}
+
+/// `VICTORY_KERNEL_LESS`: fewer calls into the memory manager on the
+/// submitting thread, both of these together: what Windows said about
+/// uncommitted memory kept for the frame ([`absent_per_frame`]) and fills of
+/// upload memory copied in place at any size (`crate::plaincopy`). `1` on,
+/// `alt` on and off by turns, 20 s each; off unless set. A driving profile
+/// had 10 ms a frame of the submitting thread in `VirtualQuery` and 7 ms in
+/// kernel copies, every such call taking the process's address-space lock
+/// that the title's 200 remappings a frame take too.
+pub(crate) fn kernel_less() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_KERNEL_LESS").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(on, "fewer memory-manager calls (VICTORY_KERNEL_LESS=alt)");
+            }
+            on
+        }
+    }
 }
 
 /// The runtime mapped or unmapped `[at, at + len)`: what [`uncommitted_end`]
@@ -1135,7 +1164,7 @@ fn uncommitted_end_asked(block: usize) -> usize {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::kmeter::timed(crate::kmeter::K::Query, || unsafe { VirtualQuery((block * BLOCK) as *const _, &mut info, size_of_val(&info)) });
     if n != 0 && matches!(info.State, MEM_RESERVE | MEM_FREE) {
         (info.BaseAddress as usize).saturating_add(info.RegionSize) / BLOCK
     } else {
@@ -1211,15 +1240,15 @@ fn open_blocks(g: &mut Guards, first: usize, last: usize) -> bool {
         }
         let mut old = 0;
         // SAFETY: blocks we made read-only.
-        let set = unsafe {
+        let set = crate::kmeter::timed(crate::kmeter::K::Protect, || unsafe {
             VirtualProtect((run_start * BLOCK) as *const _, (run_end - run_start) * BLOCK, PAGE_READWRITE, &mut old)
-        };
+        });
         if set == 0 && run_end - run_start > 1 {
             // A run can span regions the kernel only changes one at a time.
             for block in run_start..run_end {
                 let mut old = 0;
                 // SAFETY: a block we made read-only.
-                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+                crate::kmeter::timed(crate::kmeter::K::Protect, || unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) });
             }
         }
     }
@@ -1506,6 +1535,8 @@ fn install() {
             return EXCEPTION_CONTINUE_SEARCH;
         }
         let at = r.ExceptionInformation[1];
+        #[cfg(feature = "diagnostics")]
+        let faulted = std::time::Instant::now();
         // Held across both checks: another thread may have opened the block
         // since this one faulted, and a copy may have guarded it again since
         // (then it is ours again, not read-only for some other reason).
@@ -1521,6 +1552,8 @@ fn install() {
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::GuardFaults, 1);
             crate::framelog::add(crate::framelog::T::GuardFaults, 1);
+            #[cfg(feature = "diagnostics")]
+            crate::kmeter::note(crate::kmeter::K::GuardFault, faulted.elapsed().as_nanos() as u64);
             return EXCEPTION_CONTINUE_EXECUTION;
         }
         if writable(at) {
@@ -1544,7 +1577,7 @@ fn writable(at: usize) -> bool {
     // SAFETY: plain data filled in by the query.
     let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out pointer of the right size.
-    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    let n = crate::kmeter::timed(crate::kmeter::K::Query, || unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) });
     n != 0 && info.State == MEM_COMMIT && info.Protect == PAGE_READWRITE
 }
 

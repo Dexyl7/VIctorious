@@ -220,7 +220,7 @@ pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
 /// `ReadProcessMemory` call (6 ms a frame of the submitting thread).
 pub(crate) fn copy_expected(to: *mut u8, from: *const u8, len: usize) -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let small = *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_IN_PLACE").is_some_and(|v| v == "1"));
+    let small = *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_IN_PLACE").is_some_and(|v| v == "1")) || crate::watch::kernel_less();
     copy_sized(to, from, len, small)
 }
 

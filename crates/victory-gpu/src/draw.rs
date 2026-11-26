@@ -1775,7 +1775,7 @@ impl State {
                     }) as Box<dyn FnOnce() + Send>
                 })
                 .collect();
-            crate::shadow::wide_run(jobs);
+            crate::shadow::wide_run_heap_pass(jobs);
             let found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
             for (index, shadow, from, to) in found {
                 ranges.insert(index, (shadow, from, to));

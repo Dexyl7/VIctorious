@@ -100,6 +100,31 @@ pub enum T {
     WorkerSlow,
     RecordLooks,
     RecordSlow,
+    /// The submitting thread's preparing of a submission sent ahead, by
+    /// part (`Host::submit`): the heap sync, the sweep and what comes with
+    /// it, the write-watch asking and the checks of flights before the
+    /// steps, the lists' steps (copies, fills, textures; refreshes only
+    /// noted), the refreshes (`Batch::flush`), the snapshots, the copies in
+    /// the card's memory, the host's submit call, and the settles of
+    /// flights inside it all (counted in their parts too).
+    SubHeapSyncUs,
+    SubSweepUs,
+    SubAskUs,
+    SubStepsUs,
+    SubFlushUs,
+    SubSnapUs,
+    SubCardUs,
+    SubExecUs,
+    SubSettleUs,
+    /// Of the steps: by kind (the time to the next step), and how many fills.
+    StepCopyUs,
+    StepFillUs,
+    StepFills,
+    StepRefreshNoteUs,
+    StepRunUs,
+    StepHostUs,
+    StepGpuWriteUs,
+    StepTextureUs,
     Count,
 }
 
@@ -473,6 +498,29 @@ fn text(f: &Frame) -> String {
         t(T::WorkerLooks),
         t(T::RecordSlow),
         t(T::RecordLooks),
+    ) + &format!(
+        " | submit split: heap sync {:.1}, sweep and waiting slots {:.1}, asking and flight checks {:.1}, steps {:.1}, refreshes {:.1}, snapshots {:.1}, card copies {:.1}, \
+         submit call {:.1}, settles inside {:.1}",
+        ms(T::SubHeapSyncUs),
+        ms(T::SubSweepUs),
+        ms(T::SubAskUs),
+        ms(T::SubStepsUs),
+        ms(T::SubFlushUs),
+        ms(T::SubSnapUs),
+        ms(T::SubCardUs),
+        ms(T::SubExecUs),
+        ms(T::SubSettleUs),
+    ) + &format!(
+        " | steps by kind: title copies {:.1}, fills {:.1} ({:.0}), refreshes noted {:.1}, work that writes title memory {:.1}, \
+         host work {:.1}, shader writes {:.1}, textures {:.1}",
+        ms(T::StepCopyUs),
+        ms(T::StepFillUs),
+        t(T::StepFills),
+        ms(T::StepRefreshNoteUs),
+        ms(T::StepRunUs),
+        ms(T::StepHostUs),
+        ms(T::StepGpuWriteUs),
+        ms(T::StepTextureUs),
     )
 }
 
