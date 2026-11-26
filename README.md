@@ -64,7 +64,12 @@ developer or publisher.
   (`VICTORY_LOOKUP_CACHE`) is that fork's commit `32be36d`, from its pull request
   #1237, merged here by hand over this fork's shared lock. A draw's stages sharing
   the tables they make afresh (`VICTORY_TABLE_STAGES`, on in `smooth2`) is that
-  fork's commit `5d659e0`, ported by hand.
+  fork's commit `5d659e0`, ported by hand. The heap pass's two halves come from
+  there too, merged here three-way: the buffer-view pass that looks only at marked
+  slots (`VICTORY_HEAP_PASS_MARKED`, and `VICTORY_LIST_REUSE` with it), commit
+  `895a23b`, from darkworldhm's snapshot carrying fork pull request #523; and the
+  textures picked by index uploaded by a thread of their own (`VICTORY_HEAP_WORKER`),
+  commit `d4a528b`, from fork pull request #1007 (its worker commit `233a65f4`).
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
   the Series S pieces, ported here and adapted to this tree's presents:
   - the interface plane laid over the game (`compose.rs`, `VICTORY_COMPOSE`), its
