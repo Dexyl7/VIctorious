@@ -56,6 +56,34 @@ developer or publisher.
   VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
   memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
   are carried here unchanged apart from one merge conflict.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** and its
+  contributors: the renderer work this fork is built on, including the switches the
+  `smooth2` set of `play.ps1` turns on (indirect gather, small buffers' copies on the
+  card, joined parts, own views for shader writes, copies in place, submissions
+  prepared by a thread of the layer). The per-thread memory of buffer lookups
+  (`VICTORY_LOOKUP_CACHE`) is that fork's commit `32be36d`, from its pull request
+  #1237, merged here by hand over this fork's shared lock.
+- **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
+  the Series S pieces, ported here and adapted to this tree's presents:
+  - the interface plane laid over the game (`compose.rs`, `VICTORY_COMPOSE`), its
+    commit `7997a20`, itself a port of fxceless's pull request #1189 (by Tissma95);
+  - the title patches for the 1.0.2.1 executable, render scale, the title's own
+    upscaler and the watchdog (`victory-loader/src/hooks.rs`), its commit `afd84de`,
+    taken from [vitutu1/victory-perf](https://github.com/vitutu1/victory-perf), which
+    ported them from ZigZagBoi1/ScarlettPort (GPL-3.0-or-later);
+  - ray walks ended at the root (`VICTORY_BVH_MISS`), its commit `24a479d`.
+  Its measurements on the same CPU are what showed the Series S route was worth taking.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the
+  indirect clamps hoisted to a list before their draws (`VICTORY_HOIST_CLAMPS`, done here
+  after that fork's approach), and its ambient light and quad-read fixes.
+- **romainhedouin**: pull request #27 (the host heap behind a descriptor heap returned
+  without taking the pending lock once it is made).
+- **Kyle** (the commit in fork pull request #697 the AMD compiler fix follows) and the
+  authors of fork pull requests **#665** (copy queue for the relay) and **#220**
+  (cheaper indirect draws).
+- The sharpening of the shown frame (`sharpen.rs`, `VICTORY_SHARPEN`) is this fork's own
+  code following the contrast-adaptive sharpening approach of AMD's FidelityFX CAS /
+  Radeon Image Sharpening; no AMD code is used.
 - This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Status of this fork (2026-11-25)
