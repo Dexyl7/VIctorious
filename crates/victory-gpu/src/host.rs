@@ -2191,6 +2191,17 @@ fn late_exact() -> bool {
 /// or listed is presented the old way. Once every second and a half a
 /// submission settles the flights all the same, for the sweep that lets
 /// idle host objects go (it needs nothing in the air).
+/// With [`late_free_present`]: how often a submission settles the flights
+/// all the same, so that the sweep finds nothing in the air
+/// (`VICTORY_SWEEP_MS`, 1,500 by default). Each such settle waits for all
+/// the card's work: a frame of 220 to 300 ms instead of about 140 in heavy
+/// views, every time; with a longer gap, idle host objects are let go
+/// later.
+fn sweep_every_ms() -> u64 {
+    static MS: OnceLock<u64> = OnceLock::new();
+    *MS.get_or_init(|| std::env::var("VICTORY_SWEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(1500).max(100))
+}
+
 pub(crate) fn late_free_present() -> bool {
     late_stage() > 2
 }
@@ -5725,7 +5736,7 @@ impl Host {
         if !behind {
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
-        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + 1500 {
+        } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_every_ms() {
             // With the present sent ahead nothing else brings a moment
             // with nothing in the air: one is made for the sweep.
             self.settle(&mut submitted, WHY_SYNC);
