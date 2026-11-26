@@ -9,7 +9,8 @@ dispatch dropped.
 | Compute shaders that crash AMD's driver compiler | 66+ (skipped, with their effects) | **0** |
 | Shaders that do not translate during play | 1 (the submerged water volumetrics) | **0** |
 | Dispatches dropped without a pipeline | the water volumetrics, whenever it ran | **0** |
-| Frame rate in the world | ~3.7 fps | **5–8 fps** (up to ~10) |
+| Frame rate in the world (Series X, standing) | ~3.7 fps | **~12 fps** (80 ms at ~5,000 draws) |
+| Frame rate in the world (Series S, 720p, driving) | – | **~13–17 fps**, up to ~23 (59 ms at 4,000 draws, 78 ms at 6,000) |
 | Fastest mode (`fast2`) without a device loss | a few minutes | **25+ min** |
 
 What made the difference:
@@ -22,6 +23,61 @@ What made the difference:
   a copy of their own instead of being left null.
 - Faster: fork PRs #665 (copy queue for the relay) and #220 (cheaper indirect draws), relay stage 2,
   and the two AMD-faulting culling shaders skipped.
+
+## Newest (2026-11-26)
+
+**Series S at 720p, driving: ~59 ms a frame at 4,000 draws, ~78 ms at 6,000, up to ~23 fps
+on foot.** The same scene on Series X was ~200 ms (5 fps) that morning. To play:
+
+```powershell
+.\play.ps1 -Mode smooth2 -NoDred -Console series-s -RenderScale 0.67 -Sharpen 0.6
+```
+
+What did it, in the order it went in (measured in the same driving route, compared at equal draw
+counts because the frame follows the draws):
+
+| Change | Effect |
+|---|---|
+| Submissions prepared by our own thread, presents behind them, copies in place (`smooth2`) | ~106 → ~89 ms (Series X, 5,300 draws) |
+| The buffer table behind a shared (read) lock: six recording threads queued on one | ~10 ms |
+| A lock per descriptor slot's kept resource instead of one | ~3–5 ms |
+| **Series S profile** (interface plane, the title's own upscaler, render scale; ported from trustno1-coder/VIctory-NVIDIA) | ~80 → ~75 ms at fewer draws, card time halved |
+| A draw's stages share the tables they make afresh (`VICTORY_TABLE_STAGES`, fxceless) | ~79 → ~73.5 ms at 4,000 draws |
+| Textures picked by index uploaded by a thread of their own (`VICTORY_HEAP_WORKER`, fxceless) | ~73.5 → ~64.6 ms at 4,000 draws |
+| Uncommitted-memory answers kept per submission (`VICTORY_ABSENT_CACHE`): 9.6 ms a frame of `VirtualQuery` | ~4 ms at 4,000 draws, ~11 ms at 6,000 |
+| **Descriptor slots' made-from records behind 4,096 locks instead of one** | ~88–99 → ~78 ms at 6,000 draws |
+
+What was found on the way:
+- **Waiting, not work.** The largest gains came from threads queueing on shared locks, not from
+  doing less: the slots' one lock alone had the heap sync's helpers, the recording threads and
+  the submitting thread waiting ~150 ms a frame together against ~30 ms of work under it.
+  Spreading work over more threads did nothing while they queued on one lock.
+- **The card is not the limit any more.** On Series S it is busy ~17–19 ms of a ~60–90 ms frame;
+  skipping ray walks (`-BvhMiss`) saves card time only and costs light (and every shader is
+  translated again once, the switch being in the cache key). The frame is set by our CPU work
+  per draw, ~12–15 ms per 1,000 draws.
+- **Series S above 2/3 render scale stops at start**: the title's own out-of-memory check (an
+  allocation of 1–8 MB from a fixed pool fails). Reporting Series X's memory does not change it;
+  the pools are sized by the device type. 720p (0.67) plus `-Sharpen` is the sharpest that runs.
+  The driver's Radeon Image Sharpening does not reach the layer's window; `VICTORY_SHARPEN` does it
+  in our present.
+- **No dynamic-resolution feedback to steer.** A test that slowed parts of our pipeline in turn
+  first looked like the title sizing its work by our timing; it was the scene's own ~60 s traffic
+  cycle lining up with a 60 s rotation. Scaling the title's GPU clock and system timestamps
+  (it never reads the latter) changed nothing.
+- **Black roads on Series S** were textures refused "for lack of room": 3 GB of the card is kept
+  for render targets by default (measured on Series X at 4K), against ~1.25 GB on Series S at
+  720p. `play.ps1` keeps 1.5 GB and lets textures fill to 95 % for Series S; most roads are
+  textured now, some are still black.
+- **Memory**: the PC has 0.4–3 GB free while playing (32 GB); with a few runs between reboots
+  it falls further and frames slow down. Reboot between long sessions.
+- Measured and left off: spreading the copies' refresh over threads, more helper threads,
+  skipping the copy-back (a measurement: the frame did not move), the heap sync beside the
+  preparing, fence signals meeting waits, the lookup cache (our shared lock had taken its
+  gain), title memory in place (the page pool cannot be opened as one buffer), the marked
+  heap pass.
+- New tools: a timeline of a few seconds (`-Timeline`, opens in ui.perfetto.dev), a slow test
+  (`-SlowTest`), and switches that alternate every 20 s so one run is an A/B.
 
 Details, switches, scripts and what is still open: **[AMD.md](AMD.md)**.
 Tested on: RX 9070 XT 16 GB, Adrenalin 26.11.2, Ryzen 7 9800X3D, 32 GB, Windows 11.
