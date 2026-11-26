@@ -62,7 +62,9 @@ developer or publisher.
   card, joined parts, own views for shader writes, copies in place, submissions
   prepared by a thread of the layer). The per-thread memory of buffer lookups
   (`VICTORY_LOOKUP_CACHE`) is that fork's commit `32be36d`, from its pull request
-  #1237, merged here by hand over this fork's shared lock.
+  #1237, merged here by hand over this fork's shared lock. A draw's stages sharing
+  the tables they make afresh (`VICTORY_TABLE_STAGES`, on in `smooth2`) is that
+  fork's commit `5d659e0`, ported by hand.
 - **[trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**:
   the Series S pieces, ported here and adapted to this tree's presents:
   - the interface plane laid over the game (`compose.rs`, `VICTORY_COMPOSE`), its
