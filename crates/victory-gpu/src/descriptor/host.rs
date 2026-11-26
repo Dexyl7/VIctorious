@@ -26,6 +26,12 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// `made` as it is, read without its lock: [`HostHeap::mirror`]'s check
+    /// whether a slot is already up to date, which nearly every call ends
+    /// at. Written only where `made` is, under its lock. (Held for every
+    /// such check, the lock was 61 % of the mirror's time in the world,
+    /// waited for by the recording threads and the heap sync alike.)
+    seen: Box<[std::sync::atomic::AtomicU64]>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -951,6 +957,7 @@ impl HostHeap {
             dynamic: extra,
             sampler,
             made: Mutex::new(vec![0; count as usize]),
+            seen: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
             kept: Mutex::new(vec![None; (count + extra) as usize]),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
@@ -1418,12 +1425,20 @@ impl HostHeap {
         true
     }
 
+    /// Keeps `seen` in step with `made` (call with `made`'s lock held).
+    fn seen_set(&self, index: u32, key: u64) {
+        if let Some(seen) = self.seen.get(index as usize) {
+            seen.store(key, std::sync::atomic::Ordering::Release);
+        }
+    }
+
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        self.seen_set(index, 0);
         if key == 0 {
             return;
         }
@@ -1941,6 +1956,15 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // Already up to date: the view, without the lock (`seen`). A slot
+        // made with this key holds this view (keys are never 0).
+        if tag == VIEW_TAG
+            && SEEN_FAST.load(std::sync::atomic::Ordering::Relaxed)
+            && self.seen.get(index as usize).is_some_and(|s| s.load(std::sync::atomic::Ordering::Acquire) == key)
+            && let Some(view) = view_at(i, generation)
+        {
+            return Some(view);
+        }
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
@@ -1948,6 +1972,7 @@ impl HostHeap {
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.seen_set(index, 0);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -1990,6 +2015,17 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            let now = made[index as usize];
+            // Not up to date until written (and never, if left for later:
+            // a draw must make it): the lock-free check must not say it is.
+            // Left at the old key, it let a draw skip a buffer view that
+            // was never made, and the card hung on it.
+            self.seen_set(index, 0);
+            // The descriptor itself is written with the lock let go: it is
+            // this slot's alone, and descriptors may be made on several
+            // threads at once (`super::sync_heaps` mirrors pages in
+            // parallel). Held, it made every other mirror wait for it.
+            drop(made);
             let kept = if later {
                 None
             } else {
@@ -1999,6 +2035,14 @@ impl HostHeap {
                 null_for(&view, self.cpu(index));
             }
             self.keep(index, kept.flatten());
+            // Up to date for the lock-free check only once written, and
+            // only if no other thread made the slot anew meanwhile.
+            if now != 0 {
+                let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+                if made.get(index as usize) == Some(&now) {
+                    self.seen_set(index, now);
+                }
+            }
         }
         Some(view)
     }
@@ -3731,3 +3775,9 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
     }
 }
+
+/// Whether [`HostHeap::mirror`] answers "already up to date" without the
+/// lock (`VICTORY_SEEN_FAST`: on unless `0`; `alt` 20 s on, 20 s off, set by
+/// [`super::sync_heaps`]).
+pub(crate) static SEEN_FAST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+

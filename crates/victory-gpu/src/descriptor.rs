@@ -191,11 +191,25 @@ pub(crate) fn sync_heaps() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC").is_none_or(|v| v != "0")) {
         return;
     }
+    seen_fast_mode();
     let started = std::time::Instant::now();
     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
     let mut page_bytes: Vec<u8> = Vec::new();
     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    // Quiet pages (`quiet_pages`): skipped but on every `QUIET_CHECK`th
+    // frame, their ranges held until then. Both maps live under `SYNCING`.
+    let frame = crate::frame::current();
+    let check = !quiet_pages() || frame.is_multiple_of(QUIET_CHECK);
+    let mut quiet = QUIET.lock().unwrap_or_else(|e| e.into_inner());
+    let quiet = quiet.get_or_insert_with(std::collections::HashMap::new);
+    let mut pending = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    let pending = pending.get_or_insert_with(std::collections::HashMap::new);
+    let mut skipped = 0u64;
+    // Pages for the parallel mirror: host heap (its address), slots, the
+    // heap's start and step, the page's first byte, its bytes.
+    type Piece = (usize, std::ops::Range<u64>, (u64, u64), usize, Vec<u8>);
+    let mut batches: Vec<Vec<Piece>> = Vec::new();
     for &(start, end, at) in heaps.iter() {
         // SAFETY: registered heaps are live (removed when dropped).
         let heap = unsafe { &*(at as *const Heap) };
@@ -208,11 +222,35 @@ pub(crate) fn sync_heaps() {
         // Capped host heaps have no counterparts for the title slots reserved
         // for per-draw tables; raw writes there must not be mirrored.
         let mirrored_count = heap.desc.count.min(host.count());
-        for (range_from, range_end) in written.take(start as usize, end as usize) {
+        let mut ranges = written.take(start as usize, end as usize);
+        if check && let Some(held) = pending.remove(&at) {
+            // The same pages come back every frame: each byte once.
+            ranges.extend(held);
+            ranges.sort_unstable();
+            let mut joined: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+            for (a, b) in ranges {
+                match joined.last_mut() {
+                    Some(last) if a <= last.1 => last.1 = last.1.max(b),
+                    _ => joined.push((a, b)),
+                }
+            }
+            ranges = joined;
+        }
+        for (range_from, range_end) in ranges {
             let mut page = range_from & !(crate::watch::PAGE - 1);
             while page < range_end {
                 let from = page.max(range_from);
                 let to = (page + crate::watch::PAGE).min(range_end);
+                // A quiet page (`quiet_pages`): held for the next check.
+                if !check && page_at_once() && quiet.get(&page).is_some_and(|&q| q >= QUIET_AFTER) {
+                    let held = pending.entry(at).or_default();
+                    if !held.contains(&(from, to)) {
+                        held.push((from, to));
+                    }
+                    skipped += 1;
+                    page += crate::watch::PAGE;
+                    continue;
+                }
                 // The page's records are read through the kernel, into a
                 // copy: a page the title unmaps meanwhile fails the read
                 // where 2,048 reads in place would fault.
@@ -223,10 +261,30 @@ pub(crate) fn sync_heaps() {
                     // The page's records in one go, under one lock
                     // (`HostHeap::mirror_copied_page`); one by one below
                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                    // In parallel (`parallel_sync`): the page goes to a job,
+                    // run with the others below.
+                    if parallel_sync() && page_at_once() {
+                        let (host_at, bytes) = (std::ptr::from_ref(host) as usize, std::mem::take(&mut page_bytes));
+                        let piece = (host_at, slots, (start, step), from, bytes);
+                        match batches.last_mut() {
+                            Some(batch) if batch.len() < SYNC_BATCH => batch.push(piece),
+                            _ => batches.push(vec![piece]),
+                        }
+                        page += crate::watch::PAGE;
+                        continue;
+                    }
                     let slots = if page_at_once() {
                         let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
                         looked += seen;
                         mirrored += made;
+                        if quiet_pages() {
+                            if made == 0 {
+                                let q = quiet.entry(page).or_insert(0);
+                                *q = q.saturating_add(1);
+                            } else {
+                                quiet.remove(&page);
+                            }
+                        }
                         0..0
                     } else {
                         slots
@@ -253,11 +311,121 @@ pub(crate) fn sync_heaps() {
             }
         }
     }
+    // The pages handed out above, on the wide threads and this one; all are
+    // done when `wide_run` returns, with the heaps' read lock still held.
+    if !batches.is_empty() {
+        static COUNTS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = batches
+            .into_iter()
+            .map(|batch| {
+                Box::new(move || {
+                    let (mut seen, mut made) = (0, 0);
+                    for (host_at, slots, (start, step), from, bytes) in batch {
+                        // SAFETY: a host heap of a registered heap; the
+                        // registry is read-locked until every job is done.
+                        let host = unsafe { &*(host_at as *const host::HostHeap) };
+                        let (s, m) = host.mirror_copied_page(slots, (start, step), from, &bytes);
+                        seen += s;
+                        made += m;
+                    }
+                    COUNTS[0].fetch_add(seen, Relaxed);
+                    COUNTS[1].fetch_add(made, Relaxed);
+                }) as Box<dyn FnOnce() + Send>
+            })
+            .collect();
+        crate::shadow::wide_run(jobs);
+        looked += COUNTS[0].swap(0, Relaxed);
+        mirrored += COUNTS[1].swap(0, Relaxed);
+    }
+    // Held ranges of heaps that are gone.
+    if check && !pending.is_empty() {
+        pending.retain(|at, _| heaps.iter().any(|h| h.2 == *at));
+    }
     drop(heaps);
     for (count, n) in SYNCED.iter().zip([pages, looked, mirrored, started.elapsed().as_micros() as u64]) {
         count.fetch_add(n, Relaxed);
     }
+    QUIET_SKIPPED.fetch_add(skipped, Relaxed);
 }
+
+/// Sets [`host::SEEN_FAST`] from `VICTORY_SEEN_FAST` (0, 1, `alt`).
+#[cfg(windows)]
+fn seen_fast_mode() {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_SEEN_FAST").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    });
+    let on = match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0
+        }
+    };
+    if host::SEEN_FAST.swap(on, std::sync::atomic::Ordering::Relaxed) != on {
+        tracing::info!(fast = on, "descriptor slots: lock-free check switched (VICTORY_SEEN_FAST)");
+    }
+}
+
+/// Whether [`sync_heaps`] mirrors the changed pages on several threads
+/// (`VICTORY_HEAP_SYNC_PARALLEL`, on unless `0`): in the world 38,000 to
+/// 40,000 new records a frame were made one by one on the submitting
+/// thread, 37 to 53 ms a frame, while the wide threads stood idle.
+#[cfg(windows)]
+fn parallel_sync() -> bool {
+    // 0 off, 1 on, 2 in turn (`alt`: 20 s on, 20 s off).
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_PARALLEL").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 0;
+            static SAID: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if SAID.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(parallel = on, "descriptor mirror switched (VICTORY_HEAP_SYNC_PARALLEL=alt)");
+            }
+            on
+        }
+    }
+}
+/// Pages to a job of the parallel mirror.
+#[cfg(windows)]
+const SYNC_BATCH: usize = 16;
+
+/// Whether [`sync_heaps`] skips quiet pages (`VICTORY_HEAP_SYNC_QUIET=1`;
+/// off: in the world no page was ever quiet, every one held new records): a page whose last `QUIET_AFTER` looks mirrored nothing (the
+/// title rewrites its per-draw tables every frame, and the draws that read
+/// them through tables mirror those slots themselves: 680,000 of 880,000
+/// slots looked at a frame in the world, 37 ms a frame) is looked at only
+/// every `QUIET_CHECK`th frame; what the title wrote there meanwhile is held
+/// and looked at then. A slot there that the draws do not read through
+/// tables may be mirrored up to that many frames late.
+#[cfg(windows)]
+fn quiet_pages() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_SYNC_QUIET").is_some_and(|v| v == "1"))
+}
+#[cfg(windows)]
+const QUIET_AFTER: u8 = 4;
+#[cfg(windows)]
+const QUIET_CHECK: u64 = 8;
+/// Looks without a mirrored record, by page (title address).
+#[cfg(windows)]
+static QUIET: std::sync::Mutex<Option<std::collections::HashMap<usize, u8>>> = std::sync::Mutex::new(None);
+/// Ranges held for the next check, by heap.
+#[cfg(windows)]
+static PENDING: std::sync::Mutex<Option<std::collections::HashMap<usize, Vec<(usize, usize)>>>> = std::sync::Mutex::new(None);
+/// Page pieces skipped, since the last frame line.
+#[cfg(windows)]
+static QUIET_SKIPPED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Since the last frame line, of [`sync_heaps`]: changed pages of placed
 /// shader-visible heaps looked at, slots on them, slots whose record was
@@ -275,12 +443,14 @@ pub(crate) fn sync_line(frames: f64) {
     }
     tracing::info!(
         "descriptor records the title copied into its heap as bytes (VICTORY_HEAP_SYNC=0: not looked for): per frame \
-         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms",
+         {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.0} left to the \n         draws that read them through tables (VICTORY_HEAP_SYNC_TABLES=1 mirrors those too), {:.2} ms; {:.1} quiet pages held for \
+         later (VICTORY_HEAP_SYNC_QUIET=0: none)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
-        micros as f64 / 1000.0 / frames
+        micros as f64 / 1000.0 / frames,
+        QUIET_SKIPPED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
 }
 
