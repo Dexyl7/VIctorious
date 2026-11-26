@@ -5904,6 +5904,9 @@ impl Host {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         let was_working = working(true);
         submitting(1, runs.len());
+        // A new submission: what was found uncommitted is asked again
+        // (`crate::watch::uncommitted_end`).
+        crate::watch::uncommitted_stale();
         // Flights in the air ([`late`]): a submission that is waited for
         // settles them first, one sent ahead only if preparing it reads
         // what they write.

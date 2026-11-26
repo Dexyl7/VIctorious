@@ -885,8 +885,80 @@ fn protect_here(g: &mut Guards, from: usize, to: usize) {
     }
 }
 
+/// Uncommitted regions of title memory found by [`uncommitted_end`] since
+/// the submission being prepared began (blocks `[first, end)`), and the
+/// count of submissions (and remappings) they are from.
+static UNCOMMITTED: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeMap::new()));
+/// Bumped where an answer of [`uncommitted_end`] may go stale: a
+/// submission's preparing begins ([`ask_once`]), the runtime maps or
+/// unmaps title memory ([`title_memory_remapped`]).
+static UNCOMMITTED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn uncommitted_stale() {
+    UNCOMMITTED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`uncommitted_end`] remembers its answers for the rest of the
+/// submission being prepared (`VICTORY_ABSENT_CACHE`: 1 on, the default;
+/// 0 off; `alt` 20 s each).
+///
+/// A driving profile had 9.6 ms a frame of the submitting thread in
+/// `VirtualQuery` from here: blocks of title memory once found uncommitted
+/// (streaming areas) are asked about again at every refresh that covers
+/// them, some 22,000 refreshes a frame over the same regions. The title
+/// may commit memory at any moment, so an answer is only as fresh as the
+/// moment it was asked; remembered from the start of a submission's
+/// preparing, it is as fresh as that, a few milliseconds.
+fn absent_cache() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_ABSENT_CACHE").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(cached = on, "answers about uncommitted title memory remembered per submission switched (VICTORY_ABSENT_CACHE=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// The end (exclusive) of the whole uncommitted blocks starting at `block`.
 fn uncommitted_end(block: usize) -> usize {
+    if !absent_cache() {
+        return uncommitted_end_asked(block);
+    }
+    let epoch = UNCOMMITTED_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut kept = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.0 != epoch {
+            kept.0 = epoch;
+            kept.1.clear();
+        } else if let Some((_, &end)) = kept.1.range(..=block).next_back()
+            && end > block
+        {
+            return end;
+        }
+    }
+    let end = uncommitted_end_asked(block);
+    if end > block {
+        let mut kept = UNCOMMITTED.lock().unwrap_or_else(|e| e.into_inner());
+        if kept.0 == epoch {
+            kept.1.insert(block, end);
+        }
+    }
+    end
+}
+
+/// [`uncommitted_end`], asked of Windows.
+fn uncommitted_end_asked(block: usize) -> usize {
     use windows_sys::Win32::System::Memory::{
         MEM_FREE, MEM_RESERVE, MEMORY_BASIC_INFORMATION, VirtualQuery,
     };
@@ -1116,6 +1188,7 @@ pub fn title_memory_reading_now() -> Option<Reading> {
 /// shows is new and read-write, so it is no longer guarded (nor known
 /// unmapped).
 pub fn title_memory_remapped(at: usize, len: usize) {
+    uncommitted_stale();
     let t = std::time::Instant::now();
     // Stored pages followed there end (`VICTORY_BACK_READS`): counted only.
     #[cfg(feature = "diagnostics")]
