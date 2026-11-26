@@ -695,6 +695,7 @@ extern "system" fn list_type(this: This) -> u32 {
     unsafe { (*this.cast::<List>()).kind }
 }
 extern "system" fn close(this: This) -> HRESULT {
+    crate::timeline::list_closed();
     #[cfg(windows)]
     if !this.is_null() {
         // SAFETY: the title passes one of our lists, and records nothing
@@ -708,6 +709,7 @@ extern "system" fn close(this: This) -> HRESULT {
     S_OK
 }
 extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT {
+    crate::timeline::list_open();
     if allocator.is_null() {
         return E_INVALIDARG;
     }

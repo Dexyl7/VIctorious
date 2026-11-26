@@ -54,6 +54,13 @@ mod inplace;
 pub mod list;
 pub mod object;
 pub mod pipeline;
+mod timeline;
+// Series S interface plane laid over the game (VICTORY_COMPOSE=1).
+#[cfg(windows)]
+mod compose;
+// Sharpening of the frame we show (VICTORY_SHARPEN).
+#[cfg(windows)]
+mod sharpen;
 #[cfg(windows)]
 mod plaincopy;
 #[cfg(windows)]

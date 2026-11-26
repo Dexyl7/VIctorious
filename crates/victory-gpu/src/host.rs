@@ -3225,6 +3225,54 @@ fn stale_under_flights(runs: &[&HostList]) -> bool {
     spans.iter().any(|(shadow, from, to)| shadow.stale_under_writes(*from, *to - *from))
 }
 
+/// Whether a wait for a memory value at `[address, address + bytes)` is
+/// met by a fence signal waiting behind the flights in the air: a list
+/// that waits on a fence's value in memory (the fence's GPU address),
+/// which the line sets only when the flights before it land. The part
+/// behind the wait goes to the card behind those flights, as for a
+/// bottom-of-pipe write ([`late_met`]). Without this such a part waited
+/// for the landing, and the card stood idle while it was prepared: the
+/// timeline had every preparing begin the moment the card was done
+/// (`VICTORY_SIGNAL_MEETS`: 1 on, the default; 0 off; `alt` 20 s each).
+fn signal_meets(line: &[Late], address: usize, bytes: usize, wait: &crate::list::ValueWait) -> bool {
+    if bytes > 8 || !signal_meets_on() {
+        return false;
+    }
+    let met = line.iter().any(|item| match item {
+        Late::Signal(fence, value) => crate::fence::value_address(*fence as crate::object::This) == address && wait.holds_for(*value),
+        _ => false,
+    });
+    if met {
+        LATE_STATS_SIGNAL_MEETS.fetch_add(1, Ordering::Relaxed);
+        crate::timeline::mark("wait met by a fence signal in the air", address as u64);
+    }
+    met
+}
+
+static LATE_STATS_SIGNAL_MEETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn signal_meets_on() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_SIGNAL_MEETS").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                let n = LATE_STATS_SIGNAL_MEETS.swap(0, Ordering::Relaxed);
+                tracing::info!(on, met_before = n, "waits met by fence signals in the air switched (VICTORY_SIGNAL_MEETS=alt)");
+            }
+            on
+        }
+    }
+}
+
 /// A fence signal on a queue ([`late`]): goes behind the flights in the
 /// air, if there are any, and is set when they are settled. Whether it
 /// did; if not the caller sets the fence now.
@@ -3260,6 +3308,9 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
         if line.line.is_empty() && line.in_hand.is_empty() {
             return false;
         }
+        if signal_meets(&line.line, address, bytes, wait) {
+            return true;
+        }
         let mut unsure = touches(&line.written, address, address + bytes);
         // (With the relay: first the writes of flights being landed.)
         let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
@@ -3294,6 +3345,9 @@ pub(crate) fn late_met(wait: &crate::list::ValueWait) -> bool {
 pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
     let (address, bytes) = wait.place();
     let line = line();
+    if signal_meets(&line.line, address, bytes, wait) {
+        return true;
+    }
     let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
         Late::Write(at, what, n) => Some((at, what, n)),
         _ => None,
@@ -3334,6 +3388,82 @@ pub(crate) fn settle_for_fence() {
 
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
+/// Whether a submission's descriptor heap sync runs on a thread of its
+/// own beside the rest of its preparing (`VICTORY_HEAP_SYNC_BESIDE`: 0 off,
+/// 1 on, `alt` 20 s each; off by default). The timeline showed the
+/// submitting thread busy 94 % of the time, the sync some 19 ms a frame of
+/// it and the refreshes after it some 23: the two read title memory and
+/// write different things (host descriptors; host copies).
+fn heap_sync_beside() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_SYNC_BESIDE").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(beside = on, "the heap sync beside the preparing switched (VICTORY_HEAP_SYNC_BESIDE=alt)");
+            }
+            on
+        }
+    }
+}
+
+/// The heap sync's thread: asked (true) and done (false).
+static HEAP_SYNC: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+static HEAP_SYNC_MOVED: std::sync::Condvar = std::sync::Condvar::new();
+static HEAP_SYNC_THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Starts the heap sync on its own thread (made on first use).
+fn heap_sync_begin() {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        let spawned = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+            crate::framelog::keep_on_fast_cores("victory-heap-sync");
+            loop {
+                {
+                    let mut asked = HEAP_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+                    while !*asked {
+                        asked = HEAP_SYNC_MOVED.wait(asked).unwrap_or_else(|e| e.into_inner());
+                    }
+                }
+                {
+                    let _timeline = crate::timeline::span("heap sync beside", 0);
+                    crate::descriptor::sync_heaps();
+                }
+                *HEAP_SYNC.lock().unwrap_or_else(|e| e.into_inner()) = false;
+                HEAP_SYNC_MOVED.notify_all();
+            }
+        });
+        if spawned.is_err() {
+            tracing::warn!("no thread for the heap sync beside the preparing");
+        } else {
+            HEAP_SYNC_THREAD.store(true, Ordering::Release);
+        }
+    });
+    if !HEAP_SYNC_THREAD.load(Ordering::Acquire) {
+        crate::descriptor::sync_heaps();
+        return;
+    }
+    *HEAP_SYNC.lock().unwrap_or_else(|e| e.into_inner()) = true;
+    HEAP_SYNC_MOVED.notify_all();
+}
+
+/// Waits for the heap sync [`heap_sync_begin`] started.
+fn heap_sync_end() {
+    let _timeline = crate::timeline::span("waiting for the heap sync", 0);
+    let mut asked = HEAP_SYNC.lock().unwrap_or_else(|e| e.into_inner());
+    while *asked {
+        asked = HEAP_SYNC_MOVED.wait(asked).unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 fn land() {
     let landed = std::mem::take(&mut line().landed);
     for (lists, order) in landed {
@@ -3524,8 +3654,13 @@ fn relay_worker() {
             }
         };
         match next {
-            Ok(items) => host.relay_land(items, &mut fetch),
+            Ok(items) => {
+                crate::timeline::autopilot_hold_landing();
+                let _timeline = crate::timeline::span("we land and tell the title", 0);
+                host.relay_land(items, &mut fetch);
+            }
             Err(target) => {
+                let _timeline = crate::timeline::span("card still running", target);
                 let waiting = std::time::Instant::now();
                 // SAFETY: the host's fence and this thread's event.
                 let waited = unsafe {
@@ -3547,7 +3682,36 @@ fn relay_worker() {
 /// once, the pieces that differ found on several threads; but the merge is
 /// `Shadow::relay_merge`, which does not write the copy, and the ranges
 /// are not done with here (each flight's are, afterwards).
+/// A measurement, not a fix: what shaders wrote is not brought back to
+/// title memory at all (`VICTORY_NO_BACK`: 1, or `alt` 20 s each). The
+/// card keeps what it wrote in its copies; the title reads the old bytes.
+/// How much of the frame the bringing back costs, and what breaks
+/// without it.
+pub(crate) fn no_back() -> bool {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_NO_BACK").as_deref() {
+        Ok("1") => 1,
+        Ok("alt") => 2,
+        _ => 0,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: OnceLock<std::time::Instant> = OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(skipped = on, "what shaders wrote brought back switched (VICTORY_NO_BACK=alt)");
+            }
+            on
+        }
+    }
+}
+
 fn relay_hand_back(back: &[Declared]) {
+    if no_back() {
+        return;
+    }
     let mut work: Vec<(std::sync::Arc<crate::shadow::Shadow>, usize, usize)> = Vec::new();
     for (shadow, declared) in back {
         if shadow.carded() {
@@ -3587,6 +3751,14 @@ fn relay_hand_back(back: &[Declared]) {
 /// For the frame-rate line, with [`late`]: what the line of flights did
 /// per frame since the last one.
 fn late_line(frames: f64) {
+    {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE)",
+            found[0],
+            found[1]
+        );
+    }
     if !late() {
         return;
     }
@@ -3853,6 +4025,9 @@ fn read_backs(list: &HostList) {
 /// After the card ran what declared `back`: what shaders wrote there goes
 /// into title memory, and the ranges are done with.
 fn hand_back(back: &[Declared]) {
+    if no_back() {
+        return;
+    }
     if crate::shadow::wide_back() {
         // Every range first (the pieces that differ, found on several
         // threads), then the merges, in order, as below.
@@ -4786,20 +4961,21 @@ impl Host {
             // before these are done with (`card_done`).
             let differs = unsafe { std::slice::from_raw_parts(differs as *const u32, dwords) };
             let mut seen = std::collections::HashSet::new();
+            let skip = no_back();
             for &(number, plan) in plans {
                 let mut flags: Vec<(usize, u32, bool)> = plan
                     .ranges
                     .iter()
                     .flat_map(|r| {
                         (0..r.span.pieces).map(move |p| {
-                            let flagged = !r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0);
+                            let flagged = !skip && (!r.compared || differs.get((r.at + p) as usize).is_none_or(|&d| d != 0));
                             (std::sync::Arc::as_ptr(&r.shadow) as usize, r.span.first + p, flagged)
                         })
                     })
                     .collect();
                 // A piece an earlier fetch brought down while this flight
                 // may have been writing it: fetched, flagged or not.
-                for flag in flags.iter_mut().filter(|f| !f.2) {
+                for flag in flags.iter_mut().filter(|f| !skip && !f.2) {
                     if fetched_beside(noted.get(&(flag.0, flag.1)).copied(), number) {
                         flag.2 = true;
                         again += 1;
@@ -5305,7 +5481,7 @@ impl Host {
         let mut total = 0u64;
         for (i, r) in plan.ranges.iter().enumerate() {
             for p in 0..r.span.pieces {
-                if r.compared && differs[(r.at + p) as usize] == 0 {
+                if no_back() || (r.compared && differs[(r.at + p) as usize] == 0) {
                     continue;
                 }
                 let (lo, hi) = r.shadow.card_piece(&r.span, p);
@@ -5699,6 +5875,8 @@ impl Host {
     /// to be done once they have run comes back with the submission lock
     /// still held.
     fn submit<'a>(&'a self, runs: &[&HostList], late: bool) -> Option<(std::sync::MutexGuard<'a, u64>, Sent)> {
+        let mut _timeline = crate::timeline::span("we prepare and send", 0);
+        crate::timeline::slow_test_submit();
         #[cfg(feature = "diagnostics")]
         let called = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
@@ -5724,16 +5902,31 @@ impl Host {
                 self.settle(&mut submitted, why);
             }
         }
+        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         // Descriptors the title copied into placed heaps directly, before
-        // command lists that index those slots are submitted.
-        crate::descriptor::sync_heaps();
+        // command lists that index those slots are submitted. Beside the
+        // rest of the preparing (`heap_sync_beside`) when no sweep comes
+        // now: the sweep must see every slot the sync names.
+        let beside = heap_sync_beside()
+            && late
+            && flying()
+            && !(late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_every_ms());
+        if beside {
+            heap_sync_begin();
+        } else {
+            crate::descriptor::sync_heaps();
+        }
         let behind = late && flying();
         // Before this submission counts as started: what the sweep lets go
         // of is named by no list, and nothing runs now (behind flights the
         // sweep waits for a submission that finds none in the air: there is
         // one at every present).
-        static SWEPT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         if !behind {
+            // (A flight landed since `beside` was decided: the sync is
+            // done before the sweep all the same.)
+            if beside {
+                heap_sync_end();
+            }
             sweep();
             SWEPT.store(now_ms(), Ordering::Relaxed);
         } else if late_free_present() && now_ms() > SWEPT.load(Ordering::Relaxed) + sweep_every_ms() {
@@ -5745,8 +5938,11 @@ impl Host {
         }
         let behind = late && flying();
         // The slots that waited for a texture's host copy, before the
-        // lists that may read them run.
-        crate::descriptor::make_waiting();
+        // lists that may read them run (after the sync, which may be
+        // running beside: then further down).
+        if !beside {
+            crate::descriptor::make_waiting();
+        }
         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
         // The ranges shaders write are counted for it (with the relay).
         crate::shadow::preparing(this_submission);
@@ -5821,6 +6017,10 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        if beside {
+            heap_sync_end();
+            crate::descriptor::make_waiting();
+        }
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
@@ -5852,6 +6052,7 @@ impl Host {
                 self.queue.ExecuteCommandLists(&lists);
                 self.queue.Signal(&self.fence, *submitted)
             };
+            _timeline.set_arg(*submitted);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
@@ -8471,13 +8672,26 @@ impl Host {
     /// as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+        self.present_over(texture, state, None, frame)
+    }
+
+    /// [`Self::present`], with a second plane laid over `texture` if there
+    /// is one (`crate::compose`): its texture and its state, which it is
+    /// left in.
+    pub(crate) fn present_over(
+        &self,
+        texture: &ID3D12Resource,
+        state: u32,
+        over: Option<(&ID3D12Resource, u32)>,
+        frame: u64,
+    ) -> Option<bool> {
         let showing = std::time::Instant::now();
-        let shown = self.present_now(texture, state, frame);
+        let shown = self.present_now(texture, state, over, frame);
         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
         shown
     }
 
-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
+    fn present_now(&self, texture: &ID3D12Resource, state: u32, over: Option<(&ID3D12Resource, u32)>, frame: u64) -> Option<bool> {
         // SAFETY: a live resource.
         let desc = unsafe { texture.GetDesc() };
         let Some(format) = swap_format(desc.Format) else {
@@ -8561,7 +8775,18 @@ impl Host {
                     D3D12_RESOURCE_STATE_COPY_DEST,
                 ),
             ]);
-            list.CopyResource(&back, texture);
+            // The second plane laid over the first, into a texture of ours
+            // shown instead (`crate::compose`).
+            let laid = over.and_then(|(ui, ui_state)| crate::compose::record(&self.device, list, texture, ui, ui_state));
+            if let Some(laid) = &laid {
+                copy.keep(laid);
+            }
+            // Then sharpened, if asked for (`crate::sharpen`).
+            let sharp = crate::sharpen::record(&self.device, list, laid.as_ref().unwrap_or(texture));
+            if let Some(sharp) = &sharp {
+                copy.keep(sharp);
+            }
+            list.CopyResource(&back, sharp.as_ref().or(laid.as_ref()).unwrap_or(texture));
             // The frame rate, into the corner of what is shown (not of the
             // title's own frame, which the lines below read back).
             crate::fpsbox::draw(self, list, &back, (width, height, format));

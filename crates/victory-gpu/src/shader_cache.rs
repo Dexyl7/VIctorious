@@ -73,6 +73,10 @@ fn build() -> [u8; 32] {
         h.update(exe);
     }
     h.update(&victory_shader::emit::translation_fingerprint());
+    // Switches that change translations: their own cache entries.
+    if std::env::var_os("VICTORY_BVH_MISS").is_some_and(|v| v == "1") {
+        h.update(b"VICTORY_BVH_MISS");
+    }
     h.update(include_bytes!("shader_cache.rs"));
     *h.finalize().as_bytes()
 }

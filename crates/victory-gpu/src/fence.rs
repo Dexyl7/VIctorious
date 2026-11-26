@@ -84,6 +84,7 @@ pub(crate) extern "system" fn completed(this: This) -> u64 {
     fence(this).value.load(Ordering::Acquire)
 }
 extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c_void) -> HRESULT {
+    crate::timeline::mark("title waits on a fence", value);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     if fence.value.load(Ordering::Acquire) >= value {
@@ -120,6 +121,7 @@ extern "system" fn set_event_on_completion(this: This, value: u64, event: *mut c
 }
 /// Moves the fence to `value` and sets the events that waited for it.
 pub(crate) fn set(this: This, value: u64) {
+    crate::timeline::mark("title fence set", value);
     let fence = fence(this);
     let mut waiters = fence.waiters.lock().unwrap_or_else(|e| e.into_inner());
     fence.value.store(value, Ordering::Release);
@@ -144,6 +146,11 @@ pub(crate) extern "system" fn signal(this: This, value: u64) -> HRESULT {
 extern "system" fn creation_flags(this: This) -> u32 {
     fence(this).flags
 }
+/// Where fence `this`'s value lives in memory (as [`gpu_address`] says).
+pub(crate) fn value_address(this: This) -> usize {
+    (&raw const fence(this).value) as usize
+}
+
 /// Where the value lives (GPU addresses are CPU addresses).
 extern "system" fn gpu_address(this: This) -> u64 {
     (&raw const fence(this).value) as u64

@@ -61,7 +61,14 @@ enum Held {
     /// With [`present_behind`]: the title's present of a frame, due after
     /// what the queue holds before it: the host texture shown, the state
     /// the title's lists leave it in, and the frame's number.
-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
+    /// A frame to show, its state, its number, and the plane laid over it
+    /// (`crate::compose`) with its state.
+    Present(
+        windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        u32,
+        u64,
+        Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    ),
 }
 
 /// Presents that are in a queue's line and have not run ([`Held::Present`]).
@@ -163,9 +170,10 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
     crate::resource::host_transition(resource, state);
     let texture = texture.clone();
+    let over = second_plane(planes, plane_parameters, resource);
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
-        Held::Present(texture, state, frame)
+        Held::Present(texture, state, frame, over)
     });
     if sent {
         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
@@ -771,6 +779,7 @@ fn release_held_now(all: bool) {
                     Some(&Held::Wait(fence, value))
                         if !all && crate::fence::completed(fence as This) < value =>
                     {
+                        crate::timeline::mark("held at a fence wait", value);
                         break;
                     }
                     // With parts taken and not sent: only what is known
@@ -784,7 +793,10 @@ fn release_held_now(all: bool) {
                             JOINED[4].fetch_add(1, Ordering::Relaxed);
                         }
                     }
-                    Some(Held::Value(wait)) if !all && !value_met(wait) => break,
+                    Some(Held::Value(wait)) if !all && !value_met(wait) => {
+                        crate::timeline::mark("held at a memory wait", wait.place().0 as u64);
+                        break;
+                    }
                     // The frame is shown behind the parts taken: they are
                     // sent first.
                     Some(Held::Present(..)) if !joined.is_empty() => break,
@@ -891,10 +903,11 @@ fn release_held_now(all: bool) {
                             }
                         }
                     }
-                    Held::Present(texture, state, frame) => {
+                    Held::Present(texture, state, frame, over) => {
                         let show = || {
                             if let Some(host) = crate::host::host() {
-                                let _ = host.present(&texture, state, frame);
+                                let over = over.as_ref().map(|(t, s)| (t, *s));
+                                let _ = host.present_over(&texture, state, over, frame);
                             }
                         };
                         if all {
@@ -1031,6 +1044,7 @@ extern "system" fn release(this: This) -> u32 {
 /// Runs the lists' host lists and waits for them (decision 0007). A queue
 /// that waits for a fence keeps them until the fence is reached.
 extern "system" fn execute(this: This, count: u32, lists: *const This) {
+    let _timeline = crate::timeline::span("title submits", u64::from(count));
     #[cfg(windows)]
     let started = std::time::Instant::now();
     execute_now(this, count, lists);
@@ -1167,6 +1181,7 @@ extern "system" fn signal(this: This, fence: This, value: u64) -> HRESULT {
 /// ([`Held`]) until a signal or a list's bottom-of-pipe write gets the
 /// fence there.
 extern "system" fn wait(this: This, fence: This, value: u64) -> HRESULT {
+    crate::timeline::mark("title queue waits on a fence", value);
     if fence.is_null() {
         return E_INVALIDARG;
     }
@@ -1241,14 +1256,24 @@ pub(crate) enum Written {
 impl Written {
     /// Stores the low `bytes` (4 or 8) of the value at `at`.
     pub(crate) fn write(self, at: *mut u8, bytes: usize) {
+        autopilot_count(match self {
+            Written::Value(_) => 0,
+            Written::GpuTimestamp => 1,
+            Written::SystemTimestamp => 2,
+        });
         let value = match self {
             Written::Value(v) => v,
             Written::GpuTimestamp => {
-                static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-                let elapsed = START.get_or_init(std::time::Instant::now).elapsed();
+                let elapsed = gpu_clock();
                 (elapsed.as_nanos() / (1_000_000_000 / u128::from(TIMESTAMP_FREQUENCY))) as u64
             }
-            Written::SystemTimestamp => system_timestamp(),
+            Written::SystemTimestamp => {
+                if crate::timeline::autopilot_phase() == 2 {
+                    stretched_system_timestamp()
+                } else {
+                    system_timestamp()
+                }
+            }
         };
         // SAFETY: the title names writable GPU memory (unified with ours).
         unsafe {
@@ -1291,6 +1316,7 @@ extern "system" fn present(
     plane_parameters: *const Plane,
     _parameters: *const u8,
 ) -> HRESULT {
+    let _timeline = crate::timeline::span("title presents", 0);
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
     let hr = present_now(this, planes, plane_parameters);
@@ -1404,7 +1430,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        let shown = host.present(texture, state, frame);
+        let over = second_plane(planes, plane_parameters, resource);
+        let shown = host.present_over(texture, state, over.as_ref().map(|(t, s)| (t, *s)), frame);
         crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
@@ -1674,4 +1701,132 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
+}
+
+/// The clock the title's GPU timestamps read: time since the first one,
+/// run faster by `VICTORY_GPU_CLOCK_SCALE` (a factor, 1 by default; `x,alt`
+/// turns it on and off every 20 s), and never backwards.
+///
+/// Why: the title measures its GPU time with timestamps and sizes its
+/// work by them (draws, and likely its render resolution). Ours are the
+/// moments the bottom-of-pipe writes reach title memory, not the card's
+/// time. A run that slowed parts of ours in turn (`VICTORY_SLOW_TEST`)
+/// had the title draw 3,500 draws a frame in one phase and 5,700 in
+/// another, standing still. A clock that runs faster tells it the card
+/// is slower than it is, so it draws less for the same 30 fps budget the
+/// console has.
+fn gpu_clock() -> std::time::Duration {
+    struct Clock {
+        real: std::time::Instant,
+        shown: std::time::Duration,
+    }
+    static CLOCK: std::sync::Mutex<Option<Clock>> = std::sync::Mutex::new(None);
+    static SCALE: std::sync::OnceLock<(f64, bool)> = std::sync::OnceLock::new();
+    let (factor, alternating) = *SCALE.get_or_init(|| {
+        let v = std::env::var("VICTORY_GPU_CLOCK_SCALE").unwrap_or_default();
+        let mut parts = v.split(',');
+        let factor = parts.next().and_then(|f| f.trim().parse::<f64>().ok()).filter(|f| (0.1..=20.0).contains(f)).unwrap_or(1.0);
+        let alternating = parts.next().is_some_and(|p| p.trim() == "alt");
+        if factor != 1.0 {
+            tracing::info!(factor, alternating, "the title's GPU clock runs faster (VICTORY_GPU_CLOCK_SCALE)");
+        }
+        (factor, alternating)
+    });
+    let now = std::time::Instant::now();
+    let mut clock = CLOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let clock = clock.get_or_insert(Clock { real: now, shown: std::time::Duration::ZERO });
+    let scale = if alternating {
+        static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+        static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+        if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+            tracing::info!(scaled = on, factor, "the title's GPU clock scale switched (VICTORY_GPU_CLOCK_SCALE=alt)");
+        }
+        if on { factor } else { 1.0 }
+    } else {
+        factor
+    };
+    let step = now.saturating_duration_since(clock.real);
+    clock.real = now;
+    clock.shown += step.mul_f64(scale);
+    clock.shown
+}
+
+/// Bottom-of-pipe writes by kind (plain values, GPU timestamps, system
+/// timestamps), said every five seconds when `VICTORY_AUTOPILOT_TEST=1`:
+/// which clocks the title reads its GPU work's timing from at all.
+static WRITTEN_KINDS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+fn autopilot_count(kind: usize) {
+    WRITTEN_KINDS[kind].fetch_add(1, Ordering::Relaxed);
+    if crate::timeline::autopilot_phase() == u8::MAX {
+        return;
+    }
+    static LAST: AtomicU64 = AtomicU64::new(0);
+    let now = crate::host::now_ms();
+    let last = LAST.load(Ordering::Relaxed);
+    if now >= last + 5000 && LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        let n = WRITTEN_KINDS.each_ref().map(|c| c.swap(0, Ordering::Relaxed));
+        tracing::info!(
+            values = n[0],
+            gpu_timestamps = n[1],
+            system_timestamps = n[2],
+            "bottom-of-pipe writes in the last 5 s by kind (VICTORY_AUTOPILOT_TEST)"
+        );
+    }
+}
+
+/// The performance counter, run twice as fast since the first call
+/// (`VICTORY_AUTOPILOT_TEST` phase 2), never backwards.
+fn stretched_system_timestamp() -> u64 {
+    static STATE: std::sync::Mutex<Option<(u64, u64)>> = std::sync::Mutex::new(None);
+    let real = system_timestamp();
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let (last_real, last_shown) = state.get_or_insert((real, real));
+    let shown = *last_shown + 2 * real.saturating_sub(*last_real);
+    *last_real = real;
+    *last_shown = shown;
+    shown
+}
+
+/// A present's second plane, to be laid over the first (`crate::compose`),
+/// with `VICTORY_COMPOSE=1`: its host texture and the host state the lists
+/// recorded so far leave it in. A Series S title presents two planes, the
+/// game and the interface (menus, loading screens, subtitles), 72-byte
+/// descriptions each; only the first was shown, so everything before
+/// gameplay was black. Ported from trustno1-coder/VIctory-NVIDIA (commit
+/// 7997a20), from a fork's pull request #1189 (fxceless).
+#[cfg(windows)]
+fn second_plane(
+    planes: u32,
+    plane_parameters: *const Plane,
+    first: This,
+) -> Option<(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)> {
+    const STRIDE: usize = 72;
+    const COPY_SOURCE: u32 = 0x800;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)");
+        }
+        on
+    });
+    if !on || planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    if resource == first {
+        return None;
+    }
+    let texture = crate::resource::host_resource(resource)?.clone();
+    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+    crate::resource::host_transition(resource, state);
+    Some((texture, state))
 }

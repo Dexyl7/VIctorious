@@ -1108,6 +1108,7 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        crate::timeline::slow_test_draw();
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1588,39 +1589,96 @@ impl State {
         static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         let mut alive = !GONE.load(Ordering::Relaxed) && crate::descriptor::host::device_removed().is_none();
         HEAP_PASS_PARTS[1].fetch_add(slots.len() as u64, Ordering::Relaxed);
-        for (n, &index) in slots.iter().enumerate() {
-            ranges.remove(&index);
-            let Some(handle) = heap.handle(index) else {
-                continue;
-            };
-            let Some(view) = host.mirror(index, handle, true) else {
-                continue;
-            };
-            // Every 64 views while the device lives (a cheap query).
-            if alive
-                && n % 64 == 63
-                && let Some(why) = crate::descriptor::host::device_removed()
-            {
-                alive = false;
+        if heap_pass_wide() && slots.len() >= 2 * HEAP_PASS_PIECE {
+            // On the wide threads and this one: each slot's mirror and the
+            // copy its view shows are that slot's alone, and the mirror is
+            // made for several threads at once (the heap sync does it so).
+            // One thread did it all, 45 ms of a recording thread a frame,
+            // while the threads that waited for that list waited too.
+            for index in &slots {
+                ranges.remove(index);
+            }
+            type Found = Vec<(u32, std::sync::Arc<crate::shadow::Shadow>, u64, u64)>;
+            let found: std::sync::Arc<std::sync::Mutex<Found>> = std::sync::Arc::default();
+            let (heap_at, host_at) = (std::ptr::from_ref(heap) as usize, std::ptr::from_ref(host) as usize);
+            let jobs: Vec<Box<dyn FnOnce() + Send>> = slots
+                .chunks(HEAP_PASS_PIECE)
+                .map(|piece| {
+                    let piece = piece.to_vec();
+                    let found = found.clone();
+                    Box::new(move || {
+                        // SAFETY: the title's heap and its host heap, alive
+                        // for this pass: `wide_run` returns when every job
+                        // is done, and the pass holds the list being recorded.
+                        let (heap, host) = unsafe {
+                            (&*(heap_at as *const crate::descriptor::Heap), &*(host_at as *const crate::descriptor::host::HostHeap))
+                        };
+                        let mut mine: Found = Vec::with_capacity(piece.len());
+                        for index in piece {
+                            let Some(handle) = heap.handle(index) else {
+                                continue;
+                            };
+                            let Some(view) = host.mirror(index, handle, true) else {
+                                continue;
+                            };
+                            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                                continue;
+                            };
+                            #[cfg(feature = "diagnostics")]
+                            if host.shows(index, &shadow.buffer) == Some(false) {
+                                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                            }
+                            mine.push((index, shadow, address, address + len));
+                        }
+                        found.lock().unwrap_or_else(|e| e.into_inner()).append(&mut mine);
+                    }) as Box<dyn FnOnce() + Send>
+                })
+                .collect();
+            crate::shadow::wide_run(jobs);
+            let found = std::mem::take(&mut *found.lock().unwrap_or_else(|e| e.into_inner()));
+            for (index, shadow, from, to) in found {
+                ranges.insert(index, (shadow, from, to));
+            }
+            if alive && let Some(why) = crate::descriptor::host::device_removed() {
                 GONE.store(true, Ordering::Relaxed);
-                let last: Vec<String> = slots[n - 63..=n]
-                    .iter()
-                    .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
-                    .map(|s| s.chars().take(200).collect())
-                    .collect();
-                tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                tracing::error!(why, slots = slots.len(), "the host device went while buffer views of the heap were made (made on several threads: which one is not known)");
                 crate::host::log_removal_context();
             }
-            // The copy the slot shows (`buffer_copy`), not the one the
-            // view's range alone would find.
-            let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
-                continue;
-            };
-            #[cfg(feature = "diagnostics")]
-            if host.shows(index, &shadow.buffer) == Some(false) {
-                HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+        } else {
+            for (n, &index) in slots.iter().enumerate() {
+                ranges.remove(&index);
+                let Some(handle) = heap.handle(index) else {
+                    continue;
+                };
+                let Some(view) = host.mirror(index, handle, true) else {
+                    continue;
+                };
+                // Every 64 views while the device lives (a cheap query).
+                if alive
+                    && n % 64 == 63
+                    && let Some(why) = crate::descriptor::host::device_removed()
+                {
+                    alive = false;
+                    GONE.store(true, Ordering::Relaxed);
+                    let last: Vec<String> = slots[n - 63..=n]
+                        .iter()
+                        .filter_map(|&i| crate::descriptor::view(heap.handle(i)?).map(|v| format!("{i}: {v:?}")))
+                        .map(|s| s.chars().take(200).collect())
+                        .collect();
+                    tracing::error!(why, slot = index, "the host device went while buffer views of the heap were made; one of: {last:#?}");
+                    crate::host::log_removal_context();
+                }
+                // The copy the slot shows (`buffer_copy`), not the one the
+                // view's range alone would find.
+                let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                    continue;
+                };
+                #[cfg(feature = "diagnostics")]
+                if host.shows(index, &shadow.buffer) == Some(false) {
+                    HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+                }
+                ranges.insert(index, (shadow, address, address + len));
             }
-            ranges.insert(index, (shadow, address, address + len));
         }
         let views = ranges.len() as u32;
         // Per host copy, the span its picked views cover.
@@ -3827,3 +3885,31 @@ mod tests {
         assert_eq!(jump_window(None, (7, 10, 12), 1 << 20), None);
     }
 }
+
+/// Slots to a piece of work in the heap pass on several threads.
+const HEAP_PASS_PIECE: usize = 1024;
+
+/// Whether the pass over the heap's buffer views ([`State::heap_buffers`])
+/// runs on the wide threads (`VICTORY_HEAP_PASS_WIDE`: 0 off, 1 on, the
+/// default, `alt` 20 s each).
+fn heap_pass_wide() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_HEAP_PASS_WIDE").as_deref() {
+        Ok("0") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(wide = on, "the heap pass on several threads switched (VICTORY_HEAP_PASS_WIDE=alt)");
+            }
+            on
+        }
+    }
+}
+

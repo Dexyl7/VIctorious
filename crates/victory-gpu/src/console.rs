@@ -19,9 +19,23 @@ impl Console {
     // shortcut: later system updates gave Series S titles more (amount not
     // published here); the title sizes nothing from this figure
     // (it goes by the device type), so update it if a title does.
-    pub const fn title_memory(self) -> (usize, usize) {
+    ///
+    /// `VICTORY_SERIES_S_MEMORY=x`: Series S reports Series X's amounts (a
+    /// test: Series S at a render scale above 2/3 stopped at the title's own
+    /// out-of-memory check, an 8 MB block its pools could not give; this
+    /// says whether those pools are sized from the memory reported).
+    pub fn title_memory(self) -> (usize, usize) {
+        static BIGGER: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let bigger = *BIGGER.get_or_init(|| {
+            let on = std::env::var_os("VICTORY_SERIES_S_MEMORY").is_some_and(|v| v == "x");
+            if on {
+                tracing::warn!("Series S reports Series X's title memory (VICTORY_SERIES_S_MEMORY=x)");
+            }
+            on
+        });
         match self {
             Console::SeriesX => (10 * GIB, 7 * GIB / 2),
+            Console::SeriesS if bigger => (10 * GIB, 7 * GIB / 2),
             Console::SeriesS => (0, 7_776 << 20),
         }
     }
