@@ -1,6 +1,6 @@
 # Runs the game with the crash skip list and one set of the fork's speed
 # switches; the log goes to play_<Mode>.txt. Network off first.
-param([ValidateSet("default", "relay", "relay1", "relay1card", "relaysafe", "fast", "fast2", "fast3", "smooth", "fast2si", "fast2mc", "fast2debug", "latewait", "both", "direct", "smooth2")][string]$Mode = "default", [int]$StageMs = 80, [switch]$NoDred, [switch]$Big, [switch]$Timing, [int]$Hoist = -1, [switch]$Feed, [switch]$Water, [switch]$Pool, [switch]$NoWater, [switch]$FeedAlt, [string]$Waits = "", [string]$Late = "", [switch]$NeverWait, [string]$Barriers = "", [ValidateSet("series-x", "series-s")][string]$Console = "series-x", [string]$Display = "", [string]$HeapPar = "", [string]$Fast = "", [string]$Plain = "", [switch]$Async, [string]$Shared = "", [string]$WideRefresh = "", [string]$WideThreads = "", [string]$CardMinKb = "", [string]$CardMb = "", [string]$NoBack = "", [string]$HeapPass = "", [switch]$Timeline, [string]$SyncBeside = "", [string]$SignalMeets = "", [string]$InPlace = "", [string]$LookupCache = "", [switch]$SlowTest, [string]$GpuClock = "", [switch]$Autopilot, [string]$RenderScale = "", [switch]$BvhMiss, [switch]$NoWatchdog, [string]$Sharpen = "", [switch]$BigMemory, [string]$TableStages = "", [switch]$HeapWorker, [switch]$NoHeapWorker, [string]$HeapMarked = "", [string]$AbsentCache = "", [switch]$PortConstants, [string]$PortDirect = "", [switch]$Profile, [string]$Ahead = "", [string]$SweepRoom = "", [string]$BufferPool = "", [string]$KernelLess = "", [switch]$RingTrace, [string]$EarlyRefresh = "", [switch]$Repeats, [string]$PortDescriptors = "", [string]$SyncWide = "", [string]$ParallelRefresh = "", [string]$SettleRoom = "", [string]$NoteBatch = "", [string]$HeapPassPool = "")
+param([ValidateSet("default", "relay", "relay1", "relay1card", "relaysafe", "fast", "fast2", "fast3", "smooth", "fast2si", "fast2mc", "fast2debug", "latewait", "both", "direct", "smooth2")][string]$Mode = "default", [int]$StageMs = 80, [switch]$NoDred, [switch]$Big, [switch]$Timing, [int]$Hoist = -1, [switch]$Feed, [switch]$Water, [switch]$Pool, [switch]$NoWater, [switch]$FeedAlt, [string]$Waits = "", [string]$Late = "", [switch]$NeverWait, [string]$Barriers = "", [ValidateSet("series-x", "series-s")][string]$Console = "series-x", [string]$Display = "", [string]$HeapPar = "", [string]$Fast = "", [string]$Plain = "", [switch]$Async, [string]$Shared = "", [string]$WideRefresh = "", [string]$WideThreads = "", [string]$CardMinKb = "", [string]$CardMb = "", [string]$NoBack = "", [string]$HeapPass = "", [switch]$Timeline, [string]$SyncBeside = "", [string]$SignalMeets = "", [string]$InPlace = "", [string]$LookupCache = "", [switch]$SlowTest, [string]$GpuClock = "", [switch]$Autopilot, [string]$RenderScale = "", [switch]$BvhMiss, [switch]$NoWatchdog, [string]$Sharpen = "", [switch]$BigMemory, [string]$TableStages = "", [switch]$HeapWorker, [switch]$NoHeapWorker, [string]$HeapMarked = "", [string]$AbsentCache = "", [switch]$PortConstants, [string]$PortDirect = "", [switch]$Profile, [string]$Ahead = "", [string]$SweepRoom = "", [string]$BufferPool = "", [string]$KernelLess = "", [switch]$RingTrace, [string]$EarlyRefresh = "", [switch]$Repeats, [string]$PortDescriptors = "", [string]$SyncWide = "", [string]$ParallelRefresh = "", [string]$SettleRoom = "", [string]$NoteBatch = "", [string]$HeapPassPool = "", [string]$TextureRoom = "")
 Set-Location C:\VIctory3
 $speed = @("VICTORY_RELAY", "VICTORY_LATE_WAIT", "VICTORY_WIDE_BACK", "VICTORY_CARD_BUFFERS_MIN_MB", "VICTORY_CARD_BUFFERS_MB",
            "VICTORY_PIPELINE_WORKERS", "VICTORY_ABLATE", "VICTORY_ABLATE_RANGE", "VICTORY_DXIL_FLAGS_OR",
@@ -33,7 +33,7 @@ if ($Timing) { $env:VICTORY_GPU_TIMING = "1" }
 
 # smooth2: smooth plus fxceless's switches of 2026-11-25 (indirect records gathered and clamped once
 # a list, small buffers' copies on the card, parts joined, copy-back through our own view)
-if ($Mode -eq "smooth2") { $env:VICTORY_INDIRECT_GATHER = "1"; $env:VICTORY_CARD_BUFFERS_MIN_KB = "1024"; $env:VICTORY_JOIN_PARTS = "1"; $env:VICTORY_BACK_OWN_VIEW = "1"; $env:VICTORY_TEXTURE_BACK = "1"; $env:VICTORY_LATE_WAIT = "3"; $env:VICTORY_INDIRECT_WAITS = "0"; $env:VICTORY_MERGE_RUNS = "4096"; $env:VICTORY_MERGE_GAP = "64"; $env:VICTORY_FILL_NEVER_WAIT = "1"; $env:VICTORY_SWEEP_MS = "10000"; $env:VICTORY_COPY_PLAIN = "1"; $env:VICTORY_ASYNC_SUBMIT = "1"; $env:VICTORY_ASYNC_PRESENT = "1"; $env:VICTORY_BUFFER_POOL = "1"; $env:VICTORY_HEAP_PASS_POOL = "1" }
+if ($Mode -eq "smooth2") { $env:VICTORY_INDIRECT_GATHER = "1"; $env:VICTORY_CARD_BUFFERS_MIN_KB = "1024"; $env:VICTORY_JOIN_PARTS = "1"; $env:VICTORY_BACK_OWN_VIEW = "1"; $env:VICTORY_TEXTURE_BACK = "1"; $env:VICTORY_LATE_WAIT = "3"; $env:VICTORY_INDIRECT_WAITS = "0"; $env:VICTORY_MERGE_RUNS = "4096"; $env:VICTORY_MERGE_GAP = "64"; $env:VICTORY_FILL_NEVER_WAIT = "1"; $env:VICTORY_SWEEP_MS = "10000"; $env:VICTORY_COPY_PLAIN = "1"; $env:VICTORY_ASYNC_SUBMIT = "1"; $env:VICTORY_ASYNC_PRESENT = "1"; $env:VICTORY_BUFFER_POOL = "1"; $env:VICTORY_HEAP_PASS_POOL = "1"; $env:VICTORY_WIDE_REFRESH = "1" }
 if ($Mode -eq "smooth2" -and $Hoist -lt 0) { $env:VICTORY_HOIST_CLAMPS = "1" }
 if ($Hoist -ge 0) { $env:VICTORY_HOIST_CLAMPS = "$Hoist" }
 # -Water: textures shaders write that the title reads are copied back (pull request #999; on in smooth2)
@@ -61,7 +61,7 @@ if ($Autopilot) { $env:VICTORY_AUTOPILOT_TEST = "1" }
 if ($Console -eq "series-s") { $env:VICTORY_COMPOSE = "1"; $env:VICTORY_OWN_UPSCALER = "1" }
 # Series S at 720p: its render targets hold ~1.25 GB, not the 3 GB kept for them by default (measured on Series X):
 # the rest goes to textures, which were refused for lack of room (black roads).
-if ($Console -eq "series-s") { $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = "1536"; $env:VICTORY_TEXTURE_ROOM_PERCENT = "95" }
+if ($Console -eq "series-s") { $env:VICTORY_CARD_ROOM_FOR_TARGETS_MB = "1536"; $env:VICTORY_TEXTURE_ROOM_PERCENT = "75" }
 if ($RenderScale -ne "") { $env:VICTORY_RENDER_SCALE = $RenderScale }
 if ($Sharpen -ne "") { $env:VICTORY_SHARPEN = $Sharpen }
 if ($BigMemory) { $env:VICTORY_SERIES_S_MEMORY = "x" }
@@ -79,6 +79,7 @@ if ($ParallelRefresh -ne "") { $env:VICTORY_PARALLEL_REFRESH = $ParallelRefresh 
 if ($SettleRoom -ne "") { $env:VICTORY_SETTLE_ROOM = $SettleRoom }
 if ($NoteBatch -ne "") { $env:VICTORY_NOTE_BATCH = $NoteBatch }
 if ($HeapPassPool -ne "") { $env:VICTORY_HEAP_PASS_POOL = $HeapPassPool }
+if ($TextureRoom -ne "") { $env:VICTORY_TEXTURE_ROOM_PERCENT = $TextureRoom }
 if ($Repeats) { $env:VICTORY_REPEAT_COUNT = "1" }
 if ($EarlyRefresh -ne "") { $env:VICTORY_EARLY_REFRESH = $EarlyRefresh }
 if ($RingTrace) { $env:VICTORY_RING_TRACE = "1" }

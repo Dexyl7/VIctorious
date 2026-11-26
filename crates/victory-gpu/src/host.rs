@@ -8096,6 +8096,16 @@ fn parallel_refresh() -> bool {
 /// threads' summed microseconds, the microseconds taken.
 static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+/// The bytes a submission's refreshes must span together before
+/// [`wide_refresh`] cuts them in pieces (`VICTORY_WIDE_REFRESH_MIN_MB`,
+/// 16 MiB by default; 0: any batch of four or more, as before).
+fn wide_refresh_least() -> usize {
+    static LEAST: OnceLock<usize> = OnceLock::new();
+    *LEAST.get_or_init(|| {
+        std::env::var("VICTORY_WIDE_REFRESH_MIN_MB").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(16) << 20
+    })
+}
+
 fn wide_refresh() -> bool {
     /// 0 off, 1 on, 2 in turn.
     static MODE: OnceLock<u8> = OnceLock::new();
@@ -8376,7 +8386,17 @@ impl Batch {
             crate::watch::ask_ahead(&ranges);
             preparing(0, started.elapsed().as_micros() as u64);
         }
-        if wide_refresh() && self.refreshes.len() >= 4 {
+        // Only a big batch (`wide_refresh_least`): run 2026-11-27 01:50,
+        // driving, alternating: the heavy frames' refreshes fell 17 ms at
+        // equal draws (x4.5 side by side), but the usual frames rose 4 ms:
+        // their small batches cost more cut in pieces (the threads share
+        // the memory's bandwidth and the title's processors) than they
+        // save.
+        let span: usize = self.refreshes.iter().map(|r| r.2.saturating_sub(r.1)).sum();
+        #[cfg(feature = "diagnostics")]
+        let timing = (!self.refreshes.is_empty()).then(|| (std::time::Instant::now(), span));
+        let went_wide = wide_refresh() && self.refreshes.len() >= 4 && span >= wide_refresh_least();
+        if went_wide {
             // Each copy on its own, several at a time: a copy's refresh
             // writes that copy and reads title memory, nothing of another's.
             // The time counted is the time it took, not the threads' sum.
@@ -8402,10 +8422,48 @@ impl Batch {
                 Self::brought(&mut self.current, &shadow, from, to);
             }
         }
+        #[cfg(feature = "diagnostics")]
+        if let Some((began, span)) = timing {
+            let bucket = match span >> 20 {
+                0 => 0,
+                1..4 => 1,
+                4..16 => 2,
+                16..64 => 3,
+                _ => 4,
+            };
+            let us = began.elapsed().as_micros() as u64;
+            let at = 2 * bucket + usize::from(went_wide) * 10;
+            REFRESH_SIZES[at].fetch_add(1, Ordering::Relaxed);
+            REFRESH_SIZES[at + 1].fetch_add(us, Ordering::Relaxed);
+        }
         if ahead {
             crate::watch::ask_ahead_done();
         }
     }
+}
+
+/// Diagnostics: a submission's refresh batches by the bytes they span
+/// (under 1 MiB, to 4, to 16, to 64, more), one after the other and then
+/// cut in pieces ([`wide_refresh`]): batches and microseconds of each.
+#[cfg(feature = "diagnostics")]
+static REFRESH_SIZES: [std::sync::atomic::AtomicU64; 20] = [const { std::sync::atomic::AtomicU64::new(0) }; 20];
+
+/// With the frame line: [`REFRESH_SIZES`] per frame over `frames`.
+#[cfg(feature = "diagnostics")]
+fn refresh_sizes_line(frames: f64) {
+    let v: Vec<f64> = REFRESH_SIZES.iter().map(|a| a.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+    let names = ["<1 MB", "1-4 MB", "4-16 MB", "16-64 MB", ">64 MB"];
+    let part = |off: usize| {
+        (0..5)
+            .map(|b| format!("{} {:.1} = {:.1} ms", names[b], v[off + 2 * b], v[off + 2 * b + 1] / 1e3))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    tracing::info!(
+        "refresh batches per frame by the bytes they span (count = time): one after the other: {}; cut in pieces: {}",
+        part(0),
+        part(10)
+    );
 }
 
 /// What `VICTORY_LIST_REUSE` says: 0 unset (off), 1 on, 2 in turn.
@@ -8898,6 +8956,8 @@ impl Meter {
         crate::kmeter::line(frames);
         #[cfg(feature = "diagnostics")]
         crate::shadow::wide_line(frames);
+        #[cfg(feature = "diagnostics")]
+        refresh_sizes_line(frames);
         late_line(frames);
         card_clock_line(frames, ms);
         crate::queue2::line(frames);
