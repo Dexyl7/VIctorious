@@ -8,9 +8,9 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::alloc::{Layout, alloc, dealloc};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
@@ -153,6 +153,12 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    // Renderer port 1: the title's 32-bit graphics reservation (kind
+    // 0x42000, without the 64 KiB page bits, made a placeholder by the host
+    // all the same), for [`arrange`].
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 && port_on() {
+        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -351,6 +357,8 @@ const MEM_COALESCE_PLACEHOLDERS: u32 = 0x1;
 struct Section {
     handle: HANDLE,
     committed: bool,
+    /// Its 64 KiB pages.
+    pages: usize,
 }
 
 /// Whether physical pages are sections committed whole
@@ -412,6 +420,9 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// Every slice (`Slice::key`) ever mapped: one not in it was never
+    /// shown to the title, so it still reads as zeros ([`arrange`]).
+    touched: HashSet<(usize, usize)>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -476,7 +487,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
                 return None; // those made close as they drop
             }
             victory_gpu::title_memory_section(handle as usize, (here * PAGE) as u64, committed);
-            sections.push(Arc::new(Section { handle, committed }));
+            sections.push(Arc::new(Section { handle, committed, pages: here }));
             left -= here;
         }
         Some(sections)
@@ -852,6 +863,11 @@ fn map_physical_pages(
 ) -> *mut c_void {
     let base = address as usize;
     let mut physical = physical();
+    if port_on() && !pages.is_null() && n > 0 {
+        // SAFETY: the title passes `n` page numbers.
+        let wanted = unsafe { std::slice::from_raw_parts(pages, n) };
+        arrange(&mut physical, base, wanted);
+    }
     map_timing(0, std::time::Duration::ZERO, Some(started.elapsed()));
     if pages.is_null() {
         SKIPPED[3].fetch_add(1, Ordering::Relaxed);
@@ -1139,9 +1155,110 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     phase(5, || victory_gpu::title_memory_view(base, len, slice.section.handle as usize, (slice.index * PAGE) as u64));
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        physical.touched.insert(slice.key(k));
     }
     physical.views.insert(base, (len, slice));
     true
+}
+
+/// Renderer port 1 (`VICTORY_PORT_CONSTANTS=1`, from avatarmanz's
+/// fork; the GPU side's half is `victory_gpu`'s `port`).
+fn port_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// The title's reservations for 32-bit graphics memory: base and bytes.
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Pages given another slice of their section so far by [`arrange`], and
+/// the times a slice was not fresh.
+static ARRANGED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// Before `pages` are mapped at `base`: if `base` lies in a 32-bit graphics
+/// reservation ([`LOW_RESERVATIONS`]) and the pages are all of one section
+/// at least as big as it, the page numbers are given the slices of that
+/// section in the reservation's address order, so that the reservation
+/// becomes one stretch of the section and the GPU side can open it as one
+/// heap. The title maps the pieces of its heap in another order than their
+/// addresses. Only fresh slices are exchanged (never mapped: they read as
+/// zeros), so which slice a number names is not observable by the title.
+fn arrange(physical: &mut Physical, base: usize, pages: &[usize]) {
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+    else {
+        return;
+    };
+    let Some(section) = pages.first().and_then(|p| physical.pages.get(p)).map(|s| s.section.clone()) else {
+        return;
+    };
+    if section.pages * PAGE < bytes
+        || !pages.iter().all(|p| physical.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section)))
+    {
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                pages = pages.len(),
+                section_pages = section.pages,
+                reservation = bytes / PAGE,
+                "renderer port 1: pages mapped into the 32-bit heap are not of one section as big as it: left where they are"
+            );
+        }
+        return;
+    }
+    let key = Arc::as_ptr(&section) as usize;
+    let fresh = |physical: &Physical, index: usize| !physical.touched.contains(&(key, index));
+    // Which number has which slice of the section.
+    let mut owner: HashMap<usize, usize> = physical
+        .pages
+        .iter()
+        .filter(|(_, s)| Arc::ptr_eq(&s.section, &section))
+        .map(|(&number, s)| (s.index, number))
+        .collect();
+    let mut moved = 0u64;
+    for (i, number) in pages.iter().enumerate() {
+        let want = (base - first) / PAGE + i;
+        if want >= section.pages {
+            continue;
+        }
+        let Some(have) = physical.pages.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if !fresh(physical, have) || !fresh(physical, want) {
+            ARRANGED[1].fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        if let Some(other) = owner.get(&want).copied()
+            && let Some(slice) = physical.pages.get_mut(&other)
+        {
+            slice.index = have;
+            owner.insert(have, other);
+        }
+        if let Some(slice) = physical.pages.get_mut(number) {
+            slice.index = want;
+        }
+        owner.insert(want, *number);
+        moved += 1;
+    }
+    if moved > 0 {
+        let all = ARRANGED[0].fetch_add(moved, Ordering::Relaxed) + moved;
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            all,
+            not_fresh = ARRANGED[1].load(Ordering::Relaxed),
+            "renderer port 1: the title's 32-bit graphics pages given their section's slices in address order"
+        );
+    }
 }
 
 /// Commits the section pages a view shows (once per page, whichever view).

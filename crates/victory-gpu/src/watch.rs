@@ -44,7 +44,7 @@ pub(crate) struct Tracked {
 /// `views` is true. Other process memory is not tracked.
 pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
     let end = start.checked_add(len)?;
-    if len == 0 || writes(start, end, views).is_none() {
+    if len == 0 || writes(start, end, views, u64::MAX).is_none() {
         return None;
     }
     Some(Tracked {
@@ -391,7 +391,12 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// this asking's number, which is higher than any in the list but those the
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
-pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+///
+/// Only pages last written by an asking after `since` are listed (0: all;
+/// after Flamingo 69dd4480, victory-fork #1059): the callers want those
+/// alone, and the whole list, made anew at every one of thousands of
+/// askings a frame, was most of this function's time there.
+pub(crate) fn writes(start: usize, end: usize, guarded: bool, since: u64) -> Option<(u64, Vec<(usize, u64)>)> {
     use windows_sys::Win32::System::Memory::GetWriteWatch;
     const WRITE_WATCH_FLAG_RESET: u32 = 1;
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
@@ -403,6 +408,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             j.ahead_asked,
             j.written
                 .range(first..last)
+                .filter(|&(_, &w)| w > since)
                 .map(|(&p, &w)| (p, w))
                 .collect(),
         ));
@@ -427,7 +433,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
         for page in written {
             held.written.insert(page, now);
         }
-        return Some((now, held.written.range(first..last).map(|(&p, &w)| (p, w)).collect()));
+        return Some((now, held.written.range(first..last).filter(|&(_, &w)| w > since).map(|(&p, &w)| (p, w)).collect()));
     }
     let mut count = (last - first) * PAGE / KERNEL_PAGE;
     j.found.resize(count.max(j.found.len()), 0);
@@ -486,14 +492,16 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     }
     j.asked += 1;
     let now = j.asked;
-    let pages = j.found[..count].iter().map(|&at| at / PAGE).chain(guarded);
-    for page in pages.collect::<Vec<_>>() {
+    // Straight into the journal, without a list first (Flamingo 78bb9035,
+    // from its pull request #4 by rayane-creato1r).
+    for page in j.found[..count].iter().map(|&at| at / PAGE).chain(guarded) {
         j.written.insert(page, now);
     }
     Some((
         now,
         j.written
             .range(first..last)
+            .filter(|&(_, &w)| w > since)
             .map(|(&p, &w)| (p, w))
             .collect(),
     ))
@@ -541,7 +549,7 @@ impl Tracked {
         if from >= to {
             return Vec::new();
         }
-        let Some((_, pages)) = writes(from, to, true) else {
+        let Some((_, pages)) = writes(from, to, true, 0) else {
             return Vec::new();
         };
         let mut seen = self.seen.lock().unwrap_or_else(|e| e.into_inner());
@@ -838,6 +846,7 @@ fn protect_aliases(from: usize, to: usize) {
     if !view_guard() {
         return;
     }
+    let mut others: Vec<usize> = Vec::new();
     for (base, bytes) in crate::inplace::views_between(from.saturating_mul(BLOCK), to.saturating_mul(BLOCK)) {
         let first = (base / BLOCK).max(from);
         let last = (base.saturating_add(bytes).div_ceil(BLOCK)).min(to);
@@ -853,11 +862,58 @@ fn protect_aliases(from: usize, to: usize) {
             ALIASES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             for alias in shown {
                 let alias = alias / BLOCK;
-                let mut g = guards(alias);
-                g.aliased.insert(alias);
+                guards(alias).aliased.insert(alias);
                 if alias != block {
-                    protect_alias(&mut g, alias);
+                    others.push(alias);
                 }
+            }
+        }
+    }
+    // Blocks that follow one another are made read-only in one call (after
+    // Flamingo 69dd4480, victory-fork #1059), region by region.
+    others.sort_unstable();
+    others.dedup();
+    let mut at = 0;
+    while at < others.len() {
+        let run_start = others[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < others.len() && others[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        for (first, last) in segments(run_start, run_end) {
+            let mut g = guards(first);
+            protect_alias_run(&mut g, first, last);
+        }
+    }
+}
+
+/// [`protect_alias`] for the blocks `[first, last)` of one region: each run
+/// of them not read-only yet in one call, block by block if that fails.
+fn protect_alias_run(g: &mut Guards, first: usize, last: usize) {
+    use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+    let mut block = first;
+    while block < last {
+        if g.protected.contains(&block) {
+            block += 1;
+            continue;
+        }
+        let start = block;
+        while block < last && !g.protected.contains(&block) {
+            block += 1;
+        }
+        let mut old = 0;
+        // SAFETY: title view memory; only its protection changes.
+        let set = unsafe { VirtualProtect((start * BLOCK) as *const _, (block - start) * BLOCK, PAGE_READONLY, &mut old) } != 0;
+        if set {
+            g.protected.extend(start..block);
+            if view_known() {
+                g.viewed.extend(start..block);
+            }
+        } else {
+            for one in start..block {
+                protect_alias(g, one);
             }
         }
     }
@@ -961,8 +1017,33 @@ static UNCOMMITTED: Mutex<(u64, BTreeMap<usize, usize>)> = Mutex::new((0, BTreeM
 /// unmaps title memory ([`title_memory_remapped`]).
 static UNCOMMITTED_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// A submission's preparing begins: answers of [`uncommitted_end`] go
+/// stale, unless they are kept for the whole frame ([`absent_per_frame`]).
 pub(crate) fn uncommitted_stale() {
-    UNCOMMITTED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !absent_per_frame() {
+        UNCOMMITTED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// The title presented: with [`absent_per_frame`], answers of
+/// [`uncommitted_end`] go stale here.
+pub(crate) fn uncommitted_frame() {
+    if absent_per_frame() {
+        UNCOMMITTED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `VICTORY_ABSENT_CACHE=frame` (off by default: a clean driving run with it
+/// and renderer port 1 showed no gain; `1`, the default, per submission): what Windows said about uncommitted title memory is kept from
+/// one present to the next, ~10 submissions, instead of from the start of
+/// each submission's preparing. Remappings still drop what they touch
+/// ([`uncommitted_changed`]); memory the title commits itself without a
+/// remapping is seen at the next frame at the latest. A driving profile
+/// still had 9.4 ms a frame of the submitting thread in `VirtualQuery`
+/// with answers kept per submission.
+fn absent_per_frame() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_ABSENT_CACHE").as_deref() == Ok("frame"))
 }
 
 /// The runtime mapped or unmapped `[at, at + len)`: what [`uncommitted_end`]
@@ -1112,12 +1193,35 @@ fn open_aliases(aliased: Vec<usize>) {
 fn open_blocks(g: &mut Guards, first: usize, last: usize) -> bool {
     use windows_sys::Win32::System::Memory::{PAGE_READWRITE, VirtualProtect};
     let blocks: Vec<usize> = g.protected.range(first..last).copied().collect();
-    for &block in &blocks {
-        g.protected.remove(&block);
-        g.clean.remove(&block);
+    // Each run of blocks that follow one another is given back in one call
+    // (after Flamingo 69dd4480, victory-fork #1059): a long write opens
+    // hundreds of blocks, and every call walks the page tables.
+    let mut at = 0;
+    while at < blocks.len() {
+        let run_start = blocks[at];
+        let mut run_end = run_start + 1;
+        at += 1;
+        while at < blocks.len() && blocks[at] == run_end {
+            run_end += 1;
+            at += 1;
+        }
+        for block in run_start..run_end {
+            g.protected.remove(&block);
+            g.clean.remove(&block);
+        }
         let mut old = 0;
-        // SAFETY: a block we made read-only.
-        unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+        // SAFETY: blocks we made read-only.
+        let set = unsafe {
+            VirtualProtect((run_start * BLOCK) as *const _, (run_end - run_start) * BLOCK, PAGE_READWRITE, &mut old)
+        };
+        if set == 0 && run_end - run_start > 1 {
+            // A run can span regions the kernel only changes one at a time.
+            for block in run_start..run_end {
+                let mut old = 0;
+                // SAFETY: a block we made read-only.
+                unsafe { VirtualProtect((block * BLOCK) as *const _, BLOCK, PAGE_READWRITE, &mut old) };
+            }
+        }
     }
     !blocks.is_empty()
 }
@@ -1465,14 +1569,16 @@ mod tests {
         } as usize;
         assert_ne!(p, 0);
         let (start, end) = (p, p + 4 * PAGE);
-        let (_, before) = writes(start, end, false).expect("watched");
+        let (_, before) = writes(start, end, false, 0).expect("watched");
         assert!(before.is_empty());
         // SAFETY: committed pages of ours.
         unsafe { ((p + PAGE + 8) as *mut u8).write(1) };
-        let (now, after) = writes(start, end, false).expect("watched");
+        let (now, after) = writes(start, end, false, 0).expect("watched");
         assert_eq!(after, [(p / PAGE + 1, now)]);
         // Another asker after the kernel's bit was cleared still sees it.
-        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
+        // What an asking after the write's lists is not news.
+        assert!(writes(start, end, false, now).expect("watched").1.is_empty());
+        let (later, again) = writes(p + PAGE, p + 2 * PAGE, false, 0).expect("watched");
         assert!(later > now);
         assert_eq!(again, [(p / PAGE + 1, now)]);
         let mut plain = vec![0u8; PAGE];
@@ -1480,7 +1586,8 @@ mod tests {
             writes(
                 plain.as_mut_ptr() as usize,
                 plain.as_ptr() as usize + PAGE,
-                true
+                true,
+                0
             )
             .is_none()
         );

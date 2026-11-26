@@ -183,6 +183,20 @@ extern "system" fn window_proc(
     if message == wm::WM_SYSCOMMAND && wparam & 0xFFF0 == wm::SC_KEYMENU as usize {
         return 0;
     }
+    // Alt+Enter or F11: borderless fullscreen on the window's monitor, and
+    // back (the picture is stretched to the window; no mode switch).
+    let pressed = lparam & (1 << 30) == 0;
+    if (message == wm::WM_SYSKEYDOWN && wparam == 0x0D && lparam & (1 << 29) != 0)
+        || (message == wm::WM_KEYDOWN && wparam == 0x7A)
+    {
+        if pressed {
+            toggle_fullscreen(hwnd);
+        }
+        return 0;
+    }
+    if message == wm::WM_SYSCHAR && wparam == 0x0D {
+        return 0; // no beep
+    }
     // SAFETY: the procedure `hook` stored, called the way the system would.
     unsafe {
         let title = wm::GetPropW(hwnd, TITLE_PROC);
@@ -191,6 +205,53 @@ extern "system" fn window_proc(
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
         wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+    }
+}
+
+/// The window's style and place before [`toggle_fullscreen`] made it fill
+/// its monitor (`None`: windowed).
+static WINDOWED: Mutex<Option<(isize, RECT)>> = Mutex::new(None);
+
+fn toggle_fullscreen(hwnd: HWND) {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    let mut windowed = WINDOWED.lock().unwrap_or_else(|e| e.into_inner());
+    // SAFETY: the title's window, on its own thread.
+    unsafe {
+        match windowed.take() {
+            Some((style, r)) => {
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, style);
+                wm::SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    wm::SWP_FRAMECHANGED | wm::SWP_NOZORDER | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+                );
+            }
+            None => {
+                let mut r = RECT::default();
+                wm::GetWindowRect(hwnd, &mut r);
+                let style = wm::GetWindowLongPtrW(hwnd, wm::GWL_STYLE);
+                let mut info = MONITORINFO { cbSize: size_of::<MONITORINFO>() as u32, ..Default::default() };
+                if GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mut info) == 0 {
+                    return;
+                }
+                let m = info.rcMonitor;
+                wm::SetWindowLongPtrW(hwnd, wm::GWL_STYLE, ((wm::WS_POPUP | wm::WS_VISIBLE) as isize) | (style & (wm::WS_CLIPCHILDREN | wm::WS_CLIPSIBLINGS) as isize));
+                wm::SetWindowPos(
+                    hwnd,
+                    wm::HWND_TOP,
+                    m.left,
+                    m.top,
+                    m.right - m.left,
+                    m.bottom - m.top,
+                    wm::SWP_FRAMECHANGED | wm::SWP_NOOWNERZORDER | wm::SWP_SHOWWINDOW,
+                );
+                *windowed = Some((style, r));
+            }
+        }
     }
 }
 

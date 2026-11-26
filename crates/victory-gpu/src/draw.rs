@@ -645,6 +645,47 @@ pub(crate) fn dispatched() -> u64 {
 /// streams of a cutscene frame reach further, and what lay past the first
 /// megabyte was never brought up to date - meshes without bodies, exploded
 /// triangles. `VICTORY_ROOT_VIEW_MB` sets a limit again.)
+/// `VICTORY_PORT_DIRECT` (1 on, the default with renderer port 1; 0 off):
+/// a constant buffer in title memory used in place (`crate::port`) is
+/// bound at the card's address of that memory when it is 256-byte aligned
+/// there, in place of a copy into the list's upload memory made on the CPU
+/// at submission. The card then reads the constants when the draw runs,
+/// not as they were when the list was submitted.
+fn port_direct() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| crate::port::on() && std::env::var_os("VICTORY_PORT_DIRECT").is_none_or(|v| v != "0"))
+}
+
+/// Constant buffers in memory used in place: bound where they are, and
+/// filled after all because not 256-byte aligned (root views, table
+/// views). Per frame on the port's line.
+pub(crate) static PORT_DIRECT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// With [`port_direct`]: the card's address of the constant buffer at
+/// `address` (`size` bytes) if it lies in title memory used in place and
+/// can be bound there; `None`: fill it as before. `table` only picks the
+/// counters.
+fn in_place_constant(list: &HostList, address: u64, size: u64, table: bool) -> Option<u64> {
+    if !port_direct() {
+        return None;
+    }
+    let shadow = crate::shadow::find(address, 1)?;
+    if !shadow.in_place() {
+        return None;
+    }
+    let gpu = shadow.gpu(address);
+    let at = usize::from(table) * 2;
+    if gpu % 256 != 0 || shadow.left(address) < size.next_multiple_of(256) {
+        PORT_DIRECT[at + 1].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    PORT_DIRECT[at].fetch_add(1, Ordering::Relaxed);
+    // Keeps the placed buffer alive until the list is reset (nothing is
+    // copied for memory in place).
+    shadow.refresh(list, address, size);
+    Some(gpu)
+}
+
 fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     static LIMIT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let limit = *LIMIT.get_or_init(|| {
@@ -661,6 +702,9 @@ fn root_view(list: &HostList, address: u64, srv: bool) -> Option<u64> {
     if srv || gpu % 256 == 0 {
         shadow.refresh(list, address, len);
         return Some(gpu);
+    }
+    if port_direct() && shadow.in_place() {
+        PORT_DIRECT[1].fetch_add(1, Ordering::Relaxed);
     }
     if crate::host::list_reuse() {
         return list.fill_scratch(address as *const u8, len);
@@ -3228,6 +3272,10 @@ impl State {
                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        if let Some(gpu) = in_place_constant(list, address, u64::from(size), true) {
+                            host.constant_at(index, gpu, size);
+                            continue;
+                        }
                         let Some((gpu, to)) = list.scratch(u64::from(size)) else {
                             host.make_null(index);
                             continue;

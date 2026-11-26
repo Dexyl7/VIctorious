@@ -2446,6 +2446,14 @@ impl Drop for Shadow {
         }
         LIVE[0].fetch_sub(1, Ordering::Relaxed);
         LIVE[1].fetch_sub(self.len, Ordering::Relaxed);
+        // A plain copy in a shared buffer (not in the card's memory, not an
+        // upload heap's): the buffer may be kept for the next copy of its
+        // size (`VICTORY_BUFFER_POOL`).
+        if self.card.is_none() && self.uploaded == 0 && crate::host::buffer_pool() {
+            // SAFETY: a live buffer.
+            let size = unsafe { self.buffer.GetDesc() }.Width;
+            crate::host::pool_put(&self.buffer, self.data, size);
+        }
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
@@ -2755,6 +2763,12 @@ impl Shadow {
     /// Bytes from a title address to the buffer's end.
     pub(crate) fn left(&self, address: u64) -> u64 {
         (self.start + self.len).saturating_sub(address)
+    }
+
+    /// Whether this is title memory in place (no copy: the card reads the
+    /// title's bytes where the title has them).
+    pub(crate) fn in_place(&self) -> bool {
+        self.place.is_some()
     }
 
     /// Whether the memory behind the copy turned out not to be write-watched:
@@ -3452,7 +3466,7 @@ impl Shadow {
             // of view memory, which is guarded and not write-watched, and
             // those were all of run 99's cases: the flights were settled
             // 4-5 times a frame for "0 pages looked at".
-            let Some((now, written)) = crate::watch::writes(a, e, true) else {
+            let Some((now, written)) = crate::watch::writes(a, e, true, self.oldest_taken(a, e)) else {
                 return true;
             };
             let stale: Vec<usize> = {
@@ -3583,7 +3597,7 @@ impl Shadow {
     /// shader writes.
     fn update_free(&self, from: usize, to: usize) -> usize {
         if self.watched.load(Ordering::Relaxed) != NOT_WATCHED {
-            if let Some((now, written)) = crate::watch::writes(from, to, true) {
+            if let Some((now, written)) = crate::watch::writes(from, to, true, self.oldest_taken(from, to)) {
                 self.watched.store(1, Ordering::Relaxed);
                 let copied = self.copy_stale(from, to, now, &written);
                 self.refresh_check(from, to);
@@ -3662,6 +3676,22 @@ impl Shadow {
             // The first bytes of the next 64 KiB block.
             at = (at / PAGE + 1) * PAGE;
         }
+    }
+
+    /// The oldest asking at which the copy took a page of `[from, to)` it
+    /// has taken (`u64::MAX` if none): a page written at or before it is no
+    /// news to the copy (`crate::watch::writes`'s `since`; Flamingo
+    /// 69dd4480, victory-fork #1059). Pages never taken are copied whatever
+    /// the list says ([`Shadow::copy_stale`]).
+    fn oldest_taken(&self, from: usize, to: usize) -> u64 {
+        let base = self.start as usize / PAGE;
+        let copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        (from / PAGE..to.div_ceil(PAGE))
+            .filter_map(|page| page.checked_sub(base).and_then(|i| copied.get(i)))
+            .filter(|&&at| at != 0)
+            .min()
+            .copied()
+            .unwrap_or(u64::MAX)
     }
 
     /// Copies the pages of `[from, to)` written after their last copy
@@ -4380,6 +4410,12 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
         // (`crate::inplace::place_for`): the buffer is the title's own
         // memory. Not the big ones `cards` puts in the card's memory: those
         // are read too often to stay in the PC's.
+        // Renderer port 1 (`crate::port`, `VICTORY_PORT_CONSTANTS=1`): the
+        // title's 32-bit graphics heap in place, big or not.
+        if let Some(placed) = crate::port::place_for(key.0, len, false) {
+            entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
+            return entry.shadow.clone();
+        }
         // `VICTORY_INPLACE_BIG=1` tries those too: what the card would read
         // from its own memory it reads over the bus, and nothing is copied,
         // hashed, compared or brought back for them.
@@ -4606,7 +4642,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     }
     // In place, if asked for and the window's memory can be opened: the
     // window is the title's own memory, with nothing to copy.
-    if let Some(placed) = crate::inplace::place_for(start, len, true) {
+    if let Some(placed) = crate::port::place_for(start, len, true).or_else(|| crate::inplace::place_for(start, len, true)) {
         let shadow = Arc::new(Shadow::placed(placed, start, len, true));
         note(&shadow);
         map.insert((start, len), shadow.clone());

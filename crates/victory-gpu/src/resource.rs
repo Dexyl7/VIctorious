@@ -1531,6 +1531,64 @@ fn room_percent() -> u64 {
     })
 }
 
+/// Whether the sweep of idle texture copies ([`let_go_idle`]) counts the
+/// card as full by the room textures may fill ([`room_percent`]) when that
+/// is set (`VICTORY_TEXTURE_ROOM_PERCENT`), not by the fixed 75 and 85 %
+/// of `crate::host::vram_idle_ms` (`VICTORY_SWEEP_FOLLOWS_ROOM`: 1 on, the
+/// default; 0 off; `alt` 20 s each). With the room at 95 % (Series S) the
+/// card stood over 85 % all the time, so a copy idle for a second went and
+/// the next use made it again: 62,594 copies (36.8 GB) made again in six
+/// minutes of driving, each detiled and uploaded anew.
+#[cfg(windows)]
+fn sweep_follows_room() -> bool {
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_ROOM_PERCENT").is_none() {
+            return 0;
+        }
+        match std::env::var("VICTORY_SWEEP_FOLLOWS_ROOM").as_deref() {
+            Ok("0") => 0,
+            Ok("alt") => 2,
+            _ => 1,
+        }
+    });
+    match mode {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(follows = on, "the texture sweep counts the card full by the texture room (VICTORY_SWEEP_FOLLOWS_ROOM=alt)");
+            }
+            on
+        }
+    }
+}
+
+/// With [`sweep_follows_room`]: how long a texture copy must be idle to go,
+/// by the card's use against the room: 5 s below 10 points under it, 2.5 s
+/// up to it, 1 s at or over it.
+#[cfg(windows)]
+fn sweep_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
+    let Some([budget, used, ..]) = video_memory else {
+        return 5_000;
+    };
+    if budget == 0 {
+        return 5_000;
+    }
+    let used_pct = (u128::from(used) * 100 / u128::from(budget)) as u64;
+    let room = room_percent();
+    if used_pct >= room {
+        1_000
+    } else if used_pct + 10 >= room {
+        2_500
+    } else {
+        5_000
+    }
+}
+
 /// For the card accounting line ([`card_accounting`]): the title texture
 /// made for a view of memory at `address` with the resource description
 /// `desc`, if there is one ([`texture_at`] makes it; this does not).
@@ -1779,7 +1837,12 @@ pub(crate) fn let_go_idle() {
     if !*ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0")) {
         return;
     }
-    let idle_ms = crate::host::vram_idle_ms(crate::host::host().and_then(|h| h.video_memory()));
+    let video = crate::host::host().and_then(|h| h.video_memory());
+    let idle_ms = if sweep_follows_room() {
+        sweep_idle_ms(video)
+    } else {
+        crate::host::vram_idle_ms(video)
+    };
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);

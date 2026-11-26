@@ -167,6 +167,95 @@ pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
 /// (`HostHeap::kept`) and no list (`HostList::keep`).
+/// `VICTORY_BUFFER_POOL`: `1` keeps shared buffers (`Host::shared_buffer`)
+/// that host copies of title memory let go, by size, for the next copy of
+/// that size, up to `VICTORY_BUFFER_POOL_MB` (512) in all; off unless set.
+/// A driving run made 9.7 GB of them and let go most again in six minutes;
+/// the driver's 32 MB blocks they sit in stood at 14.6 GB committed with
+/// 3.5 GB of it in memory, and the PC paged.
+pub(crate) fn buffer_pool() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BUFFER_POOL").is_some_and(|v| v == "1"))
+}
+
+fn buffer_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_BUFFER_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20)
+}
+
+/// The pool: buffers by size with their mapping, the sizes in the order
+/// they came (the oldest goes first when it is full), its bytes.
+struct Pool {
+    by_size: std::collections::HashMap<u64, Vec<(ID3D12Resource, usize)>>,
+    order: std::collections::VecDeque<u64>,
+    bytes: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are plain
+// addresses of memory the buffers own.
+unsafe impl Send for Pool {}
+
+static POOL: Mutex<Option<Pool>> = Mutex::new(None);
+
+/// Since the start: buffers taken from the pool, put in, let go because it
+/// was full.
+static POOL_COUNTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn pool_take(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !buffer_pool() {
+        return None;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = pool.as_mut()?;
+    let (buffer, data) = pool.by_size.get_mut(&size)?.pop()?;
+    pool.bytes -= size;
+    let taken = POOL_COUNTS[0].fetch_add(1, Ordering::Relaxed) + 1;
+    if taken.is_power_of_two() || taken.is_multiple_of(16384) {
+        tracing::info!(
+            taken,
+            put = POOL_COUNTS[1].load(Ordering::Relaxed),
+            let_go_full = POOL_COUNTS[2].load(Ordering::Relaxed),
+            pooled_mb = pool.bytes >> 20,
+            "shared buffers taken from the pool of ones let go (VICTORY_BUFFER_POOL=1)"
+        );
+    }
+    Some((buffer, data as *mut u8))
+}
+
+/// A host copy lets go of its shared buffer of `size` bytes, mapped at
+/// `data`: kept for another copy if nothing else holds it (no descriptor
+/// slot, no list) and the pool has room for it after the oldest go.
+pub(crate) fn pool_put(buffer: &ID3D12Resource, data: *mut u8, size: u64) {
+    if !buffer_pool() || size == 0 || data.is_null() || references(buffer) != 1 {
+        return;
+    }
+    let most = buffer_pool_most();
+    if size > most / 8 {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = pool.get_or_insert_with(|| Pool {
+        by_size: std::collections::HashMap::new(),
+        order: std::collections::VecDeque::new(),
+        bytes: 0,
+    });
+    while pool.bytes + size > most {
+        let Some(oldest) = pool.order.pop_front() else { break };
+        if let Some(list) = pool.by_size.get_mut(&oldest)
+            && !list.is_empty()
+        {
+            // Not freed here, under the lock, in whatever thread lets go.
+            retire(list.remove(0));
+            pool.bytes -= oldest;
+            POOL_COUNTS[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pool.by_size.entry(size).or_default().push((buffer.clone(), data as usize));
+    pool.order.push_back(size);
+    pool.bytes += size;
+    POOL_COUNTS[1].fetch_add(1, Ordering::Relaxed);
+}
+
 pub(crate) fn references(object: &impl Interface) -> u32 {
     type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
     let raw = object.as_raw();
@@ -2668,14 +2757,15 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
     ranges.sort_unstable();
-    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
-    for &(from, to) in ranges.iter() {
-        match out.last_mut() {
-            Some(last) if from <= last.1 => last.1 = last.1.max(to),
-            _ => out.push((from, to)),
+    // Merged in place: no second list each call (Flamingo 78bb9035, from
+    // its pull request #4 by rayane-creato1r).
+    ranges.dedup_by(|next, kept| {
+        let joins = next.0 <= kept.1;
+        if joins {
+            kept.1 = kept.1.max(next.1);
         }
-    }
-    *ranges = out;
+        joins
+    });
 }
 
 /// `VICTORY_SETTLE_INDIRECT=1` (see where it is read).
@@ -3848,6 +3938,7 @@ fn late_line(frames: f64) {
             );
         }
     }
+    crate::port::log(frames);
     if late_exact() {
         let [pages, runs, bytes] = crate::shadow::merged_stats().map(|n| n as f64 / frames);
         tracing::info!(
@@ -7727,6 +7818,7 @@ impl HostList {
                     fill_check::copy_runs(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
+                    crate::port::copied(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);
                     // With the submission's one asking: the journal learns it.
                     crate::watch::wrote(dst, len);
@@ -7741,7 +7833,8 @@ impl HostList {
                     }
                     #[cfg(feature = "diagnostics")]
                     let _reads_as = crate::backreads::reading_as(crate::backreads::TITLE_COPY, 0);
-                    copy_mapped(dst as *mut u8, src as *const u8, len, false);
+                    crate::port::filled(src, len);
+                    copy_fill(dst as *mut u8, src as *const u8, len);
                     len
                 }
                 Step::Refresh(shadow, address, len) => {
@@ -8131,6 +8224,16 @@ pub(crate) fn list_reuse() -> bool {
 /// cost about 2 ms per copy in the title's big pools (it walks the page
 /// tables to the region's end), which made copies run at 100-200 MB/s.
 pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: bool) {
+    copy_mapped_as(dst, src, len, title_dst, false);
+}
+
+/// [`copy_mapped`] of a source expected to be there (a fill of upload
+/// memory): copied in place at any size (`crate::plaincopy::copy_expected`).
+pub(crate) fn copy_fill(dst: *mut u8, src: *const u8, len: usize) {
+    copy_mapped_as(dst, src, len, false, true);
+}
+
+fn copy_mapped_as(dst: *mut u8, src: *const u8, len: usize, title_dst: bool, expected: bool) {
     #[cfg(feature = "diagnostics")]
     match crate::copystat::mode() {
         1 => {
@@ -8172,7 +8275,12 @@ pub(crate) fn copy_mapped(dst: *mut u8, src: *const u8, len: usize, title_dst: b
     let moved = std::time::Instant::now();
     // Into host memory: in place first, if asked for (`crate::plaincopy`);
     // through the kernel if that is off or met a page that was not there.
-    let whole = (!title_dst && crate::plaincopy::copy(dst, src, len)) || read(src, dst, len);
+    let in_place = if expected {
+        crate::plaincopy::copy_expected(dst, src, len)
+    } else {
+        crate::plaincopy::copy(dst, src, len)
+    };
+    let whole = (!title_dst && in_place) || read(src, dst, len);
     #[cfg(feature = "diagnostics")]
     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
     if whole {
@@ -8979,6 +9087,12 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Alt+Enter is the window's own (borderless, `victory_hle`'s
+            // lifecycle): DXGI's exclusive switch froze the picture, since
+            // nothing here makes the buffers again for it.
+            if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::warn!(error = %e, "Alt+Enter not taken from DXGI");
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");
@@ -9216,6 +9330,9 @@ impl Host {
     /// memory that shaders write, which upload memory cannot be. Starts in
     /// the common state (buffers move out of it implicitly).
     pub(crate) fn shared_buffer(&self, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+        if let Some(found) = pool_take(size.max(1)) {
+            return Some(found);
+        }
         MADE[2].fetch_add(1, Ordering::Relaxed);
         MADE[3].fetch_add(size, Ordering::Relaxed);
         let heap = D3D12_HEAP_PROPERTIES {

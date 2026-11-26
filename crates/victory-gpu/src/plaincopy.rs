@@ -208,10 +208,27 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
 /// false if it is off or a source page was not there (the caller then
 /// copies through the kernel, as before).
 pub(crate) fn copy(to: *mut u8, from: *const u8, len: usize) -> bool {
+    copy_sized(to, from, len, false)
+}
+
+/// [`copy`] for a source that is expected to be there whatever its size
+/// (fills of constant buffers): no [`LEAST`], which is for the reads that
+/// ask whether a page is there. `VICTORY_SMALL_IN_PLACE=1` turns it on
+/// (off by default: a clean driving run with it and renderer port 1 showed
+/// no gain).
+/// A driving run had 9,600 such copies a frame of under 256 bytes, each a
+/// `ReadProcessMemory` call (6 ms a frame of the submitting thread).
+pub(crate) fn copy_expected(to: *mut u8, from: *const u8, len: usize) -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let small = *ON.get_or_init(|| std::env::var_os("VICTORY_SMALL_IN_PLACE").is_some_and(|v| v == "1"));
+    copy_sized(to, from, len, small)
+}
+
+fn copy_sized(to: *mut u8, from: *const u8, len: usize, any_size: bool) -> bool {
     if !on() {
         return false;
     }
-    if len < LEAST {
+    if len < LEAST && !any_size {
         COUNT[4].fetch_add(1, Relaxed);
         return false;
     }

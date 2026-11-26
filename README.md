@@ -26,7 +26,7 @@ What made the difference:
 
 ## Newest (2026-11-26)
 
-**Series S at 720p, driving: ~59 ms a frame at 4,000 draws, ~78 ms at 6,000, up to ~23 fps
+**Series S at 720p, driving: ~51–55 ms a frame at 4,000 draws, ~69–70 ms at 6,000, up to ~23 fps
 on foot.** The same scene on Series X was ~200 ms (5 fps) that morning. To play:
 
 ```powershell
@@ -46,6 +46,10 @@ counts because the frame follows the draws):
 | Textures picked by index uploaded by a thread of their own (`VICTORY_HEAP_WORKER`, fxceless) | ~73.5 → ~64.6 ms at 4,000 draws |
 | Uncommitted-memory answers kept per submission (`VICTORY_ABSENT_CACHE`): 9.6 ms a frame of `VirtualQuery` | ~4 ms at 4,000 draws, ~11 ms at 6,000 |
 | **Descriptor slots' made-from records behind 4,096 locks instead of one** | ~88–99 → ~78 ms at 6,000 draws |
+| The guards of view memory cut into 64 regions with a lock each; the journal's lock let go while view memory is guarded | → ~51–55 ms at 4,000 draws, ~69–70 at 6,000 (several runs) |
+| Fewer memory-protection calls and write-watch answers cut to what is new (Flamingo, hand-ported) | no change measured |
+| Shared buffers that copies let go kept by size for the next copy (`-BufferPool 1`, on in `smooth2`) | no change in the frame; ~2 GB less committed |
+| Borderless fullscreen on Alt+Enter or F11 (DXGI's exclusive switch froze the picture) | — |
 
 What was found on the way:
 - **Waiting, not work.** The largest gains came from threads queueing on shared locks, not from
@@ -76,6 +80,18 @@ What was found on the way:
   preparing, fence signals meeting waits, the lookup cache (our shared lock had taken its
   gain), title memory in place (the page pool cannot be opened as one buffer), the marked
   heap pass.
+- **Measured this evening and left off** (each behind its switch): renderer port 1 from
+  avatarmanz, the title's 185 MB block of constants used in place (`-PortConstants`): the copies
+  it saved came back as ~14,000 constant-buffer fills a frame on the CPU, and binding those in
+  place too (a 256-byte offset table the shaders read) made the frame slower; two frames in the
+  queues' lines (`-Ahead 2`): ~51 → ~68 ms at 4,000 draws in one run, alternating; the texture
+  sweep counting the card full by the texture room (`-SweepRoom`): no change; small fills copied
+  in place and uncommitted-memory answers kept a whole frame: no gain.
+- **The long frames (stutter)** are frames where the title does two to three times its usual
+  work (up to ~15,000 draws, ~20 submissions, ~300 MB copied), not paging: they shrink only as
+  our cost per draw and per byte does.
+- **Profiling**: `-Profile` (the report goes to `profile.txt` here); `play.ps1` clears it on
+  every other run. A shell that once had `VICTORY_PROFILE` set profiles every run after it.
 - New tools: a timeline of a few seconds (`-Timeline`, opens in ui.perfetto.dev), a slow test
   (`-SlowTest`), and switches that alternate every 20 s so one run is an A/B.
 
@@ -136,6 +152,15 @@ developer or publisher.
     ported them from ZigZagBoi1/ScarlettPort (GPL-3.0-or-later);
   - ray walks ended at the root (`VICTORY_BVH_MISS`), its commit `24a479d`.
   Its measurements on the same CPU are what showed the Series S route was worth taking.
+- **[realblastex/flamingo](https://github.com/realblastex/flamingo)**: fewer memory-protection calls (runs of
+  blocks guarded and opened in one call) and write-watch answers limited to pages newer than the caller's copy
+  (commit `69dd4480`, after victory-fork pull request #1059); the journal filled without a list first and
+  written ranges merged in place (commit `78bb9035`, from its pull request #4 by rayane-creato1r). Hand-ported
+  onto our 64-region guards.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: renderer port 1
+  (commits `86dc109`, `4b82f6c`, `9c23e8d`): the game's 32-bit graphics heap opened as a host heap
+  through a view of our own and used in place (`VICTORY_PORT_CONSTANTS=1`, play.ps1 `-PortConstants`).
+  Merged by hand; the page-order half rewritten for our page table.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the
   indirect clamps hoisted to a list before their draws (`VICTORY_HOIST_CLAMPS`, done here
   after that fork's approach), and its ambient light and quad-read fixes.

@@ -1035,7 +1035,9 @@ impl Staging {
         let start = self.memory as usize;
         let mut last = waited(0, || self.last.lock().unwrap_or_else(|e| e.into_inner()));
         let last = &mut *last;
-        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
+        // Only pages written after the last asking are news (Flamingo 69dd4480).
+        let since = last.asked;
+        if let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false, since)) {
             if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
                 return 0;
             }
@@ -1062,7 +1064,7 @@ impl Staging {
         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true, since))
         {
             const HASH_EVERY: u64 = 8;
             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
@@ -1171,7 +1173,7 @@ impl Staging {
             // Detiled before: the submission's check is cheap.
             return true;
         }
-        let asked = crate::watch::writes(start, start + size, false).or_else(|| crate::watch::writes(start, start + size, true));
+        let asked = crate::watch::writes(start, start + size, false, 0).or_else(|| crate::watch::writes(start, start + size, true, 0));
         let Some((now, _)) = asked else {
             return false;
         };

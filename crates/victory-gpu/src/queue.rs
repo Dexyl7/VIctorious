@@ -139,11 +139,39 @@ fn present_behind() -> bool {
     }
 }
 
+/// How many presents may wait in the queues' lines at once before a present
+/// runs the old way, the title's thread releasing everything held itself
+/// (`VICTORY_PRESENTS_AHEAD`: a number, 1 by default; `alt`: 1 and 2 in
+/// turn, 20 s each). A driving profile with 1 had the title's thread wait
+/// 15 ms a frame there for the submitting thread to finish what it was
+/// releasing, and the submitting thread then wait 14 ms a frame with
+/// nothing to do: the two took turns. With 2 the title records the next
+/// frame while the last is prepared; the lines keep their order.
+#[cfg(windows)]
+fn presents_ahead() -> u64 {
+    static MODE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let mode = *MODE.get_or_init(|| match std::env::var("VICTORY_PRESENTS_AHEAD").as_deref() {
+        Ok("alt") => 0,
+        Ok(n) => n.trim().parse::<u64>().ok().filter(|&n| n >= 1).unwrap_or(1),
+        Err(_) => 1,
+    });
+    if mode != 0 {
+        return mode;
+    }
+    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    let two = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+    static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+    if LAST.swap(u8::from(two), Ordering::Relaxed) != u8::from(two) {
+        tracing::info!(ahead = if two { 2 } else { 1 }, "presents that may wait in the lines (VICTORY_PRESENTS_AHEAD=alt)");
+    }
+    if two { 2 } else { 1 }
+}
+
 /// With [`present_behind`]: puts the present of the next frame behind what
 /// the queue `this` holds. False if it has to run the old way.
 #[cfg(windows)]
 fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool {
-    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) != 0 {
+    if this.is_null() || planes == 0 || PRESENTS_HELD.load(Ordering::Relaxed) >= presents_ahead() {
         return false;
     }
     let frame = FRAMES.load(Ordering::Relaxed) + 1;
@@ -1319,6 +1347,8 @@ extern "system" fn present(
     let _timeline = crate::timeline::span("title presents", 0);
     #[cfg(windows)]
     let presenting = std::time::Instant::now();
+    #[cfg(windows)]
+    crate::watch::uncommitted_frame();
     let hr = present_now(this, planes, plane_parameters);
     #[cfg(windows)]
     {
