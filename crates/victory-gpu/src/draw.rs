@@ -492,7 +492,6 @@ pub(crate) struct State {
     /// Graphics, compute.
     host_roots: [usize; 2],
     host_heaps: [usize; 2],
-    host_heaps_set: bool,
     /// Tables made afresh in this list: (table, slot count, contents) → first
     /// dynamic slot.
     fresh_tables: std::collections::HashMap<(u64, u32, u64), FreshTable, std::hash::BuildHasherDefault<crate::host::AddressHash>>,
@@ -1310,7 +1309,6 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots = [0; 2];
         self.host_heaps = [0; 2];
-        self.host_heaps_set = false;
         if self.topology_set {
             self.set_topology(list, self.topology);
         }
@@ -1611,12 +1609,8 @@ impl State {
             self.heaps[0] = heap;
         }
         // Heaps first: a root signature with directly indexed heaps must be
-        // set after them, with both a view heap and a sampler heap bound.
-        // (`VICTORY_FALLBACK_HEAPS=1`, codec-d/cool_fox 641835a4: a host
-        // heap of one slot for one the title did not set; else only those it
-        // set, as before.)
-        let fallback = crate::host::fallback_heaps();
-        if (fallback && !self.host_heaps_set) || self.host_heaps != self.heaps {
+        // set after them.
+        if self.host_heaps != self.heaps {
             let mut view_heap: Option<ID3D12DescriptorHeap> = None;
             let mut sampler_heap: Option<ID3D12DescriptorHeap> = None;
             for &h in &self.heaps {
@@ -1632,12 +1626,6 @@ impl State {
                     }
                 }
             }
-            if fallback && view_heap.is_none() {
-                view_heap = crate::host::host().and_then(|h| h.fallback_view_heap().cloned());
-            }
-            if fallback && sampler_heap.is_none() {
-                sampler_heap = crate::host::host().and_then(|h| h.fallback_sampler_heap().cloned());
-            }
             let mut heaps: Vec<Option<ID3D12DescriptorHeap>> = Vec::with_capacity(2);
             if let Some(h) = view_heap {
                 list.keep(&h);
@@ -1652,7 +1640,6 @@ impl State {
                 unsafe { l.SetDescriptorHeaps(&heaps) };
             }
             self.host_heaps = self.heaps;
-            self.host_heaps_set = true;
             self.host_roots = [0; 2];
         }
         // The depth target a draw only tests, for the views of it that the

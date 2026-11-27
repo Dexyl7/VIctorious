@@ -144,14 +144,6 @@ static GENERATED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "diagnostics")]
 static FRAME_RATES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
-pub(crate) fn frame_rates() -> Option<(f32, f32)> {
-    let rates = FRAME_RATES.load(Ordering::Relaxed);
-    let rendered = f32::from_bits((rates >> 32) as u32);
-    let presented = f32::from_bits(rates as u32);
-    (presented > 0.0).then_some((rendered, presented))
-}
-
 const NO_RESOURCE: Resource = Resource {
     resource: null_mut(),
     description: [0; 8],

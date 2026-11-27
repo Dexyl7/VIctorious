@@ -57,10 +57,6 @@ pub(crate) struct Host {
     /// The adapter the device is on, for its memory budget
     /// ([`Host::video_memory`]); `None` if the system does not name it.
     adapter: Option<IDXGIAdapter3>,
-    /// Shader-visible heaps of one slot, bound where a list sets no view or
-    /// no sampler heap ([`fallback_heaps`]).
-    fallback_view: OnceLock<Option<ID3D12DescriptorHeap>>,
-    fallback_sampler: OnceLock<Option<ID3D12DescriptorHeap>>,
 }
 
 // SAFETY: D3D12 devices, queues, fences and descriptor heaps are
@@ -349,14 +345,6 @@ pub(crate) fn resident(device: &ID3D12Device, object: &impl Interface) -> window
 
 /// Times, microseconds and the longest of [`resident`].
 static RESIDENT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
-
-/// Whether a list always has a view heap and a sampler heap bound, ours of
-/// one slot for one the title did not set (`VICTORY_FALLBACK_HEAPS=1`, from
-/// codec-d/cool_fox 641835a4; off by default).
-pub(crate) fn fallback_heaps() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_FALLBACK_HEAPS").is_some_and(|v| v == "1"))
-}
 
 /// Whether memory the card was given stays with it while there is room (on
 /// by default; `VICTORY_KEEP_FREED=0`: it is given back as before). A shader
@@ -1042,10 +1030,6 @@ fn create() -> windows::core::Result<Host> {
             crate::tdr::log();
         }
         let device = device.ok_or_else(windows::core::Error::empty)?;
-        // The driver's modules are loaded: who asks for big blocks from here
-        // on (`VICTORY_ALLOC_OWNERS`).
-        #[cfg(feature = "diagnostics")]
-        crate::allocowners::hook();
         // Before anything is made with it (`VICTORY_RECORD`).
         #[cfg(feature = "diagnostics")]
         crate::replay::record::from_env(&device);
@@ -1123,8 +1107,6 @@ fn create() -> windows::core::Result<Host> {
             next_rtv: AtomicU32::new(0),
             presenter: Mutex::new(None),
             adapter,
-            fallback_view: OnceLock::new(),
-            fallback_sampler: OnceLock::new(),
         })
     }
 }
@@ -3780,7 +3762,6 @@ fn late_line(frames: f64) {
     crate::port::log(frames);
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
-    crate::port_rt::line(frames);
     crate::descriptor::host::table_batch_line(frames);
     crate::shadow::found_line(frames);
     {
@@ -6192,71 +6173,6 @@ impl Host {
         first_error
     }
 
-    /// 1-descriptor shader-visible CBV/SRV/UAV fallback heap for directly-indexed root signatures.
-    pub(crate) fn fallback_view_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_view
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible heap + null SRV initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R32_UINT,
-                        ViewDimension: D3D12_SRV_DIMENSION_BUFFER,
-                        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Buffer: D3D12_BUFFER_SRV::default(),
-                        },
-                    };
-                    self.device.CreateShaderResourceView(
-                        None,
-                        Some(&desc),
-                        heap.GetCPUDescriptorHandleForHeapStart(),
-                    );
-                    Some(heap)
-                }
-            })
-            .as_ref()
-    }
-
-    /// 1-descriptor shader-visible Sampler fallback heap for directly-indexed root signatures.
-    pub(crate) fn fallback_sampler_heap(&self) -> Option<&ID3D12DescriptorHeap> {
-        self.fallback_sampler
-            .get_or_init(|| {
-                // SAFETY: plain 1-descriptor shader-visible sampler heap initialization.
-                unsafe {
-                    let heap: ID3D12DescriptorHeap = self
-                        .device
-                        .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
-                            Type: D3D12_DESCRIPTOR_HEAP_TYPE_SAMPLER,
-                            NumDescriptors: 1,
-                            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-                            NodeMask: 0,
-                        })
-                        .ok()?;
-                    let desc = D3D12_SAMPLER_DESC {
-                        Filter: D3D12_FILTER_MIN_MAG_MIP_POINT,
-                        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
-                        MaxLOD: f32::MAX,
-                        ..Default::default()
-                    };
-                    self.device
-                        .CreateSampler(&desc, heap.GetCPUDescriptorHandleForHeapStart());
-                    Some(heap)
-                }
-            })
-            .as_ref()
-    }
-
     /// A host render target view of `resource`, valid until it is recorded.
     pub(crate) fn rtv(
         &self,
@@ -6964,38 +6880,9 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
-        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src, len, None));
-    }
-
-    /// Renderer port RT: where a fill of `[src, src + len)` recorded now
-    /// takes its bytes. If the last step of this list that writes them is a
-    /// copy at its place ([`place`]) that holds all of them and copies what
-    /// the CPU takes out of its source at submission, and no step since
-    /// writes the source or declares a shader write over either, the fill
-    /// takes them out of that source: the same bytes the card has there when
-    /// the list reads them (`crate::port_rt`). Else `src`.
-    fn forward_fill(&self, src: usize, len: usize) -> usize {
-        if !crate::port_rt::on() || len == 0 {
-            return src;
-        }
-        let deferred = self.deferred();
-        let seen = deferred.copies.iter().rev().map(|step| match step {
-            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
-            &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
-            &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
-            Step::Run(_) => crate::port_rt::Seen::Anything,
-            _ => crate::port_rt::Seen::Nothing,
-        });
-        match crate::port_rt::forwarded(seen, src, len) {
-            Some(from) => {
-                crate::port_rt::count(crate::port_rt::FORWARDED);
-                from
-            }
-            None => src,
-        }
+            .push(Step::Fill(dst as usize, src as usize, len, None));
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7016,18 +6903,16 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
-        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        let src = self.forward_fill(src as usize, len);
-        self.deferred().copies.push(Step::Fill(dst as usize, src, len, to));
+        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9356,13 +9241,8 @@ impl Meter {
 
 impl Host {
     /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
-    /// shown; else, in diagnostics builds, whether the frame was black.
-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-        self.present_over(texture, state, None, frame)
-    }
-
-    /// [`Self::present`], with a second plane laid over `texture` if there
+    /// as frame `frame` (saved if captures are on), with a second plane laid
+    /// over `texture` if there
     /// is one (`crate::compose`): its texture and its state, which it is
     /// left in.
     pub(crate) fn present_over(

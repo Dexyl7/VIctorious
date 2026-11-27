@@ -22,9 +22,6 @@ mod capture;
 pub mod console;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
-// Which module asks for big private blocks (VICTORY_ALLOC_OWNERS), from dexyl7/VIctorious.
-#[cfg(all(windows, feature = "diagnostics"))]
-mod allocowners;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod faultbook;
 #[cfg(windows)]
@@ -52,8 +49,6 @@ mod inplace;
 mod port;
 #[cfg(windows)]
 mod port_cbv;
-#[cfg(windows)]
-mod port_rt;
 #[cfg(windows)]
 mod land;
 pub mod list;

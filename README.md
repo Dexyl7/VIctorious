@@ -98,8 +98,6 @@ time are drawn on the picture (`VICTORY_FPS_COUNTER=0`: not).
 | `VICTORY_PORT_CONSTANTS_ORDER` | 0 with `-Ports` | 1: patch 1's in-place indirect arguments checked one by one (lights and trees right, the card ~36 ms slower a frame) |
 | `VICTORY_TABLE_BATCH` | 1 (play.ps1) | a table's descriptor copies in one driver call |
 | `VICTORY_FIND_BY_RANGE` | 1 (play.ps1) | buffer lookups forgotten only where buffers changed |
-| `VICTORY_PORT_RT` | 0 | constant-buffer fills take a copy's source (tested here: no gain) |
-| `VICTORY_FALLBACK_HEAPS` | 0 | a heap of one slot bound where the title binds none |
 | `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
 | `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
@@ -209,13 +207,12 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   631400f, 3e04ca0, 15c3d0e, 3920dc2); `scripts\play.ps1 -Ports` turns on 1, 5 and 6, with patch 1's
   ordering off: checking each in-place indirect execution alone took about 36 ms of the card a frame
   here (61 ms busy against 25), at the cost of trees and palms that can drop out for a few frames.
-- Renderer port RT, part 1 (`VICTORY_PORT_RT=1`, off by default): a constant buffer filled behind a
-  copy at its place in its own list takes the copy's source, so the submitting thread no longer
-  stands until every flight has landed (15-30 ms a frame in the city here); this repository's later
-  main (84917c3, 014d52d), without its card timing stamps.
-- Descriptor tables planned once per pipeline (`TablePlan`) and the fallback heaps
-  (`VICTORY_FALLBACK_HEAPS=1`, off): codec-d/cool_fox 641835a4 by Graham, via this repository's
-  later main (46e3297).
+- Descriptor tables planned once per pipeline (`TablePlan`): codec-d/cool_fox 641835a4 by Graham,
+  via this repository's later main (46e3297).
+- Tried and taken out again: renderer port RT part 1 (this repository's later main, 84917c3 and
+  014d52d; it removed the submitting thread's wait but the frame was no shorter here), the fallback
+  heaps that came with 46e3297, and the tool that found which module asked for big memory blocks
+  (`VICTORY_ALLOC_OWNERS`; the RAM investigation is done).
 - A descriptor slot that keeps showing the same resource no longer clones it on every draw (a
   reference count shared by the recording threads).
 - A table made afresh copies its descriptors in one call and retires what its slots let go of
