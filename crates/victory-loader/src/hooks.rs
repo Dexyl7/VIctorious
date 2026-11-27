@@ -1,6 +1,6 @@
 //! Opt-in compatibility hooks for known title builds.
 //!
-//! From dexyl7/VIctorious, which ported it from trustno1-coder/VIctory-NVIDIA (commit afd84de), which copied it from vitutu1/victory-perf crates/victory-loader/src/hooks.rs, which ported it from
+//! From randomguy12000/VIctorious, which ported it from trustno1-coder/VIctory-NVIDIA (commit afd84de), which copied it from vitutu1/victory-perf crates/victory-loader/src/hooks.rs, which ported it from
 //! ZigZagBoi1/ScarlettPort (`runtime/victory`, GPL-3.0-or-later).
 //! Only per-build offsets and short byte signatures live here (asset policy:
 //! nothing of the title itself). Every hook checks the build's hash and the

@@ -1322,7 +1322,7 @@ mod tests {
 /// with `VICTORY_COMPOSE=1`: the title's resource. A Series S title presents
 /// two planes, the game and the interface (menus, loading screens,
 /// subtitles), 72-byte descriptions each; only the first was shown, so
-/// everything was black. From dexyl7/VIctorious, ported there from
+/// everything was black. From randomguy12000/VIctorious, ported there from
 /// trustno1-coder/VIctory-NVIDIA (commit 7997a20), from a fork's pull
 /// request #1189 (fxceless).
 #[cfg(windows)]

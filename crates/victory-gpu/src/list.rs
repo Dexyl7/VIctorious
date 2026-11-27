@@ -239,7 +239,7 @@ static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::ne
 // twice as long making lists. So a recording takes the idle list that fits
 // it best ([`fresh_list_for`]), at most [`big_most`] large ones wait idle,
 // and a full pool lets its largest go first ([`recycle`]). From
-// dexyl7/VIctorious.
+// randomguy12000/VIctorious.
 
 /// Words of a recording from which it, and the host list it went to, count as
 /// large (`VICTORY_BIG_WORDS`).
@@ -332,7 +332,7 @@ fn fresh_list_for(hint: u64) -> Option<crate::host::HostList> {
 /// memory it ever held. With the pool of idle host lists (`IDLE`) beside
 /// them, 2,000 host lists were alive in the world on Series S and memory
 /// shared with the card grew to 15.5 GB (32 GB PC, near its commit limit).
-/// From dexyl7/VIctorious.
+/// From randomguy12000/VIctorious.
 #[cfg(windows)]
 fn lazy_hosts() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();

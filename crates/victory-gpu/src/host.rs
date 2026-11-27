@@ -404,7 +404,7 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
 /// shared buffers (12.5 GB) in four minutes of driving on Series S, while
 /// the driver's 32 and 64 MB blocks they lie in (memory shared with the
 /// card) stood at 11 to 13 GB committed on a 32 GB PC, and frames dropped
-/// when the camera turned and new textures went up. dexyl7/VIctorious
+/// when the camera turned and new textures went up. randomguy12000/VIctorious
 /// measured the same with host copies (14.6 GB of the driver's blocks).
 fn upload_pool_most() -> u64 {
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -3790,8 +3790,6 @@ pub(crate) mod aside;
 pub(crate) mod awake;
 mod card_steps;
 pub(crate) mod indirects;
-#[cfg(feature = "diagnostics")]
-mod panel;
 mod place;
 mod send;
 pub(crate) use send::{goes_as_words, words_under};
@@ -8913,8 +8911,6 @@ struct Presenter {
     ahead: Vec<(HostList, u64)>,
     hwnd: HWND,
     meter: Meter,
-    #[cfg(feature = "diagnostics")]
-    panel: panel::Panel,
 }
 
 /// The frame rate, shown in the window's caption every second and logged
@@ -8942,12 +8938,6 @@ impl Meter {
             logged: now,
             caption: None,
         }
-    }
-
-    /// Whether the next frame counted makes the frame-rate line.
-    #[cfg(feature = "diagnostics")]
-    fn line_due(&self) -> bool {
-        self.since.elapsed() >= std::time::Duration::from_secs(1)
     }
 
     /// Counts a presented frame.
@@ -9365,8 +9355,6 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(feature = "diagnostics")]
             let watched = crate::popwatch::take(&self.device, list, texture);
-            #[cfg(feature = "diagnostics")]
-            p.panel.draw(self, copy, &back, (width, height), format);
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
             list.ResourceBarrier(&[
@@ -9408,8 +9396,6 @@ impl Host {
                 p.swap_chain.Present(0, DXGI_PRESENT(0))
             };
             showing.next("the frame meter");
-            #[cfg(feature = "diagnostics")]
-            p.panel.frame(p.meter.line_due());
             p.meter.frame(p.hwnd);
             showing.end();
             #[cfg(feature = "diagnostics")]
@@ -9479,8 +9465,6 @@ impl Host {
                 ahead: Vec::new(),
                 hwnd,
                 meter: Meter::new(),
-                #[cfg(feature = "diagnostics")]
-                panel: panel::Panel::new(),
             })
         }
     }

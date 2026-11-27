@@ -1,5 +1,5 @@
 //! The frame rate, drawn into the top left corner of every frame shown.
-//! (From dexyl7/VIctorious; memory lines after Belobug's panel, PR #348.)
+//! (From randomguy12000/VIctorious; memory lines after Belobug's panel, PR #348.)
 //!
 //! The window's caption has the frame rate, but a capture of the window's
 //! picture (a stream) does not carry the caption. Here the number is part
@@ -23,6 +23,9 @@
 //! In the top right corner, the time since the first frame was shown, as
 //! minutes and seconds (hours once past one), so a run's length is on the
 //! picture (`VICTORY_FPS_CLOCK=0`: none).
+//!
+//! F3, with the game's window in front, hides and shows all of it (it was the
+//! key of the diagnostics panel, `VICTORY_PANEL`, which this replaces).
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -73,6 +76,26 @@ static STARTED: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::n
 fn clock_text(seconds: u64) -> String {
     let (h, m, s) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
     if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// Whether the boxes are shown now: on at the start (unless
+/// `VICTORY_FPS_COUNTER=0`), F3 turns them off and on.
+static SHOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// F3 went down since the last look, with a window of this process in front.
+fn f3_pressed() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_F3};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    static DOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // SAFETY: a plain query.
+    let down = unsafe { GetAsyncKeyState(i32::from(VK_F3)) } < 0;
+    if DOWN.swap(down, Ordering::Relaxed) || !down {
+        return false;
+    }
+    let mut process = 0;
+    // SAFETY: plain queries; room for the answer.
+    unsafe { GetWindowThreadProcessId(GetForegroundWindow(), &mut process) };
+    process == std::process::id()
 }
 
 /// Whether the counter is drawn.
@@ -287,7 +310,14 @@ pub(crate) fn draw(host: &crate::host::Host, list: &ID3D12GraphicsCommandList, b
     if !on() {
         return;
     }
+    // (The clock counts from the first frame, shown or not.)
     STARTED.get_or_init(std::time::Instant::now);
+    if f3_pressed() {
+        SHOWN.fetch_xor(true, Ordering::Relaxed);
+    }
+    if !SHOWN.load(Ordering::Relaxed) {
+        return;
+    }
     let tenths = TENTHS.load(Ordering::Relaxed);
     let Some(bytes) = pixel_bytes(format).filter(|_| tenths != u32::MAX) else {
         return;

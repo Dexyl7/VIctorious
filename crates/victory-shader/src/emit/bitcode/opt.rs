@@ -746,7 +746,7 @@ impl Module {
             // A size query stays where the lowering put it: AMD's D3D12
             // compiler (amdxc64, RDNA4) crashes making the pipeline of some
             // compute programs when one `getDimensions` serves the uses of
-            // another below it. (Belobug's PR #324, via dexyl7/VIctorious.)
+            // another below it. (Belobug's PR #324, via randomguy12000/VIctorious.)
             Op::Call(f, _) if self.funcs[*f as usize].name == "dx.op.getDimensions" => return None,
             Op::Call(f, args) => Key::Call(*f, args.clone()),
             Op::Gep(ty, p, idx) => Key::Gep(*ty, *p, idx.clone()),

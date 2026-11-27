@@ -86,14 +86,14 @@ mod switch;
 mod ab;
 #[cfg(windows)]
 mod tdr;
-// Series S interface plane laid over the game (VICTORY_COMPOSE=1), from dexyl7/VIctorious
+// Series S interface plane laid over the game (VICTORY_COMPOSE=1), from randomguy12000/VIctorious
 // (ported there from trustno1-coder/VIctory-NVIDIA).
 #[cfg(windows)]
 mod compose;
-// The frame rate, memory and run time on the picture (VICTORY_FPS_COUNTER), from dexyl7/VIctorious.
+// The frame rate, memory and run time on the picture (VICTORY_FPS_COUNTER), from randomguy12000/VIctorious.
 #[cfg(windows)]
 mod fpsbox;
-// Sharpening of the frame we show (VICTORY_SHARPEN), from dexyl7/VIctorious.
+// Sharpening of the frame we show (VICTORY_SHARPEN), from randomguy12000/VIctorious.
 #[cfg(windows)]
 mod sharpen;
 #[cfg(windows)]

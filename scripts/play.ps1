@@ -12,7 +12,7 @@
 # -RenderScale  the title's render size as a share of the output, 0.2 to 1 (0.67: as Series S draws by default)
 # -Sharpen      sharpening of the shown frame, 0 to 1 (0.6 suits a render scale of 0.67)
 # -Ports        renderer patches 1, 5 and 6 (avatarmanz): constants heap and constant buffers read in place, guards' lock shared
-# -More         other settings: -More @{VICTORY_PANEL='1'}
+# -More         other settings: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
     [Parameter(Mandatory)][string]$Exe,
@@ -46,7 +46,7 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'
     $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
-# Series S shows its interface on a second plane laid over the game's (from dexyl7/VIctorious).
+# Series S shows its interface on a second plane laid over the game's (from randomguy12000/VIctorious).
 if ($Console -eq 'series-s') {
     $settings.VICTORY_COMPOSE = '1'
     # The title's own upscaler (FSR does not translate), and card room for textures:

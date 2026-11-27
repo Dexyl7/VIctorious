@@ -263,7 +263,7 @@ extern "system" fn window_proc(
     }
     // Alt+Enter or F11: borderless fullscreen on the window's monitor, and
     // back (the picture is stretched to the window; no mode switch). From
-    // dexyl7/VIctorious.
+    // randomguy12000/VIctorious.
     let pressed = lparam & (1 << 30) == 0;
     if (message == wm::WM_SYSKEYDOWN && wparam == 0x0D && lparam & (1 << 29) != 0)
         || (message == wm::WM_KEYDOWN && wparam == 0x7A)

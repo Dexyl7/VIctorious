@@ -28,7 +28,7 @@ mod crash;
 pub mod frame_rate;
 pub mod resolution;
 // Title patches for the 1.0.2.1 executable (render scale, own upscaler,
-// watchdog), from dexyl7/VIctorious (ported there from trustno1-coder/VIctory-NVIDIA).
+// watchdog), from randomguy12000/VIctorious (ported there from trustno1-coder/VIctory-NVIDIA).
 #[cfg(windows)]
 mod hooks;
 pub mod prepare;

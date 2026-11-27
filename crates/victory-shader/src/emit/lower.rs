@@ -6541,7 +6541,7 @@ impl<'a> Lower<'a> {
         // marked uniform: such a query gets a handle of its own, marked
         // non-uniform (exact: the index is the same for every lane), and
         // not shared with the buffer's loads. (`VICTORY_DIMS_UNIFORM=1`
-        // keeps the old handle, to compare.) From dexyl7/VIctorious.
+        // keeps the old handle, to compare.) From randomguy12000/VIctorious.
         let h = if image.is_none()
             && !self.x.res.waterfall.loads.contains(&site)
             && std::env::var_os("VICTORY_DIMS_UNIFORM").is_none()
