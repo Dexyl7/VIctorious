@@ -109,6 +109,16 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   ones (`VICTORY_UPLOAD_POOL_MB`, 512; 0: off; after dexyl7/VIctorious' `VICTORY_BUFFER_POOL`)
   instead of made new every time; `VICTORY_THIN` left off in `scripts\play.ps1`
   (single frames of stretched geometry with it on, on the RX 9070 XT).
+- PC FidelityFX FSR 4.1.2 to 4K (`scripts\play.ps1 -Fsr4K quality|balanced|performance`), Belobug's
+  port (cd8dfc0) of DexNom/VIctory ab34a8b2.
+- The title's output size (`-Output 2560x1440`, `VICTORY_OUTPUT`; with `-Fsr4K`, FSR upscales to it):
+  `resolution.rs` and `frame_rate.rs` from this repository's later main.
+- Renderer patch 6 (`VICTORY_PORT_GUARD=1`, off by default): the write guards' lock shared, with a
+  claim per 64 KiB block, and refresh planning beside the submitting thread; this repository's
+  later main (9d723e8, 2edf844, 65f9707, 00ab2ac, 8f02bf7, 88b63a2) without the rest of it.
+- Renderer patches 1 and 5 (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_CBV`) and patch 1's ordering fix
+  (`VICTORY_PORT_CONSTANTS_ORDER`), from this repository's later main (86dc109, 4b82f6c, 9c23e8d,
+  631400f, 3e04ca0, 15c3d0e, 3920dc2); `scripts\play.ps1 -Ports` turns on 1, 5 and 6.
 
 ## Credits
 

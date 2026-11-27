@@ -677,6 +677,7 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
+    crate::allocowners::line();
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer

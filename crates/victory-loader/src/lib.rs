@@ -24,6 +24,9 @@
 #[cfg(windows)]
 mod console_insn;
 mod crash;
+// The title's frame rate and output size patches, from avatarmanz's later main.
+pub mod frame_rate;
+pub mod resolution;
 // Title patches for the 1.0.2.1 executable (render scale, own upscaler,
 // watchdog), from dexyl7/VIctorious (ported there from trustno1-coder/VIctory-NVIDIA).
 #[cfg(windows)]
