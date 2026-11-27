@@ -949,7 +949,17 @@ extern "system" fn present(
             None
         };
         let resource = texture.as_ref().map_or(0, |t| t.0);
-        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), Shown { frame, resource });
+        // The interface plane laid over the game (`crate::compose`), its
+        // state found the same way.
+        let over = second_plane(planes, plane_parameters, resource as This).and_then(|r| {
+            crate::resource::host_copy(r).map(|copy| {
+                let state = crate::resource::host_transition(r, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+                crate::resource::host_transition(r, state);
+                let state = if crate::list::thin::wanted() { u32::MAX } else { state };
+                (copy, state)
+            })
+        });
+        behind::present(this, texture.map(|(_, copy, state)| (copy, state)), over, Shown { frame, resource });
         called.end();
         #[cfg(feature = "diagnostics")]
         frame_ends();
@@ -969,7 +979,13 @@ extern "system" fn present(
         const COPY_SOURCE: u32 = 0x800;
         let state = crate::resource::host_transition(resource, COPY_SOURCE)
             .map_or(COPY_SOURCE, |(_, before)| before);
-        show(texture, state, Shown { frame, resource: resource as usize });
+        let ui = second_plane(planes, plane_parameters, resource).and_then(|r| {
+            let t = crate::resource::host_resource(r)?;
+            let s = crate::resource::host_transition(r, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+            crate::resource::host_transition(r, s);
+            Some((t, s))
+        });
+        show(texture, state, ui, Shown { frame, resource: resource as usize });
         crate::resource::host_transition(resource, state);
         let _ = host;
     }
@@ -1003,11 +1019,16 @@ struct Shown {
 
 /// Shows `texture`, in host state `state`, in our window.
 #[cfg(windows)]
-fn show(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32, what: Shown) {
+fn show(
+    texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+    state: u32,
+    over: Option<(&windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32)>,
+    what: Shown,
+) {
     let Some(host) = crate::host::host() else {
         return;
     };
-    let shown = host.present(texture, state, what.frame);
+    let shown = host.present_over(texture, state, over, what.frame);
     #[cfg(feature = "diagnostics")]
     blinks(what.frame, what.resource as This, state, shown);
     #[cfg(not(feature = "diagnostics"))]
@@ -1279,4 +1300,35 @@ mod tests {
         Written::GpuTimestamp.write(at[1..].as_mut_ptr().cast(), 8);
         assert!(at[1] > first);
     }
+}
+
+/// A present's second plane, to be laid over the first (`crate::compose`),
+/// with `VICTORY_COMPOSE=1`: the title's resource. A Series S title presents
+/// two planes, the game and the interface (menus, loading screens,
+/// subtitles), 72-byte descriptions each; only the first was shown, so
+/// everything was black. From dexyl7/VIctorious, ported there from
+/// trustno1-coder/VIctory-NVIDIA (commit 7997a20), from a fork's pull
+/// request #1189 (fxceless).
+#[cfg(windows)]
+fn second_plane(planes: u32, plane_parameters: *const Plane, first: This) -> Option<This> {
+    const STRIDE: usize = 72;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let on = *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_COMPOSE").is_some_and(|v| v == "1");
+        if on {
+            tracing::info!("present planes: a second plane is laid over the first (VICTORY_COMPOSE=1)");
+        }
+        on
+    });
+    if !on || planes < 2 || plane_parameters.is_null() {
+        return None;
+    }
+    // SAFETY: the title passes `planes` descriptions of `STRIDE` bytes.
+    let plane = unsafe { plane_parameters.cast::<u8>().add(STRIDE).cast::<Plane>().as_ref() }?;
+    if plane.count == 0 || plane.resources.is_null() {
+        return None;
+    }
+    // SAFETY: the plane lists `count` resources.
+    let resource = unsafe { *plane.resources };
+    (resource != first && !resource.is_null()).then_some(resource)
 }

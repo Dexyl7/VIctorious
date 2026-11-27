@@ -78,6 +78,10 @@ mod switch;
 mod ab;
 #[cfg(windows)]
 mod tdr;
+// Series S interface plane laid over the game (VICTORY_COMPOSE=1), from dexyl7/VIctorious
+// (ported there from trustno1-coder/VIctory-NVIDIA).
+#[cfg(windows)]
+mod compose;
 #[cfg(windows)]
 mod texture;
 pub mod timeline;

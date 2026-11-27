@@ -6517,7 +6517,24 @@ impl<'a> Lower<'a> {
         (first, props, image, uav, used)
         };
         let src = Source::Loaded { load: site, first };
-        let h = self.handle(site, &src, false, props)?;
+        // AMD's DXIL compiler (amdxc64) dereferences null lowering a
+        // `getDimensions` of a heap-indexed raw buffer whose handle is
+        // marked uniform: such a query gets a handle of its own, marked
+        // non-uniform (exact: the index is the same for every lane), and
+        // not shared with the buffer's loads. (`VICTORY_DIMS_UNIFORM=1`
+        // keeps the old handle, to compare.) From dexyl7/VIctorious.
+        let h = if image.is_none()
+            && !self.x.res.waterfall.loads.contains(&site)
+            && std::env::var_os("VICTORY_DIMS_UNIFORM").is_none()
+        {
+            let index = self.heap_index(site, first, false)?;
+            let h = self.s.heap_handle(self.cur, index, false, true, props);
+            // (not one of the program's per-lane handles)
+            self.s.nonuniform_handles -= 1;
+            h
+        } else {
+            self.handle(site, &src, false, props)?
+        };
         let c = self.cur;
         let i32t = self.s.t.i32;
         let dims = self.s.m.named_struct("dx.types.Dimensions", vec![i32t; 4]);
