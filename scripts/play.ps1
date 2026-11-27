@@ -57,7 +57,10 @@ if ($Fsr4K) {
     $settings.VICTORY_FSR_4K = $Fsr4K.ToLowerInvariant(); $settings.VICTORY_FIDELITYFX_DIR = $FfxDir
 }
 if ($Output -ne '') { $settings.VICTORY_OUTPUT = $Output }
-if ($Ports) { $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1' }
+# Patch 1's ordering (each in-place indirect execution checked alone, after a full wait of the card)
+# cost about 36 ms of the card's time a frame here (timelines tl2: 61 ms busy with it, 25 without);
+# without it trees and palms can drop out for a few frames. -More @{VICTORY_PORT_CONSTANTS_ORDER='1'} brings it back.
+if ($Ports) { $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_CONSTANTS_ORDER = '0' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

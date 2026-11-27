@@ -118,7 +118,18 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   later main (9d723e8, 2edf844, 65f9707, 00ab2ac, 8f02bf7, 88b63a2) without the rest of it.
 - Renderer patches 1 and 5 (`VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_CBV`) and patch 1's ordering fix
   (`VICTORY_PORT_CONSTANTS_ORDER`), from this repository's later main (86dc109, 4b82f6c, 9c23e8d,
-  631400f, 3e04ca0, 15c3d0e, 3920dc2); `scripts\play.ps1 -Ports` turns on 1, 5 and 6.
+  631400f, 3e04ca0, 15c3d0e, 3920dc2); `scripts\play.ps1 -Ports` turns on 1, 5 and 6, with patch 1's
+  ordering off: checking each in-place indirect execution alone took about 36 ms of the card a frame
+  here (61 ms busy against 25), at the cost of trees and palms that can drop out for a few frames.
+- Renderer port RT, part 1 (`VICTORY_PORT_RT=1`, off by default): a constant buffer filled behind a
+  copy at its place in its own list takes the copy's source, so the submitting thread no longer
+  stands until every flight has landed (15-30 ms a frame in the city here); this repository's later
+  main (84917c3, 014d52d), without its card timing stamps.
+- Descriptor tables planned once per pipeline (`TablePlan`) and the fallback heaps
+  (`VICTORY_FALLBACK_HEAPS=1`, off): codec-d/cool_fox 641835a4 by Graham, via this repository's
+  later main (46e3297).
+- A descriptor slot that keeps showing the same resource no longer clones it on every draw (a
+  reference count shared by the recording threads).
 
 ## Credits
 

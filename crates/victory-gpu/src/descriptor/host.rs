@@ -2598,7 +2598,7 @@ impl HostHeap {
             } else {
                 self.clear_twin(index);
             }
-            self.keep(index, made.kept.clone());
+            self.keep_ref(index, &made.kept);
             Some(made.listed)
         })
     }
@@ -2667,6 +2667,31 @@ impl HostHeap {
                 return;
             }
             std::mem::replace(&mut *slot, resource)
+        };
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire_resource(old);
+        }
+    }
+
+    /// As [`HostHeap::keep`], from a reference: the resource is cloned (a
+    /// reference count taken, shared by every recording thread that names it)
+    /// only when the slot shows another one. [`HostHeap::make_listed`] keeps
+    /// the same resource in the same slot draw after draw, and cloned it each
+    /// time to compare it: an AddRef and a Release on the same object from
+    /// five threads (3.4 % of the recording threads, profile of run p7900s).
+    fn keep_ref(&self, index: u32, resource: &Option<ID3D12Resource>) {
+        let Some(slot) = self.kept.get(index as usize) else {
+            return;
+        };
+        let old = {
+            use windows::core::Interface;
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            if slot.as_ref().map(Interface::as_raw) == resource.as_ref().map(Interface::as_raw) {
+                return;
+            }
+            std::mem::replace(&mut *slot, resource.clone())
         };
         // A running submission may still read the old resource through
         // this slot.
