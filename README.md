@@ -1,4 +1,4 @@
-# VIctory on an RX 9070 XT (dexyl7's copy)
+# VIctory on an RX 9070 XT (randomguy12000's copy)
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
 that runs an Xbox Series title natively on Windows from files the user supplies,
@@ -39,7 +39,7 @@ model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
 tools, and your own dump of the title.
 
 ```powershell
-git clone https://github.com/dexyl7/VIctorious -b 7900-base VIctory7900
+git clone https://github.com/randomguy12000/VIctorious -b 7900-base VIctory7900
 cd VIctory7900
 copy victory.example.toml victory.toml      # then set your paths, outside this folder
 cargo build --locked --profile diag -p victory --features diagnostics
@@ -86,8 +86,9 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 | `-Build diag\|release` | which build to start (`diag`, the default, is the one measured) |
 | `-More @{NAME='value'}` | any other `VICTORY_...` setting, e.g. `-More @{VICTORY_THIN='0'}` |
 
-Alt+Enter or F11 switches borderless full screen. The frame rate, memory and run
-time are drawn on the picture (`VICTORY_FPS_COUNTER=0`: not).
+Alt+Enter or F11 switches borderless full screen. The frame rate, VRAM, RAM and run
+time are drawn in the corners of the picture; **F3 hides and shows them**
+(`VICTORY_FPS_COUNTER=0`: never drawn).
 
 ### Settings added in this copy (for `-More`)
 
@@ -165,27 +166,27 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 - **Frame record and replay** with per-pass times and shader variants compared
   turn by turn ([docs/replay.md](docs/replay.md)).
 
-## Changes in this copy (dexyl7, RX 9070 XT, 32 GB)
+## Changes in this copy (randomguy12000, RX 9070 XT, 32 GB)
 
 - AMD's shader compiler (RDNA4) no longer crashes on size queries: Belobug's PR #324 and
-  dexyl7/VIctorious' separate handle for `getDimensions`.
+  randomguy12000/VIctorious' separate handle for `getDimensions`.
 - Series S (`scripts\play.ps1 -Console series-s`): the interface plane laid over the game
   (`VICTORY_COMPOSE`), the title's own upscaler, card room for textures; from
-  dexyl7/VIctorious, ported there from trustno1-coder/VIctory-NVIDIA (fxceless PR #1189).
+  randomguy12000/VIctorious, ported there from trustno1-coder/VIctory-NVIDIA (fxceless PR #1189).
 - Render scale and the title's own upscaler (`-RenderScale`, `VICTORY_RENDER_SCALE`,
   `VICTORY_OWN_UPSCALER`) and the watchdog patch (`VICTORY_NO_WATCHDOG`): trustno1-coder,
-  vitutu1/victory-perf and ZigZagBoi1/ScarlettPort, via dexyl7/VIctorious.
-- Sharpening of the shown frame (`-Sharpen`, `VICTORY_SHARPEN`), from dexyl7/VIctorious.
+  vitutu1/victory-perf and ZigZagBoi1/ScarlettPort, via randomguy12000/VIctorious.
+- Sharpening of the shown frame (`-Sharpen`, `VICTORY_SHARPEN`), from randomguy12000/VIctorious.
 - A submitted list's host side is not replaced until the list's reset (`VICTORY_LAZY_HOSTS=0`:
   as before): fewer host lists alive, less command memory.
 - Borderless fullscreen on Alt+Enter or F11, and the frame rate, memory and run time drawn on
-  the picture (`VICTORY_FPS_COUNTER=0`: none), from dexyl7/VIctorious.
+  the picture (`VICTORY_FPS_COUNTER=0`: none), from randomguy12000/VIctorious.
 - Idle host lists are kept by size (`VICTORY_LIST_SIZES=0`: one pool): a recording takes the idle list
   that fits it best, only 64 large ones wait idle (`VICTORY_BIG_IDLE`, `VICTORY_BIG_WORDS`),
   and a full pool lets its largest go first: the driver's command memory stops growing to the
   largest recording in every list.
 - Lists' upload buffers made by size class, and host copies' buffers by size, kept for the next
-  ones (`VICTORY_UPLOAD_POOL_MB`, 512; 0: off; after dexyl7/VIctorious' `VICTORY_BUFFER_POOL`)
+  ones (`VICTORY_UPLOAD_POOL_MB`, 512; 0: off; after randomguy12000/VIctorious' `VICTORY_BUFFER_POOL`)
   instead of made new every time; `VICTORY_THIN` left off in `scripts\play.ps1`
   (single frames of stretched geometry with it on, on the RX 9070 XT).
 - PC FidelityFX FSR 4.1.2 to 4K (`scripts\play.ps1 -Fsr4K quality|balanced|performance`), Belobug's
@@ -212,7 +213,8 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 - Tried and taken out again: renderer port RT part 1 (this repository's later main, 84917c3 and
   014d52d; it removed the submitting thread's wait but the frame was no shorter here), the fallback
   heaps that came with 46e3297, and the tool that found which module asked for big memory blocks
-  (`VICTORY_ALLOC_OWNERS`; the RAM investigation is done).
+  (`VICTORY_ALLOC_OWNERS`; the RAM investigation is done). The diagnostics panel
+  (`VICTORY_PANEL`) is gone too: F3 now hides and shows the corner boxes instead.
 - A descriptor slot that keeps showing the same resource no longer clones it on every draw (a
   reference count shared by the recording threads).
 - A table made afresh copies its descriptors in one call and retires what its slots let go of
