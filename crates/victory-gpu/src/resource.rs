@@ -2181,6 +2181,67 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    // Copies of placed textures whose title memory is not mapped any more
+    // (its first page): the title gave the texture up, so the copy goes once
+    // it has been idle a moment, room on the card or not. 2.7 GB of them
+    // were alive 11 minutes into a Series S run while the card sat under its
+    // line and 9.3 GB of the PC's memory was shared with it. The same checks
+    // as above (no list, no slot, nothing else holds it); a later use makes
+    // it again. A part of them at each look, the next part at the next.
+    // `VICTORY_DEAD_SWEEP=0`: kept until the card's line, as before.
+    static DEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *DEAD.get_or_init(|| std::env::var_os("VICTORY_DEAD_SWEEP").is_none_or(|v| v != "0")) {
+        const DEAD_PART: usize = 16384;
+        const DEAD_MS: u64 = 2_000;
+        static DEAD_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let (mut dead_went, mut dead_bytes) = (0u64, 0u64);
+        let from = DEAD_FROM.load(Relaxed);
+        let (mut seen, mut last) = (0usize, 0usize);
+        for at in all.range(from..).take(DEAD_PART).copied() {
+            seen += 1;
+            last = at;
+            // SAFETY: as above.
+            let r = unsafe { &*(at as *const Resource) };
+            if !r.host.placed.load(Relaxed) || !fills(&r.desc) {
+                continue;
+            }
+            let used = r.host.used.load(Relaxed);
+            if used == 0 || !crate::host::long_ago(used, DEAD_MS, IDLE_FRAMES) || crate::texture::host_wrote(at) {
+                continue;
+            }
+            if crate::texture::committed(r.data().cast_const(), 1) {
+                continue;
+            }
+            let gone = {
+                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+                let idle = made.as_ref().is_some_and(|(host, _)| {
+                    crate::host::long_ago(r.host.used.load(Relaxed), DEAD_MS, IDLE_FRAMES)
+                        && std::sync::Arc::strong_count(host) == 1
+                        && crate::host::references(&host.texture) == 1
+                });
+                if idle {
+                    // Under the lock, as above.
+                    crate::texture::unstage(at as This);
+                    r.host.wanted.store(u32::MAX, Relaxed);
+                    made.take()
+                } else {
+                    None
+                }
+            };
+            if let Some((host, _)) = gone {
+                let_go.push(at);
+                r.host.gone.store(true, Relaxed);
+                KINDS[2].fetch_add(1, Relaxed);
+                KINDS[3].fetch_add(host.bytes, Relaxed);
+                dead_went += 1;
+                dead_bytes += host.bytes;
+                crate::host::retire(host);
+            }
+        }
+        DEAD_FROM.store(if seen == DEAD_PART { last + 1 } else { 0 }, Relaxed);
+        DEAD_GONE[0].fetch_add(dead_went, Relaxed);
+        DEAD_GONE[1].fetch_add(dead_bytes, Relaxed);
+    }
     if hosted_walk() {
         for at in let_go {
             all.remove(&at);
@@ -2200,6 +2261,11 @@ pub(crate) fn let_go_idle() {
         });
     }
 }
+
+/// Since the start: host copies [`let_go_idle`] let go because their
+/// title memory is not mapped any more, and their bytes.
+#[cfg(windows)]
+pub(crate) static DEAD_GONE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// Since the start: looks of [`let_go_idle`], their microseconds, and the
 /// longest one's.
