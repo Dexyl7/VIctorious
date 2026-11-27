@@ -82,6 +82,12 @@ mod tdr;
 // (ported there from trustno1-coder/VIctory-NVIDIA).
 #[cfg(windows)]
 mod compose;
+// The frame rate, memory and run time on the picture (VICTORY_FPS_COUNTER), from dexyl7/VIctorious.
+#[cfg(windows)]
+mod fpsbox;
+// Sharpening of the frame we show (VICTORY_SHARPEN), from dexyl7/VIctorious.
+#[cfg(windows)]
+mod sharpen;
 #[cfg(windows)]
 mod texture;
 pub mod timeline;

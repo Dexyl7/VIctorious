@@ -86,6 +86,26 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
 - **Frame record and replay** with per-pass times and shader variants compared
   turn by turn ([docs/replay.md](docs/replay.md)).
 
+## Changes in this copy (dexyl7, RX 9070 XT, 32 GB)
+
+- AMD's shader compiler (RDNA4) no longer crashes on size queries: Belobug's PR #324 and
+  dexyl7/VIctorious' separate handle for `getDimensions`.
+- Series S (`scripts\play.ps1 -Console series-s`): the interface plane laid over the game
+  (`VICTORY_COMPOSE`), the title's own upscaler, card room for textures; from
+  dexyl7/VIctorious, ported there from trustno1-coder/VIctory-NVIDIA (fxceless PR #1189).
+- Render scale and the title's own upscaler (`-RenderScale`, `VICTORY_RENDER_SCALE`,
+  `VICTORY_OWN_UPSCALER`) and the watchdog patch (`VICTORY_NO_WATCHDOG`): trustno1-coder,
+  vitutu1/victory-perf and ZigZagBoi1/ScarlettPort, via dexyl7/VIctorious.
+- Sharpening of the shown frame (`-Sharpen`, `VICTORY_SHARPEN`), from dexyl7/VIctorious.
+- A submitted list's host side is not replaced until the list's reset (`VICTORY_LAZY_HOSTS=0`:
+  as before): fewer host lists alive, less command memory.
+- Borderless fullscreen on Alt+Enter or F11, and the frame rate, memory and run time drawn on
+  the picture (`VICTORY_FPS_COUNTER=0`: none), from dexyl7/VIctorious.
+- Idle host lists are kept by size (`VICTORY_LIST_SIZES=0`: one pool): a recording takes the idle list
+  that fits it best, only 64 large ones wait idle (`VICTORY_BIG_IDLE`, `VICTORY_BIG_WORDS`),
+  and a full pool lets its largest go first: the driver's command memory stops growing to the
+  largest recording in every list.
+
 ## Credits
 
 This is a tree of other people's work with more on top. The history is kept, and

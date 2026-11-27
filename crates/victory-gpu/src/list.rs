@@ -134,6 +134,11 @@ struct List {
     /// ([`thin`]; then there is no `host`).
     #[cfg(windows)]
     thin: thin::Front,
+    /// How many words the next recording into it is expected to have (the
+    /// last of the title list it records for, [`thin`]): which idle host
+    /// list it takes at its reset ([`fresh_list_for`]).
+    #[cfg(windows)]
+    hint: u64,
 }
 
 /// One part of a title list cut at its waits: the waits the queue stands
@@ -225,6 +230,44 @@ unsafe impl Send for Idle {}
 #[cfg(windows)]
 static IDLE: std::sync::Mutex<(Vec<Idle>, u64)> = std::sync::Mutex::new((Vec::new(), 0));
 
+// Host lists by size (`VICTORY_LIST_SIZES=0`: as before). A host list's
+// allocator keeps the command memory of the largest recording it ever took,
+// and the pool handed every list in turn to large and small recordings
+// alike: 1,500 to 2,000 host lists alive, memory shared with the card (where
+// the driver keeps command memory) at 15 GB and the process at 30 GB on a
+// 32 GB PC; with the pool off it stayed near 9 GB and 20 GB, and frames took
+// twice as long making lists. So a recording takes the idle list that fits
+// it best ([`fresh_list_for`]), at most [`big_most`] large ones wait idle,
+// and a full pool lets its largest go first ([`recycle`]). From
+// dexyl7/VIctorious.
+
+/// Words of a recording from which it, and the host list it went to, count as
+/// large (`VICTORY_BIG_WORDS`).
+#[cfg(windows)]
+fn big_words() -> u64 {
+    static N: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_BIG_WORDS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(16 * 1024))
+}
+
+/// The most large host lists kept idle (`VICTORY_BIG_IDLE`).
+#[cfg(windows)]
+fn big_most() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| std::env::var("VICTORY_BIG_IDLE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64))
+}
+
+#[cfg(windows)]
+fn sizes() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LIST_SIZES").is_none_or(|v| v != "0"))
+}
+
+/// Since the last line of the log: large lists let go of for want of room
+/// among the idle ones, and recordings expected large that found no large
+/// list idle.
+#[cfg(windows)]
+pub(crate) static SIZE_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
 /// The most host lists kept idle (128 were too few: flights land several at
 /// a time, so lists were thrown away and others made in the same frame, with
 /// their preludes and buffers, 12 % of the submitting thread in the opening,
@@ -246,9 +289,29 @@ fn pools() -> bool {
 /// after its reset, or a new one.
 #[cfg(windows)]
 fn fresh_list() -> Option<crate::host::HostList> {
+    fresh_list_for(0)
+}
+
+/// [`fresh_list`] for a recording expected to have `hint` words: a large
+/// idle list for a large one, else a small one ([`sizes`]).
+#[cfg(windows)]
+fn fresh_list_for(hint: u64) -> Option<crate::host::HostList> {
     let idle = {
         let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
-        let taken = idle.0.pop();
+        // By size: the idle list whose largest recording is the smallest that
+        // still holds `hint` words, else the largest there is (it grows less
+        // than a small one would). Without sizes, the last one put back.
+        let at = if sizes() && !idle.0.is_empty() {
+            let fits = idle.0.iter().enumerate().filter(|(_, l)| l.0.peak() >= hint).min_by_key(|(_, l)| l.0.peak());
+            let at = fits.or_else(|| idle.0.iter().enumerate().max_by_key(|(_, l)| l.0.peak())).map(|(i, _)| i);
+            if hint >= big_words() && at.is_some_and(|i| idle.0[i].0.peak() < hint) {
+                SIZE_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            at
+        } else {
+            idle.0.len().checked_sub(1)
+        };
+        let taken = at.map(|i| idle.0.swap_remove(i));
         if let Some(Idle(_, bytes)) = &taken {
             idle.1 -= bytes;
         }
@@ -258,6 +321,36 @@ fn fresh_list() -> Option<crate::host::HostList> {
         Some(Idle(list, _)) => Some(list),
         None => crate::host::host().and_then(|h| h.new_list().ok()),
     }
+}
+
+/// Whether a submitted list's host side is taken without another put in its
+/// place until the title resets the list (on by default; `VICTORY_LAZY_HOSTS=0`:
+/// a fresh one at once, as before). Why: every list of ours (the title's,
+/// and with `VICTORY_THIN` the ones the translating threads record into)
+/// held a host list between its submission and its next reset, most of the
+/// time doing nothing, and a host list's allocator keeps the most command
+/// memory it ever held. With the pool of idle host lists (`IDLE`) beside
+/// them, 2,000 host lists were alive in the world on Series S and memory
+/// shared with the card grew to 15.5 GB (32 GB PC, near its commit limit).
+/// From dexyl7/VIctorious.
+#[cfg(windows)]
+fn lazy_hosts() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_LAZY_HOSTS").is_none_or(|v| v != "0"))
+}
+
+/// A submitted list's host side, taken ([`lazy_hosts`]), or swapped for a
+/// fresh closed one (as before).
+#[cfg(windows)]
+fn take_host(list: &mut List) -> Option<crate::host::HostList> {
+    if lazy_hosts() {
+        return list.host.take();
+    }
+    let fresh = fresh_list()?;
+    // A new host list is open; the title's next call on its list is a
+    // reset, which wants it closed.
+    fresh.close();
+    list.host.replace(fresh)
 }
 
 /// The host sides of lists whose submission has run (submissions are
@@ -273,7 +366,33 @@ pub(crate) fn recycle(lists: Vec<Detached>, ran: &[usize]) {
         // The descriptor slots and the upload memory its commands named.
         drop(_state);
         drop(_uploads);
-        if !ran.contains(&i) || IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
+        if !ran.contains(&i) {
+            continue;
+        }
+        // By size: large lists (`big_words`) beyond `big_most` of them idle
+        // are let go of, their command memory with them; with the pool full,
+        // the largest list of the pool and this one goes.
+        if sizes() {
+            let big = host.peak() >= big_words();
+            let mut idle = IDLE.lock().unwrap_or_else(|e| e.into_inner());
+            if big && idle.0.iter().filter(|l| l.0.peak() >= big_words()).count() >= big_most() {
+                SIZE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                continue;
+            }
+            if idle.0.len() >= IDLE_MOST.0 {
+                let largest = idle.0.iter().enumerate().max_by_key(|(_, l)| l.0.peak()).map(|(i, l)| (i, l.0.peak()));
+                match largest {
+                    Some((i, peak)) if peak > host.peak() => {
+                        let Idle(gone, bytes) = idle.0.swap_remove(i);
+                        idle.1 -= bytes;
+                        drop(idle);
+                        drop(gone);
+                        SIZE_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    _ => continue,
+                }
+            }
+        } else if IDLE.lock().unwrap_or_else(|e| e.into_inner()).0.len() >= IDLE_MOST.0 {
             continue;
         }
         // As the title's reset does: what the list kept for its commands
@@ -397,16 +516,10 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
             }
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
-        let Some(host) = list.host.replace(fresh) else {
+        let Some(host) = take_host(list) else {
             continue;
         };
         let earlier = std::mem::take(&mut list.earlier);
@@ -469,17 +582,11 @@ pub(crate) fn detach(lists: &[This]) -> (Vec<Detached>, Vec<usize>) {
             order.push(i);
             continue;
         }
-        let Some(fresh) = fresh_list() else {
-            continue;
-        };
-        // A new host list is open; the title's next call on its list is a
-        // reset, which wants it closed.
-        fresh.close();
         let list = this.cast_mut().cast::<List>();
         // SAFETY: one of our lists, closed and submitted: nothing records
         // into it until the title resets it.
         let (host, uploads, state) = unsafe {
-            let Some(host) = (*list).host.replace(fresh) else {
+            let Some(host) = take_host(&mut *list) else {
                 continue;
             };
             let uploads =
@@ -619,6 +726,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
         gate: Vec::new(),
         #[cfg(windows)]
         thin: Default::default(),
+        #[cfg(windows)]
+        hint: 0,
     });
     #[cfg(not(windows))]
     let _ = pipeline;
@@ -678,6 +787,20 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
         list.earlier.clear();
         list.gate.clear();
+        // A list whose host side a submission took gets one now
+        // ([`lazy_hosts`]), closed, as the reset below wants it.
+        if list.host.is_none() {
+            match fresh_list_for(list.hint) {
+                Some(fresh) => {
+                    fresh.close();
+                    list.host = Some(fresh);
+                }
+                None => {
+                    static ONCE: std::sync::Once = std::sync::Once::new();
+                    ONCE.call_once(|| tracing::warn!("no host list for a list's reset: its recording is lost"));
+                }
+            }
+        }
     }
     #[cfg(windows)]
     with_state(this, |host, state| {
@@ -2442,4 +2565,14 @@ mod tests {
             assert_eq!(release(object), 0);
         }
     }
+}
+
+/// Sets the size a list's next recording is expected to have ([`List::hint`]).
+#[cfg(windows)]
+pub(crate) fn set_hint(this: This, words: u64) {
+    if this.is_null() {
+        return;
+    }
+    // SAFETY: one of our lists, not recording (its reset comes after this).
+    unsafe { (*this.cast_mut().cast::<List>()).hint = words };
 }

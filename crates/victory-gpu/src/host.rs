@@ -5,7 +5,7 @@
 //! (unless `VICTORY_LATE_WAIT=1`, see [`late`]);
 //! overlap them with per-submission fences once more than clears run.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use windows::Win32::Foundation::{HANDLE, HWND, LPARAM, LRESULT, RECT, WPARAM};
@@ -1182,6 +1182,10 @@ pub(crate) struct HostList {
     /// depends on ([`HostList::changed_something`]); no two lists have the
     /// same.
     epoch: std::sync::atomic::AtomicU64,
+    /// The most words of a translated recording (`crate::list::thin`) the
+    /// list ever took: its allocator keeps the command memory of its largest
+    /// recording, so idle lists are kept by it (`crate::list`'s pool).
+    peak: AtomicU64,
     /// Counts the list in [`ALIVE`] while it lives.
     _alive: Counted,
     /// The texts of the markers `note_op` set, in order (for device-removed
@@ -4051,6 +4055,7 @@ impl Host {
                 batch_args: Mutex::default(),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
+                peak: AtomicU64::new(0),
                 _alive: Counted::new(),
                 #[cfg(feature = "diagnostics")]
                 notes,
@@ -6856,6 +6861,16 @@ impl HostList {
 
     /// The bytes of scratch chunks the list holds now (after a reset:
     /// none while lists share their chunks).
+    /// A recording of `words` went into the list ([`Self::peak`]).
+    pub(crate) fn note_words(&self, words: u64) {
+        self.peak.fetch_max(words, Ordering::Relaxed);
+    }
+
+    /// The most words a recording into the list ever had.
+    pub(crate) fn peak(&self) -> u64 {
+        self.peak.load(Ordering::Relaxed)
+    }
+
     pub(crate) fn scratch_kept(&self) -> u64 {
         let scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         scratch.chunks.iter().map(|c| c.1).sum()
@@ -8535,6 +8550,12 @@ impl Meter {
         let drawn = crate::draw::drawn();
         let frames = f64::from(self.frames);
         let fps = frames / elapsed.as_secs_f64();
+        crate::fpsbox::set(fps);
+        // The memory lines under it: the card's own in use and its budget,
+        // the PC's the card uses, the PC's free.
+        if let Some([own, shared]) = host().and_then(|h| h.video_memory_groups()) {
+            crate::fpsbox::set_memory([own[1], own[0], shared[1], available_physical_ram().unwrap_or(0)]);
+        }
         let ms = elapsed.as_secs_f64() * 1000.0 / frames;
         let draws = (drawn - self.drawn) as f64 / frames;
         (self.since, self.frames, self.drawn) = (std::time::Instant::now(), 0, drawn);
@@ -8906,7 +8927,15 @@ impl Host {
             if let Some(laid) = &laid {
                 copy.keep(laid);
             }
-            list.CopyResource(&back, laid.as_ref().unwrap_or(texture));
+            // Then sharpened, if asked for (`crate::sharpen`).
+            let sharp = crate::sharpen::record(&self.device, list, laid.as_ref().unwrap_or(texture));
+            if let Some(sharp) = &sharp {
+                copy.keep(sharp);
+            }
+            list.CopyResource(&back, sharp.as_ref().or(laid.as_ref()).unwrap_or(texture));
+            // The frame rate, into the corner of what is shown (not of the
+            // title's own frame, which the lines below read back).
+            crate::fpsbox::draw(self, list, &back, (width, height, format));
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -8995,6 +9024,12 @@ impl Host {
             let swap_chain = factory
                 .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
                 .cast::<IDXGISwapChain3>()?;
+            // Alt+Enter is the window's own (borderless, `victory_hle`'s
+            // lifecycle): DXGI's exclusive switch froze the picture, since
+            // nothing here makes the buffers again for it.
+            if let Err(e) = factory.MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER) {
+                tracing::warn!(error = %e, "Alt+Enter not taken from DXGI");
+            }
             let copy = self.new_list()?;
             copy.close();
             tracing::info!(width, height, format = format.0, "presenting to a window");

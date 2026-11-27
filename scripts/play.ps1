@@ -4,6 +4,8 @@
 # -RayTracing   the title's own ray-traced indirect light: lit interiors, about a third slower
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Console      series-x (default) or series-s (less title memory: for PCs with 32 GB)
+# -RenderScale  the title's render size as a share of the output, 0.2 to 1 (0.67: as Series S draws by default)
+# -Sharpen      sharpening of the shown frame, 0 to 1 (0.6 suits a render scale of 0.67)
 # -More         other settings: -More @{VICTORY_PANEL='1'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -12,7 +14,9 @@ param(
     [switch]$RayTracing,
     [ValidateSet('diag', 'release')][string]$Build = 'diag',
     [hashtable]$More = @{},
-    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x'
+    [ValidateSet('series-x', 'series-s')][string]$Console = 'series-x',
+    [string]$RenderScale = '',
+    [string]$Sharpen = ''
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -26,7 +30,14 @@ if ($Safe) {
     $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 # Series S shows its interface on a second plane laid over the game's (from dexyl7/VIctorious).
-if ($Console -eq 'series-s') { $settings.VICTORY_COMPOSE = '1' }
+if ($Console -eq 'series-s') {
+    $settings.VICTORY_COMPOSE = '1'
+    # The title's own upscaler (FSR does not translate), and card room for textures:
+    # Series S's targets hold about 1.25 GB, not the 3 GB kept for them by default.
+    $settings.VICTORY_OWN_UPSCALER = '1'; $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1536'; $settings.VICTORY_TEXTURE_ROOM_PERCENT = '75'
+}
+if ($RenderScale -ne '') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
+if ($Sharpen -ne '') { $settings.VICTORY_SHARPEN = $Sharpen }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 

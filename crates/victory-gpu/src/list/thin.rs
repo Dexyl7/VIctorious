@@ -66,6 +66,9 @@ pub(super) struct Front {
     words: Vec<u64>,
     closed: bool,
     submitted: bool,
+    /// Words handed over of the recording being written: the size the next
+    /// one is expected to have (`super::fresh_list_for`).
+    written: u64,
 }
 
 impl Drop for Front {
@@ -89,7 +92,8 @@ impl Front {
     /// Begins a recording, with `pipeline` bound.
     pub(super) fn begin(&mut self, kind: u32, pipeline: This) {
         self.leave();
-        self.recording = Some(Arc::new(Recording::new(kind)));
+        let hint = std::mem::take(&mut self.written);
+        self.recording = Some(Arc::new(Recording::with_hint(kind, hint)));
         self.closed = false;
         self.submitted = false;
         self.put(RESET, &[pipeline as u64]);
@@ -137,6 +141,7 @@ impl Front {
         }
         let fresh = held(&WORDS).pop().unwrap_or_else(|| Vec::with_capacity(CHUNK + 256));
         let words = std::mem::replace(&mut self.words, fresh);
+        self.written += words.len() as u64;
         CHUNKS.fetch_add(1, Relaxed);
         let schedule = {
             let mut inner = held(&recording.inner);
@@ -180,6 +185,8 @@ fn held<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// yet, and the list of ours it goes to.
 pub(crate) struct Recording {
     kind: u32,
+    /// The words the title list's recording before had.
+    hint: u64,
     inner: Mutex<Inner>,
     /// Translated to its end.
     done: AtomicBool,
@@ -198,12 +205,20 @@ struct Inner {
     back: usize,
     /// That list was closed by the stream.
     closed: bool,
+    /// Words translated so far.
+    words: u64,
 }
 
 impl Recording {
+    #[cfg(test)]
     fn new(kind: u32) -> Self {
+        Self::with_hint(kind, 0)
+    }
+
+    fn with_hint(kind: u32, hint: u64) -> Self {
         Recording {
             kind,
+            hint,
             inner: Mutex::default(),
             done: AtomicBool::new(false),
             moved: Condvar::new(),
@@ -239,6 +254,8 @@ impl Recording {
                 };
                 if inner.back == 0 {
                     inner.back = back_list(self.kind) as usize;
+                    // Before the stream's reset, which takes the host list.
+                    super::set_hint(inner.back as This, self.hint);
                 }
                 (chunk, inner.back as This)
             };
@@ -247,6 +264,10 @@ impl Recording {
             STATS[0].fetch_add(calls, Relaxed);
             STATS[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
             let mut inner = held(&self.inner);
+            inner.words += chunk.len() as u64;
+            if let Some(host) = super::host_list(back) {
+                host.note_words(inner.words);
+            }
             inner.kept.push(chunk);
             if closed {
                 inner.closed = true;
@@ -349,6 +370,13 @@ pub(crate) fn line(frames: f64) {
         return;
     }
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    let z: Vec<f64> = super::SIZE_STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames).collect();
+    tracing::info!(
+        "host lists by size per frame (VICTORY_LIST_SIZES): {:.2} large ones let go of (no idle room), {:.2} large recordings that found no large list idle; {} host lists alive",
+        z[0],
+        z[1],
+        crate::host::ALIVE[0].load(Relaxed)
+    );
     tracing::info!(
         "list calls translated by threads of ours per frame (VICTORY_THIN): {:.0} in {:.1} ms (all threads), {:.1} lists, {:.1} pieces; left in the middle {:.2}",
         s[0],
