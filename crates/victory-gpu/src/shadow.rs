@@ -4783,7 +4783,91 @@ fn buffers() -> std::sync::RwLockWriteGuard<'static, BTreeMap<(u64, usize), Entr
 static BUFFERS_CHANGED: AtomicU64 = AtomicU64::new(1);
 
 /// Answers a thread remembers.
-const FOUND_MOST: usize = 1024;
+const FOUND_MOST: usize = 4096;
+
+/// Changes of [`BUFFERS`] by where they are: a count for each MiB of title
+/// addresses (folded onto [`GENERATIONS`] of them), bumped for every MiB a
+/// buffer that came, went or lost its copy covers. An answer of [`lookup`]
+/// is the innermost buffer holding the ask's first byte; any change to it,
+/// or to a buffer that could come between, covers that byte's MiB.
+///
+/// With one count for the whole map (`BUFFERS_CHANGED`) every buffer the
+/// title made or released anywhere emptied what all threads remembered,
+/// and they went back to the map's lock: 4 % of the recording threads' time
+/// waited there (profile p7900s), with the title streaming.
+const GENERATIONS: usize = 4096;
+static BY_RANGE: [AtomicU64; GENERATIONS] = [const { AtomicU64::new(1) }; GENERATIONS];
+
+/// Since the last line: asks [`FOUND`] answered, and asks that went to the
+/// map.
+static FOUND_COUNTS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+thread_local! {
+    /// [`FOUND_COUNTS`] of this thread, added in every 1,024 asks: a shared
+    /// count bumped by five threads 250,000 times a frame would be a cost of
+    /// its own.
+    static FOUND_HERE: std::cell::Cell<[u32; 2]> = const { std::cell::Cell::new([0; 2]) };
+}
+
+fn count_found(which: usize) {
+    FOUND_HERE.with(|c| {
+        let mut n = c.get();
+        n[which] += 1;
+        if n[0] + n[1] >= 1024 {
+            FOUND_COUNTS[0].fetch_add(u64::from(n[0]), Ordering::Relaxed);
+            FOUND_COUNTS[1].fetch_add(u64::from(n[1]), Ordering::Relaxed);
+            n = [0; 2];
+        }
+        c.set(n);
+    });
+}
+
+/// The frame line's: how often a thread's memory of its asks answered.
+pub(crate) fn found_line(frames: f64) {
+    let n = FOUND_COUNTS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+    tracing::info!(
+        "asks for a buffer's host copy per frame: {:.0} answered by the asking thread's memory, {:.0} from the map (VICTORY_FIND_BY_RANGE={})",
+        n[0],
+        n[1],
+        u8::from(by_range())
+    );
+}
+
+/// [`BY_RANGE`] for `[start, end)`: under [`BUFFERS`]' write lock.
+fn changed_over(start: u64, end: u64) {
+    let (first, last) = (start >> 20, end.max(start + 1).saturating_sub(1) >> 20);
+    if last - first >= GENERATIONS as u64 {
+        BY_RANGE.iter().for_each(|g| {
+            g.fetch_add(1, Ordering::SeqCst);
+        });
+        return;
+    }
+    for mib in first..=last {
+        BY_RANGE[mib as usize % GENERATIONS].fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// Whether [`FOUND`] goes by [`BY_RANGE`] (`VICTORY_FIND_BY_RANGE=1`; off by
+/// default: by `BUFFERS_CHANGED`, as before; A/B-able in diagnostics builds).
+fn by_range() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_FIND_BY_RANGE") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_FIND_BY_RANGE").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The count an answer for an ask at `address` is remembered at: the one of
+/// its MiB, or of the whole map. The lowest bit says which, so an answer
+/// remembered by one is never taken by the other.
+fn generation(address: u64) -> u64 {
+    if by_range() {
+        BY_RANGE[(address >> 20) as usize % GENERATIONS].load(Ordering::SeqCst) << 1 | 1
+    } else {
+        BUFFERS_CHANGED.load(Ordering::SeqCst) << 1
+    }
+}
 
 /// An ask (address, bytes), the count of changes it was answered at, and the
 /// answer.
@@ -4809,7 +4893,7 @@ fn found_at(address: u64, len: u64) -> usize {
 
 /// What this thread remembers of an ask, if nothing changed since.
 fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    let changed = BUFFERS_CHANGED.load(Ordering::SeqCst);
+    let changed = generation(address);
     let shadow = FOUND.with(|f| {
         let f = f.borrow();
         let (a, n, at, shadow) = f.get(found_at(address, len))?;
@@ -4818,7 +4902,7 @@ fn found(address: u64, len: u64) -> Option<Arc<Shadow>> {
     // Whoever takes the map to let a copy go that nobody holds finds it held
     // now, or had counted before: then it is not handed out.
     std::sync::atomic::fence(Ordering::SeqCst);
-    (BUFFERS_CHANGED.load(Ordering::SeqCst) == changed).then_some(shadow)
+    (generation(address) == changed).then_some(shadow)
 }
 
 /// Remembers an answer given while `changed` was the count.
@@ -4838,7 +4922,9 @@ fn buffers_read() -> std::sync::RwLockReadGuard<'static, BTreeMap<(u64, usize), 
 
 /// A title buffer exists at `start` (`len` bytes).
 pub(crate) fn register(resource: usize, start: u64, len: u64) {
-    buffers().insert(
+    let mut map = buffers();
+    changed_over(start, start + len);
+    map.insert(
         (start, resource),
         Entry {
             end: start + len,
@@ -4849,7 +4935,10 @@ pub(crate) fn register(resource: usize, start: u64, len: u64) {
 
 /// The title released it; lists that still hold its copy keep it alive.
 pub(crate) fn unregister(resource: usize, start: u64) {
-    buffers().remove(&(start, resource));
+    let mut map = buffers();
+    if let Some(entry) = map.remove(&(start, resource)) {
+        changed_over(start, entry.end);
+    }
 }
 
 /// The title buffer holding `address`, as (start, length), without making
@@ -4883,8 +4972,11 @@ pub(crate) fn in_place_let_go(at: u64, len: u64) -> u64 {
     {
         // As `lookup` finds a buffer: among the 256 that start below.
         let mut map = buffers();
-        for (_, entry) in map.range_mut(..(end, 0)).rev().take(256) {
+        for (key, entry) in map.range_mut(..(end, 0)).rev().take(256) {
             if entry.end > at && entry.shadow.as_ref().is_some_and(|s| s.place.is_some()) {
+                // (Counted before it is taken out, as `buffers` counted
+                // before: see `found`.)
+                changed_over(key.0, entry.end);
                 gone.extend(entry.shadow.take());
             }
         }
@@ -4947,7 +5039,11 @@ pub(crate) fn peek(address: u64, len: u64) -> Option<Arc<Shadow>> {
 fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
     let quick = quick_find();
     if quick && let Some(shadow) = found(address, len) {
+        count_found(0);
         return Some(shadow);
+    }
+    if quick {
+        count_found(1);
     }
     let end = address.checked_add(len.max(1))?;
     {
@@ -4957,7 +5053,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             Some((_, Entry { shadow: Some(shadow), .. })) => {
                 if quick {
                     // (Nobody changes the map while this lock is held.)
-                    remember(address, len, BUFFERS_CHANGED.load(Ordering::SeqCst), shadow);
+                    remember(address, len, generation(address), shadow);
                 }
                 return Some(shadow.clone());
             }

@@ -24,7 +24,7 @@ use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use victory_gpu::object::Object;
-use windows::Win32::Graphics::Direct3D12::ID3D12Device;
+use windows::Win32::Graphics::Direct3D12::{ID3D12Device, ID3D12Resource};
 use windows::core::Interface;
 
 use crate::{HleModule, hle_export};
@@ -698,6 +698,19 @@ fn record_dispatch(
     // SAFETY: the PC dispatch on host objects. The context is live and locked.
     let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
     if code == OK {
+        // Frame generation (`VICTORY_FRAMEGEN=1`) takes the upscaler's depth
+        // and motion vectors: Vice-Tay 3236af66, after PastiiJay/klbf-lab
+        // 793c56c3.
+        if victory_gpu::framegen::requested() {
+            record_framegen(
+                list,
+                dispatch,
+                ctx.creation.description.max_render,
+                ctx.creation.description.flags,
+                [&textures[1], &textures[2]],
+                [dispatch.resources[1].state, dispatch.resources[2].state],
+            );
+        }
         victory_gpu::external::output_written(output);
         ctx.first_dispatch.call_once(|| {
             tracing::info!(render = ?dispatch.render_size, output = ?output_size, ?backing_extents,
@@ -712,6 +725,35 @@ fn record_dispatch(
         );
     }
     code
+}
+
+fn record_framegen(
+    list: &victory_gpu::external::Recording<'_>,
+    dispatch: &DispatchUpscale,
+    max_render: [u32; 2],
+    upscale_flags: u32,
+    [depth, motion]: [&ID3D12Resource; 2],
+    [depth_state, motion_state]: [u32; 2],
+) {
+    if !matches!(depth_state, 0x4 | 0xc) || !matches!(motion_state, 0x4 | 0xc) {
+        return;
+    }
+    list.prepare_framegen(victory_gpu::framegen::Inputs {
+        depth,
+        motion,
+        depth_desc: dispatch.resources[1].description,
+        motion_desc: dispatch.resources[2].description,
+        depth_state,
+        motion_state,
+        max_render,
+        render_size: dispatch.render_size,
+        upscale_flags,
+        jitter: dispatch.jitter,
+        motion_scale: dispatch.motion_scale,
+        frame_ms: f32::from_bits(dispatch.settings[2]),
+        reset: dispatch.settings[4] & 0xff != 0,
+        camera: std::array::from_fn(|i| f32::from_bits(dispatch.settings[5 + i])),
+    });
 }
 
 pub(crate) fn module() -> HleModule {

@@ -3502,6 +3502,9 @@ impl State {
                 self.recording = NEXT.fetch_add(1, Ordering::Relaxed);
             }
             let recording = self.recording;
+            // Its copies together (`VICTORY_TABLE_BATCH`), made before the
+            // table is bound.
+            crate::descriptor::host::copies_begin();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
             for k in 0..n {
@@ -3603,6 +3606,7 @@ impl State {
                     }
                 }
             }
+            crate::descriptor::host::copies_flush();
             made.push((slot, first * 32));
         }
         made

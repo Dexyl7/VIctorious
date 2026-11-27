@@ -610,6 +610,24 @@ pub(crate) fn retire_resource(object: ID3D12Resource) {
     RETIRED.lock().unwrap_or_else(|e| e.into_inner()).push_back((started, Retired::Resource(object)));
 }
 
+/// [`retire_resource`] for several at once, under one taking of the lock
+/// (`crate::descriptor::host::copies_flush`). They count from now: no
+/// earlier than each was let go, so none is dropped too soon.
+pub(crate) fn retire_resources(objects: Vec<ID3D12Resource>) {
+    let queued = crate::queue::queued();
+    let started = STARTED.load(Ordering::Acquire) + queued;
+    if bury_lag() == 0 && started <= FINISHED.load(Ordering::Acquire) {
+        RETIREMENTS[0].fetch_add(objects.len() as u64, Ordering::Relaxed);
+        drop(objects);
+        return;
+    }
+    RETIREMENTS[1].fetch_add(objects.len() as u64, Ordering::Relaxed);
+    let mut retired = RETIRED.lock().unwrap_or_else(|e| e.into_inner());
+    for object in objects {
+        retired.push_back((started, Retired::Resource(object)));
+    }
+}
+
 /// How many submissions later than it could (the last one that may use it
 /// has finished) an object let go is dropped, and a host list that has run
 /// is reset, about two frames: the device losses of the night of 2026-11-25
@@ -2361,6 +2379,9 @@ struct Deferred {
     /// descriptor heaps): the title may release its objects before it
     /// submits the list.
     kept: Vec<windows::core::IUnknown>,
+    /// What a host library's commands in the list use (frame generation's
+    /// context): [`HostList::keep_shared`].
+    shared: Vec<std::sync::Arc<dyn std::any::Any + Send + Sync>>,
     /// The pipelines [`HostList::bind_pipeline`] kept, by address.
     bound: std::collections::HashSet<usize, std::hash::BuildHasherDefault<AddressHash>>,
     /// Buffer ranges refreshed since the last title copy (host copy,
@@ -3760,6 +3781,17 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_rt::line(frames);
+    crate::descriptor::host::table_batch_line(frames);
+    crate::shadow::found_line(frames);
+    {
+        let drains = crate::queue::MAP_DRAINS.swap(0, Ordering::Relaxed) as f64 / frames;
+        if crate::list::thin::wanted() || drains > 0.0 {
+            tracing::info!(
+                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}; list calls written down (VICTORY_THIN): {}",
+                crate::list::thin::wanted()
+            );
+        }
+    }
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -6857,6 +6889,7 @@ impl HostList {
             if !(deferred.copies.is_empty()
                 && deferred.uploads.is_empty()
                 && deferred.kept.is_empty()
+                && deferred.shared.is_empty()
                 && deferred.textures.is_empty()
                 && deferred.writes.is_empty()
                 && deferred.backs.is_empty()
@@ -7362,6 +7395,12 @@ impl HostList {
     /// next clamp moves it back to unordered access.
     pub(crate) fn indirect_readable(&self, scratch: &ID3D12Resource) {
         self.deferred().indirect_readable = scratch.as_raw() as usize;
+    }
+
+    /// Holds a reference to `object` until the list is reset, which is
+    /// after its last submission has run.
+    pub(crate) fn keep_shared(&self, object: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.deferred().shared.push(object);
     }
 
     /// Keeps `object` alive until the list is reset.
@@ -8977,6 +9016,8 @@ const BUFFERS: u32 = 2;
 
 struct Presenter {
     swap_chain: IDXGISwapChain3,
+    /// The swap chain is FidelityFX frame generation's (`crate::framegen`).
+    framegen: bool,
     width: u32,
     height: u32,
     format: DXGI_FORMAT,
@@ -9340,7 +9381,7 @@ impl Host {
         let (width, height) = (desc.Width as u32, desc.Height);
         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
         if presenter.is_none() {
-            *presenter = match self.presenter(width, height, format) {
+            *presenter = match self.presenter(width, height, format, frame) {
                 Ok(p) => Some(p),
                 Err(e) => {
                     tracing::warn!(error = %e, "no swap chain");
@@ -9352,10 +9393,17 @@ impl Host {
         if (p.width, p.height, p.format) != (width, height, format) {
             // Presents sent ahead hold back buffers until they have run.
             settle_now(WHY_SYNC);
-            // SAFETY: no back buffer is held; every submission was waited for.
-            let resized = unsafe {
-                p.swap_chain
-                    .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+            let resize_buffers = || {
+                // SAFETY: no back buffer is held; every submission was waited for.
+                unsafe {
+                    p.swap_chain
+                        .ResizeBuffers(BUFFERS, width, height, format, DXGI_SWAP_CHAIN_FLAG(0))
+                }
+            };
+            let resized = if p.framegen {
+                crate::framegen::resize(frame, width, height, format.0, resize_buffers)?
+            } else {
+                resize_buffers()
             };
             match resized {
                 Ok(()) => {
@@ -9474,7 +9522,11 @@ impl Host {
             #[cfg(feature = "diagnostics")]
             crate::replay::record::present(texture, state);
             let mut showing = crate::timeline::span("the host's Present");
-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
+            let _ = if p.framegen {
+                crate::framegen::present(&p.swap_chain, frame, None)
+            } else {
+                p.swap_chain.Present(0, DXGI_PRESENT(0))
+            };
             showing.next("the frame meter");
             #[cfg(feature = "diagnostics")]
             p.panel.frame(p.meter.line_due());
@@ -9492,6 +9544,7 @@ impl Host {
         width: u32,
         height: u32,
         format: DXGI_FORMAT,
+        frame: u64,
     ) -> windows::core::Result<Presenter> {
         let hwnd = match title_window() {
             Some(hwnd) => hwnd,
@@ -9514,9 +9567,18 @@ impl Host {
                 SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
                 ..Default::default()
             };
-            let swap_chain = factory
-                .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
-                .cast::<IDXGISwapChain3>()?;
+            // FidelityFX frame generation (`VICTORY_FRAMEGEN=1`): its own
+            // swap chain, which presents the generated frames between ours.
+            let generated = crate::framegen::requested()
+                .then(|| crate::framegen::swap_chain(hwnd, &desc, &factory, &self.queue, &self.device, frame))
+                .flatten();
+            let framegen = generated.is_some();
+            let swap_chain = match generated {
+                Some(swap_chain) => swap_chain,
+                None => factory
+                    .CreateSwapChainForHwnd(&self.queue, hwnd, &desc, None, None)?
+                    .cast::<IDXGISwapChain3>()?,
+            };
             // Alt+Enter is the window's own (borderless, `victory_hle`'s
             // lifecycle): DXGI's exclusive switch froze the picture, since
             // nothing here makes the buffers again for it.
@@ -9529,6 +9591,7 @@ impl Host {
             self.log_video_memory("right after the swap chain is made");
             Ok(Presenter {
                 swap_chain,
+                framegen,
                 width,
                 height,
                 format,

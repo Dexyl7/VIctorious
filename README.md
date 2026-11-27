@@ -1,15 +1,124 @@
-# VIctory on an RX 7900 XTX
+# VIctory on an RX 9070 XT (dexyl7's copy)
 
 A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
-This one is about **speed on AMD RDNA 3**: the world at 30 frames a second on
-one PC, without giving up the picture. It is not there yet.
+that runs an Xbox Series title natively on Windows from files the user supplies,
+by way of [avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX).
+This copy is tuned on an **AMD RX 9070 XT (RDNA 4), Ryzen 7 9800X3D, 32 GB RAM**.
+The goal is a steady 30 frames a second in the world. It is not there yet.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's developer
 or publisher.
 
-## Where it stands (2026-11-25)
+## Where it stands (2026-11-28)
+
+One machine: Windows 11, Ryzen 7 9800X3D, 32 GB RAM (page file raised to ~80 GB),
+RX 9070 XT. Series S profile, driving in the world, ~4,000-7,000 draws a frame:
+
+| Settings | Frame time | Notes |
+|---|---|---|
+| `-Console series-s -Ports` (THIN on, the default) | ~38 ms (~26 fps) | lamps can flicker, trees can pop |
+| `-Console series-s` (THIN on, no `-Ports`) | ~43 ms (~23 fps) | lights stable |
+| Either, before THIN was on | ~48-50 ms | |
+| Series X `-Fsr4K quality -Ports` | ~60 ms (15-17 fps) | sharper picture, heavier |
+
+What is known to be wrong:
+
+- A little geometry flicker remains (characters' clothing, single frames).
+- With `-Ports`, lamp-lit rooms can flicker and trees and palms can pop for a few
+  frames (patch 1's ordering is off: on, it cost the card ~36 ms a frame).
+- Textures of roads and buildings can be late or black while the title streams.
+- The Series S profile with 1440p output draws the interface large; use 4K output.
+- Frame generation (`-FrameGen`) doubles the shown frames but flickers at today's
+  real frame rate; best left off until the real rate is near 30.
+
+## How to run it
+
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
+model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
+tools, and your own dump of the title.
+
+```powershell
+git clone https://github.com/dexyl7/VIctorious -b 7900-base VIctory7900
+cd VIctory7900
+copy victory.example.toml victory.toml      # then set your paths, outside this folder
+cargo build --locked --profile diag -p victory --features diagnostics
+```
+
+Then, from a normal (not administrator) PowerShell window:
+
+```powershell
+cd <the folder>
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+# Fastest today (32 GB RAM): Series S profile with the renderer patches
+scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s -Ports
+# Lights without flicker, a little slower
+scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
+# Series X with PC FSR 4.1.2 to 4K (needs the AMD DLLs below)
+scripts\play.ps1 -Exe <path of your copy's executable> -Fsr4K quality -Ports
+```
+
+Add `*> play.txt` to keep the log. If `cargo build` fails, do not start the game:
+the script would run the previous build. Turn the network off before the game runs.
+
+Before the first run, ahead of time (both can be stopped and go on later):
+
+```powershell
+target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+```
+
+### `scripts\play.ps1` switches
+
+| Switch | What it does |
+|---|---|
+| `-Exe <path>` | your copy's executable (required) |
+| `-Console series-x\|series-s` | the console the title takes this PC for. `series-s` needs less memory (32 GB PCs) and lays the interface plane over the game |
+| `-Ports` | renderer patches 1, 5 and 6: the title's constants and constant buffers read in place, the write guards' lock shared. Faster; patch 1's ordering is left off (see above) |
+| `-Fsr4K quality\|balanced\|performance` | PC FidelityFX FSR 4.1.2 upscaling to 3840x2160 (Series X only) |
+| `-FfxDir <folder>` | where AMD's DLLs are (default `C:\FidelityFX`): `amd_fidelityfx_upscaler_dx12.dll` for `-Fsr4K`; for `-FrameGen` also `amd_fidelityfx_framegeneration_dx12.dll` and `amd_fidelityfx_loader_dx12.dll`, all from the FSR SDK 2.4.0 release (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, `Kits/FidelityFX/signedbin`) |
+| `-FrameGen` | with `-Fsr4K`: AMD frame generation, 2x shown frames |
+| `-Output <size>` | the title's output size (Series X): 3840x2160, 2560x1440, 1920x1080, 1664x936, 1280x720; with `-Fsr4K`, what FSR upscales to |
+| `-RenderScale 0.2-1` | the title's render size as a share of the output |
+| `-Sharpen 0-1` | sharpening of the shown frame |
+| `-RayTracing` | the title's ray-traced indirect light (about a third slower) |
+| `-Safe` | without the newer, faster ways: the first thing to try when something is wrong |
+| `-Build diag\|release` | which build to start (`diag`, the default, is the one measured) |
+| `-More @{NAME='value'}` | any other `VICTORY_...` setting, e.g. `-More @{VICTORY_THIN='0'}` |
+
+Alt+Enter or F11 switches borderless full screen. The frame rate, memory and run
+time are drawn on the picture (`VICTORY_FPS_COUNTER=0`: not).
+
+### Settings added in this copy (for `-More`)
+
+| Setting | Default | What it does |
+|---|---|---|
+| `VICTORY_THIN` | 1 (play.ps1) | list calls written down on the title's threads, translated by threads of ours (~20 % shorter frames) |
+| `VICTORY_MAP_DRAIN` | on | the title's queue page mappings wait for the lists submitted before them (THIN's stretched geometry) |
+| `VICTORY_PORT_CONSTANTS_ORDER` | 0 with `-Ports` | 1: patch 1's in-place indirect arguments checked one by one (lights and trees right, the card ~36 ms slower a frame) |
+| `VICTORY_TABLE_BATCH` | 1 (play.ps1) | a table's descriptor copies in one driver call |
+| `VICTORY_FIND_BY_RANGE` | 1 (play.ps1) | buffer lookups forgotten only where buffers changed |
+| `VICTORY_PORT_RT` | 0 | constant-buffer fills take a copy's source (tested here: no gain) |
+| `VICTORY_FALLBACK_HEAPS` | 0 | a heap of one slot bound where the title binds none |
+| `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
+| `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
+| `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
+
+### Measuring
+
+- `VICTORY_AB='<seconds>,<SWITCH>[,<SWITCH>..]'`: switches turned on and off in
+  turn while the title runs; each phase's frame times are in the log
+  (`victory_gpu::ab`). One run compares like with like.
+- `VICTORY_TIMELINE='<s>[+<s>..],<frames>,<file.json>'`: a timeline of a few
+  frames, with a `.txt` beside it naming the chain of work each frame waited on.
+- `VICTORY_PROFILE='<from s>,<to s>,<ms>,<file>'`: a sampling profile of every
+  thread.
+
+Commands, debugging switches and upstream's own description:
+[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
+described in a comment where it is read.
+
+## Upstream: where it stood on an RX 7900 XTX (avatarmanz, 2026-11-25)
 
 Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
 RX 7900 XTX, 1440p, the Series X profile.
@@ -35,34 +144,6 @@ What is known to be wrong:
 - The first run with a new driver or a new build stutters while the driver makes
   pipelines (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
-
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
-
-```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
-```
-
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
-
-Before the first run, ahead of time (both can be stopped and go on later):
-
-```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
-```
-
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
 
 ## What is different here
 
@@ -111,6 +192,13 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (single frames of stretched geometry with it on, on the RX 9070 XT).
 - PC FidelityFX FSR 4.1.2 to 4K (`scripts\play.ps1 -Fsr4K quality|balanced|performance`), Belobug's
   port (cd8dfc0) of DexNom/VIctory ab34a8b2.
+- With the line of submissions (`VICTORY_THIN=1` turns it on), the title's queue page mappings
+  (`CopyPageMappingsBatchX`) wait until the lists submitted before them are translated and prepared
+  (`VICTORY_MAP_DRAIN=0`: not): the call is a queue's, in its order, and was done at once on the
+  assumption that every earlier submission had run. Suspected of THIN's stretched-geometry frames.
+- AMD frame generation with FSR (`-Fsr4K ... -FrameGen`, `VICTORY_FRAMEGEN=1`): `framegen.rs` and its
+  hooks from TaynanGT/Vice-Tay 3236af66 (Taynan Piza, with beloooo), whose ABI and swap-chain flow follow
+  PastiiJay/klbf-lab 793c56c3; without its DLSS path and panel changes.
 - The title's output size (`-Output 2560x1440`, `VICTORY_OUTPUT`; with `-Fsr4K`, FSR upscales to it):
   `resolution.rs` and `frame_rate.rs` from this repository's later main.
 - Renderer patch 6 (`VICTORY_PORT_GUARD=1`, off by default): the write guards' lock shared, with a
@@ -130,6 +218,12 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   later main (46e3297).
 - A descriptor slot that keeps showing the same resource no longer clones it on every draw (a
   reference count shared by the recording threads).
+- A table made afresh copies its descriptors in one call and retires what its slots let go of
+  together (`VICTORY_TABLE_BATCH=1`, off by default); a thread's memory of which host copy holds a
+  buffer is forgotten only for the MiB a buffer changed in, not for every buffer anywhere
+  (`VICTORY_FIND_BY_RANGE=1`, off by default; `scripts\play.ps1` turns both on). Both from the
+  recording threads' profile of this copy: about 15 times fewer copy calls, and some 8-16 % less time
+  per draw with both on in one A/B run (four phases each, noisy).
 
 ## Credits
 

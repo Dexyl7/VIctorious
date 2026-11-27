@@ -2610,6 +2610,11 @@ impl HostHeap {
         if let Some(written) = self.written.get(to as usize) {
             written.store(crate::host::coarse_ms() as u32, std::sync::atomic::Ordering::Relaxed);
         }
+        // Inside a table being made ([`copies_begin`]): copied with the
+        // table's others in one call.
+        if !self.sampler && TABLE_BATCH.with(|b| b.borrow_mut().copy(self.cpu(to).ptr, from.ptr)) {
+            return;
+        }
         let Some(host) = host() else { return };
         // SAFETY: a slot of our heap, and one of this thread's heap.
         unsafe { host.device.CopyDescriptorsSimple(1, self.cpu(to), from, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) };
@@ -2671,7 +2676,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retire(old);
         }
     }
 
@@ -2696,7 +2701,7 @@ impl HostHeap {
         // A running submission may still read the old resource through
         // this slot.
         if let Some(old) = old {
-            crate::host::retire_resource(old);
+            retire(old);
         }
     }
 
@@ -5576,6 +5581,157 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+}
+
+/// Whether the descriptors of a table made afresh are copied in one call,
+/// and the resources its slots let go of retired together, once the table
+/// is made (`VICTORY_TABLE_BATCH=1`; off by default; A/B-able as
+/// `VICTORY_AB=<s>,VICTORY_TABLE_BATCH` in diagnostics builds).
+///
+/// A table of the title's culling and lighting dispatches is made anew for
+/// each of them (it differs in one constant buffer), slot by slot: two
+/// descriptor copies a slot, each a call into the runtime and the driver
+/// (5 % of the recording threads' time, profile p7900s), and each slot that
+/// showed something else before (dynamic slots are reused table after
+/// table) took the one lock of what is retired (lock waits there were 1.2 %
+/// of the same time). The two call sites that do the most of it took 24 ms
+/// of the recording threads a frame (timeline tl2.170).
+pub(crate) fn table_batch() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_TABLE_BATCH") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_TABLE_BATCH").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// This thread's table being made: descriptor copies (to, from) and
+/// resources let go, waiting for [`copies_flush`].
+#[derive(Default)]
+struct TableBatch {
+    on: bool,
+    copies: Vec<(usize, usize)>,
+    retired: Vec<ID3D12Resource>,
+}
+
+impl TableBatch {
+    /// Takes the copy if a table is being made.
+    fn copy(&mut self, to: usize, from: usize) -> bool {
+        if self.on {
+            self.copies.push((to, from));
+        }
+        self.on
+    }
+}
+
+thread_local! {
+    static TABLE_BATCH: std::cell::RefCell<TableBatch> = std::cell::RefCell::new(TableBatch::default());
+}
+
+/// A resource a slot let go of: retired now, or with the table's others.
+fn retire(old: ID3D12Resource) {
+    let old = TABLE_BATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.on {
+            b.retired.push(old);
+            None
+        } else {
+            Some(old)
+        }
+    });
+    if let Some(old) = old {
+        crate::host::retire_resource(old);
+    }
+}
+
+/// A table is being made on this thread ([`table_batch`]): its descriptor
+/// copies wait for [`copies_flush`]. Nothing reads its slots before that:
+/// they are dynamic slots of this list's, and the table is bound after.
+pub(crate) fn copies_begin() {
+    if table_batch() {
+        TABLE_BATCH.with(|b| b.borrow_mut().on = true);
+    }
+}
+
+/// The table is made: its copies in one call, what its slots let go of
+/// retired together.
+pub(crate) fn copies_flush() {
+    let (copies, retired) = TABLE_BATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        b.on = false;
+        (std::mem::take(&mut b.copies), std::mem::take(&mut b.retired))
+    });
+    if !copies.is_empty()
+        && let Some(host) = host()
+    {
+        static STEP: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        // SAFETY: a plain query.
+        let step = *STEP.get_or_init(|| unsafe {
+            host.device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV) as usize
+        });
+        // Runs of neighbours on either side are one range: the copies are
+        // made in order, the sources' sequence onto the destinations'.
+        let ranges = |at: &mut dyn Iterator<Item = usize>| {
+            let mut starts: Vec<D3D12_CPU_DESCRIPTOR_HANDLE> = Vec::new();
+            let mut sizes: Vec<u32> = Vec::new();
+            for ptr in at {
+                match (starts.last(), sizes.last_mut()) {
+                    (Some(last), Some(size)) if last.ptr + *size as usize * step == ptr => *size += 1,
+                    _ => {
+                        starts.push(D3D12_CPU_DESCRIPTOR_HANDLE { ptr });
+                        sizes.push(1);
+                    }
+                }
+            }
+            (starts, sizes)
+        };
+        let (to, to_sizes) = ranges(&mut copies.iter().map(|c| c.0));
+        let (from, from_sizes) = ranges(&mut copies.iter().map(|c| c.1));
+        // SAFETY: slots of our view heaps and of this thread's heap the card
+        // does not see; as many descriptors on either side.
+        unsafe {
+            host.device.CopyDescriptors(
+                to.len() as u32,
+                to.as_ptr(),
+                Some(to_sizes.as_ptr()),
+                from.len() as u32,
+                from.as_ptr(),
+                Some(from_sizes.as_ptr()),
+                D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+            );
+        }
+        TABLE_BATCHED[0].fetch_add(copies.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        TABLE_BATCHED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    if !retired.is_empty() {
+        crate::host::retire_resources(retired);
+    }
+    // (The copies' vector goes back for the next table: no allocation a
+    // table.)
+    let mut copies = copies;
+    copies.clear();
+    TABLE_BATCH.with(|b| {
+        let mut b = b.borrow_mut();
+        if b.copies.capacity() < copies.capacity() {
+            b.copies = copies;
+        }
+    });
+}
+
+/// Since the last line: descriptor copies made together, and the calls.
+static TABLE_BATCHED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The frame line's: what [`copies_flush`] did per frame.
+pub(crate) fn table_batch_line(frames: f64) {
+    let n = TABLE_BATCHED.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames);
+    if table_batch() || n[1] > 0.0 {
+        tracing::info!(
+            "tables made with their copies together (VICTORY_TABLE_BATCH={}) per frame: {:.0} descriptor copies in {:.0} calls",
+            u8::from(table_batch()),
+            n[0],
+            n[1]
+        );
     }
 }
 

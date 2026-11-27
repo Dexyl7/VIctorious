@@ -43,6 +43,20 @@ impl Recording<'_> {
     pub fn commands(&self) -> &ID3D12GraphicsCommandList {
         &self.0.list
     }
+
+    /// Holds `object` until the list is reset (after it has run).
+    pub fn keep(&self, object: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        self.0.keep_shared(object);
+    }
+
+    /// Frame generation's preparation from the upscaler's depth and motion
+    /// vectors, on the same list (`crate::framegen`); its context is held
+    /// by the list.
+    pub fn prepare_framegen(&self, input: crate::framegen::Inputs<'_>) {
+        if let Some(context) = crate::framegen::prepare(self.commands(), input) {
+            self.keep(context);
+        }
+    }
 }
 
 /// The producer recorded its output on the host's command list.

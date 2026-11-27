@@ -1,0 +1,926 @@
+//! Optional FidelityFX frame generation using the SDK 2.4 DX12 swap chain.
+//! The ABI and swap-chain flow follow PastiiJay's VIctory port (793c56c3).
+//! Upscaling stays with the selected provider. Its depth and motion vectors
+//! are submitted to AMD on the same graphics command list.
+
+use std::cell::UnsafeCell;
+use std::ffi::c_void;
+use std::os::windows::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
+use std::time::Instant;
+
+use windows::Win32::Foundation::{HWND, S_OK};
+use windows::Win32::Graphics::Direct3D12::{
+    ID3D12CommandQueue, ID3D12Device, ID3D12GraphicsCommandList, ID3D12Resource,
+};
+use windows::Win32::Graphics::Dxgi::{
+    DXGI_PRESENT, DXGI_SWAP_CHAIN_DESC1, IDXGIFactory2, IDXGISwapChain3, IDXGISwapChain4,
+};
+use windows::core::{HRESULT, Interface};
+use windows_sys::Win32::System::LibraryLoader::{
+    GetProcAddress, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+};
+
+const OK: u32 = 0;
+const ERROR: u32 = 1;
+const BACKEND_DX12: u64 = 2;
+const GET_VERSIONS: u64 = 4;
+const OVERRIDE_VERSION: u64 = 5;
+const GET_PROVIDER_VERSION: u64 = 6;
+const CREATE_FRAMEGEN: u64 = 0x0002_0001;
+const CONFIGURE_FRAMEGEN: u64 = 0x0002_0002;
+const DISPATCH_FRAMEGEN: u64 = 0x0002_0003;
+const PREPARE_FRAMEGEN: u64 = 0x0002_0004;
+const FRAMEGEN_VERSION_DESC: u64 = 0x0002_000e;
+const FRAMEGEN_VERSION: u32 = (4 << 22) | 2;
+const CREATE_SWAP_CHAIN: u64 = 0x0003_0006;
+const REGISTER_SWAP_CHAIN_UI: u64 = 0x0003_0002;
+const WAIT_FOR_PRESENTS: u64 = 0x0003_0007;
+const SWAP_CHAIN_VERSION_DESC: u64 = 0x0003_000b;
+const SWAP_CHAIN_VERSION: u32 = 4 << 22;
+// The built-in analytical provider in SDK 2.4. Read its ID from the query below.
+const FSR3_PROVIDER: u64 = (0xf600_0000 << 32) | (3 << 22) | (1 << 12) | 6;
+const PREMULTIPLIED_UI_ALPHA: u32 = 1 << 0;
+const INTERNAL_UI_DOUBLE_BUFFERING: u32 = 1 << 1;
+const TEXTURE_2D: u32 = 2;
+const RGBA8_UNORM: u32 = 10;
+const RENDER_TARGET_USAGE: u32 = 1;
+const PIXEL_COMPUTE_READ: u32 = 0xc;
+
+// AMD requires its callback-driven Present and the context API to be serialized.
+static SDK: Mutex<()> = Mutex::new(());
+
+#[repr(C)]
+struct Header {
+    kind: u64,
+    next: *mut Header,
+}
+
+fn header(kind: u64) -> Header {
+    Header {
+        kind,
+        next: null_mut(),
+    }
+}
+
+#[repr(C)]
+struct Version {
+    header: Header,
+    version: u32,
+}
+
+#[repr(C)]
+struct GetVersions {
+    header: Header,
+    create_kind: u64,
+    device: *mut c_void,
+    count: *mut u64,
+    ids: *mut u64,
+    names: *mut *const std::ffi::c_char,
+}
+
+#[repr(C)]
+struct OverrideVersion {
+    header: Header,
+    id: u64,
+}
+
+#[repr(C)]
+struct ProviderVersion {
+    header: Header,
+    id: u64,
+    name: *const std::ffi::c_char,
+}
+
+#[repr(C)]
+struct CreateSwapChain {
+    header: Header,
+    swap_chain: *mut *mut c_void,
+    hwnd: *mut c_void,
+    desc: *const c_void,
+    fullscreen: *const c_void,
+    factory: *mut c_void,
+    queue: *mut c_void,
+}
+
+#[repr(C)]
+struct Backend {
+    header: Header,
+    device: *mut c_void,
+}
+
+#[repr(C)]
+struct CreateFramegen {
+    header: Header,
+    flags: u32,
+    display: [u32; 2],
+    max_render: [u32; 2],
+    format: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Resource {
+    resource: *mut c_void,
+    description: [u32; 8],
+    state: u32,
+}
+const _: () = assert!(size_of::<Resource>() == 48);
+
+#[repr(C)]
+struct GenerateArgs {
+    header: Header,
+    command_list: *mut c_void,
+    color: Resource,
+    outputs: [Resource; 4],
+    generated: u32,
+}
+const _: () = assert!(std::mem::offset_of!(GenerateArgs, generated) == 264);
+static GENERATED: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+static FRAME_RATES: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn frame_rates() -> Option<(f32, f32)> {
+    let rates = FRAME_RATES.load(Ordering::Relaxed);
+    let rendered = f32::from_bits((rates >> 32) as u32);
+    let presented = f32::from_bits(rates as u32);
+    (presented > 0.0).then_some((rendered, presented))
+}
+
+const NO_RESOURCE: Resource = Resource {
+    resource: null_mut(),
+    description: [0; 8],
+    state: 0,
+};
+
+#[repr(C)]
+struct RegisterUi {
+    header: Header,
+    resource: Resource,
+    flags: u32,
+}
+const _: () = assert!(size_of::<RegisterUi>() == 72);
+
+type Generate = unsafe extern "C" fn(*mut Header, *mut c_void) -> u32;
+
+#[repr(C)]
+struct ConfigureFramegen {
+    header: Header,
+    swap_chain: *mut c_void,
+    present_callback: *const c_void,
+    present_context: *mut c_void,
+    generate_callback: Option<Generate>,
+    generate_context: *mut c_void,
+    enabled: bool,
+    async_workloads: bool,
+    hudless: Resource,
+    flags: u32,
+    only_generated: bool,
+    rect: [i32; 4],
+    frame: u64,
+}
+const _: () = assert!(size_of::<ConfigureFramegen>() == 144);
+
+#[repr(C)]
+struct Prepare {
+    header: Header,
+    frame: u64,
+    flags: u32,
+    command_list: *mut c_void,
+    render_size: [u32; 2],
+    jitter: [f32; 2],
+    motion_scale: [f32; 2],
+    frame_ms: f32,
+    unused_reset: bool,
+    camera: [f32; 4],
+    depth: Resource,
+    motion: Resource,
+}
+const _: () = assert!(size_of::<Prepare>() == 184);
+
+type Create = unsafe extern "C" fn(*mut *mut c_void, *mut Header, *const c_void) -> u32;
+type Destroy = unsafe extern "C" fn(*mut *mut c_void, *const c_void) -> u32;
+type Call = unsafe extern "C" fn(*mut *mut c_void, *mut Header) -> u32;
+
+struct Api {
+    create: Create,
+    destroy: Destroy,
+    configure: Call,
+    query: Call,
+    dispatch: Call,
+}
+
+pub fn requested() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_FRAMEGEN").is_some_and(|v| v == "1"))
+}
+
+fn api() -> Option<&'static Api> {
+    static API: OnceLock<Option<Api>> = OnceLock::new();
+    API.get_or_init(|| match load_api() {
+        Ok(api) => Some(api),
+        Err(reason) => {
+            tracing::warn!(%reason, "frame generation: AMD provider unavailable");
+            None
+        }
+    })
+    .as_ref()
+}
+
+fn load_api() -> Result<Api, String> {
+    let dir = std::env::var_os("VICTORY_FFX_FG_DIR")
+        .map(PathBuf::from)
+        .ok_or("set VICTORY_FFX_FG_DIR to the signed FidelityFX frame generation DLL folder")?;
+    let load = |path: &Path| {
+        let path = std::path::absolute(path).map_err(|e| e.to_string())?;
+        let wide: Vec<_> = path.as_os_str().encode_wide().chain([0]).collect();
+        // SAFETY: absolute NUL-terminated path. SDK modules stay loaded for playback callbacks.
+        let module = unsafe {
+            LoadLibraryExW(
+                wide.as_ptr(),
+                null_mut(),
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
+            )
+        };
+        if module.is_null() {
+            Err(format!("could not load {}", path.display()))
+        } else {
+            Ok(module)
+        }
+    };
+    load(&dir.join("amd_fidelityfx_framegeneration_dx12.dll"))?;
+    let module = load(&dir.join("amd_fidelityfx_loader_dx12.dll"))?;
+    let find = |name: &std::ffi::CStr| {
+        // SAFETY: a loaded SDK module and a NUL-terminated export.
+        unsafe { GetProcAddress(module, name.as_ptr().cast()) }
+            .map(|f| f as *const c_void)
+            .ok_or_else(|| format!("FidelityFX loader is missing {}", name.to_string_lossy()))
+    };
+    // SAFETY: FidelityFX SDK 2.4 C exports.
+    unsafe {
+        Ok(Api {
+            create: std::mem::transmute::<*const c_void, Create>(find(c"ffxCreateContext")?),
+            destroy: std::mem::transmute::<*const c_void, Destroy>(find(c"ffxDestroyContext")?),
+            configure: std::mem::transmute::<*const c_void, Call>(find(c"ffxConfigure")?),
+            query: std::mem::transmute::<*const c_void, Call>(find(c"ffxQuery")?),
+            dispatch: std::mem::transmute::<*const c_void, Call>(find(c"ffxDispatch")?),
+        })
+    }
+}
+
+fn analytical_provider(api: &Api, device: &ID3D12Device) -> Option<u64> {
+    let mut count = 0;
+    let mut query = GetVersions {
+        header: header(GET_VERSIONS),
+        create_kind: CREATE_FRAMEGEN,
+        device: device.as_raw(),
+        count: &raw mut count,
+        ids: null_mut(),
+        names: null_mut(),
+    };
+    // SAFETY: SDK version enumeration uses a null context and writes count.
+    if unsafe { (api.query)(null_mut(), &raw mut query.header) } != OK || count == 0 {
+        return None;
+    }
+    let mut ids = vec![0; usize::try_from(count).ok()?];
+    query.ids = ids.as_mut_ptr();
+    // SAFETY: the SDK sees the capacity in count and writes within the ID array.
+    if unsafe { (api.query)(null_mut(), &raw mut query.header) } != OK {
+        return None;
+    }
+    ids.into_iter()
+        .take(usize::try_from(count).ok()?)
+        .find(|&id| id == FSR3_PROVIDER)
+}
+
+struct Context {
+    handle: UnsafeCell<*mut c_void>,
+    create: Box<CreateFramegen>,
+    _backend: Box<Backend>,
+    _version: Box<Version>,
+    _provider: Box<OverrideVersion>,
+    _device: ID3D12Device,
+}
+
+// SAFETY: the descriptors and device stay alive and immutable after creation.
+// Preparation and configuration are serialized by SDK. The SDK owns its
+// presentation callback pipeline. Resize drains it before dropping the context.
+unsafe impl Send for Context {}
+// SAFETY: as above. Recorded lists keep their own Arc through GPU completion.
+unsafe impl Sync for Context {}
+
+impl Drop for Context {
+    fn drop(&mut self) {
+        if let Some(api) = api() {
+            let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+            // SAFETY: destruction is after all recorded work and presenter references let go.
+            unsafe { (api.destroy)(self.handle.get(), null()) };
+        }
+    }
+}
+
+#[derive(Default)]
+struct State {
+    swap_context: usize,
+    swap_chain: usize,
+    display: [u32; 2],
+    format: u32,
+    ui: Option<ID3D12Resource>,
+    provider: u64,
+    context: Option<Arc<Context>>,
+    refused_layout: Option<([u32; 2], u32)>,
+    prepared: Option<(u64, bool)>,
+    last_present: Option<u64>,
+    real: u64,
+    sample: Option<(Instant, u64, u32, u64)>,
+    #[cfg(feature = "diagnostics")]
+    cadence: Cadence,
+}
+
+#[cfg(feature = "diagnostics")]
+#[derive(Default)]
+struct Cadence {
+    prepare_seen: u64,
+    no_swap_chain: u64,
+    slot_occupied: u64,
+    wrong_frame: u64,
+    first_frame_gap: Option<(Option<u64>, u64)>,
+    invalid_extent: u64,
+    context_unavailable: u64,
+    layout_changed: u64,
+    configure_failed: u64,
+    prepare_failed: u64,
+    prepared: u64,
+    present_no_prepare: u64,
+    present_wrong_frame: u64,
+    present_reset: u64,
+}
+
+static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| Mutex::new(State::default()));
+
+fn surface_format(dxgi: i32) -> Option<u32> {
+    Some(match dxgi {
+        28 => 10,
+        87 => 14,
+        24 => 17,
+        10 => 4,
+        _ => return None,
+    })
+}
+
+pub(crate) fn swap_chain(
+    hwnd: HWND,
+    desc: &DXGI_SWAP_CHAIN_DESC1,
+    factory: &IDXGIFactory2,
+    queue: &ID3D12CommandQueue,
+    device: &ID3D12Device,
+    frame: u64,
+) -> Option<IDXGISwapChain3> {
+    let api = api()?;
+    let format = surface_format(desc.Format.0)?;
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(provider) = analytical_provider(api, device) else {
+        tracing::warn!("frame generation: AMD analytical provider 3.1.6 is unavailable");
+        return None;
+    };
+    let mut context = null_mut();
+    let mut out = null_mut();
+    let mut version = Version {
+        header: header(SWAP_CHAIN_VERSION_DESC),
+        version: SWAP_CHAIN_VERSION,
+    };
+    let mut create = CreateSwapChain {
+        header: Header {
+            kind: CREATE_SWAP_CHAIN,
+            next: &raw mut version.header,
+        },
+        swap_chain: &raw mut out,
+        hwnd: hwnd.0,
+        desc: std::ptr::from_ref(desc).cast(),
+        fullscreen: null(),
+        factory: factory.as_raw(),
+        queue: queue.as_raw(),
+    };
+    // SAFETY: the DXGI objects and the create descriptors remain live for the call.
+    let result = unsafe { (api.create)(&mut context, &raw mut create.header, null()) };
+    if result != OK || context.is_null() || out.is_null() {
+        tracing::warn!(result, "frame generation: AMD swap chain creation failed");
+        if !context.is_null() {
+            // SAFETY: a context returned by the SDK with a failed or partial create.
+            unsafe { (api.destroy)(&mut context, null()) };
+        }
+        return None;
+    }
+    // SAFETY: the SDK's replacement swap chain, which returned one COM reference.
+    let swap = unsafe { IDXGISwapChain4::from_raw(out) };
+    let Ok(swap_chain) = swap.cast::<IDXGISwapChain3>() else {
+        // SAFETY: the new swap chain has no submitted presents.
+        unsafe { (api.destroy)(&mut context, null()) };
+        return None;
+    };
+    state.swap_context = context as usize;
+    state.swap_chain = out as usize;
+    state.display = [desc.Width, desc.Height];
+    state.format = format;
+    state.provider = provider;
+    // The swap chain is created to present this title frame.
+    state.last_present = frame.checked_sub(1);
+    tracing::info!(
+        width = desc.Width,
+        height = desc.Height,
+        "frame generation: AMD swap chain active"
+    );
+    Some(swap_chain)
+}
+
+/// Depth, motion and camera data from the title's successful upscaler call.
+pub struct Inputs<'a> {
+    pub depth: &'a ID3D12Resource,
+    pub motion: &'a ID3D12Resource,
+    pub depth_desc: [u32; 8],
+    pub motion_desc: [u32; 8],
+    pub depth_state: u32,
+    pub motion_state: u32,
+    pub max_render: [u32; 2],
+    pub render_size: [u32; 2],
+    pub upscale_flags: u32,
+    pub jitter: [f32; 2],
+    pub motion_scale: [f32; 2],
+    pub frame_ms: f32,
+    pub reset: bool,
+    pub camera: [f32; 4],
+}
+
+fn make_context(api: &Api, state: &State, input: &Inputs<'_>) -> Option<Arc<Context>> {
+    let device = crate::external::host_device()?;
+    if state.format == 0 || state.display.contains(&0) || input.max_render.contains(&0) {
+        return None;
+    }
+    let mut version = Box::new(Version {
+        header: header(FRAMEGEN_VERSION_DESC),
+        version: FRAMEGEN_VERSION,
+    });
+    let mut provider = Box::new(OverrideVersion {
+        header: Header {
+            kind: OVERRIDE_VERSION,
+            next: &raw mut version.header,
+        },
+        id: state.provider,
+    });
+    let mut backend = Box::new(Backend {
+        header: Header {
+            kind: BACKEND_DX12,
+            next: &raw mut provider.header,
+        },
+        device: device.as_raw(),
+    });
+    let mut create = Box::new(CreateFramegen {
+        header: Header {
+            kind: CREATE_FRAMEGEN,
+            next: &raw mut backend.header,
+        },
+        // Keep the depth/MV flags. The swap chain's target is SDR.
+        flags: input.upscale_flags & 0b1_1110,
+        display: state.display,
+        max_render: input.max_render,
+        format: state.format,
+    });
+    let mut handle = null_mut();
+    // SAFETY: the boxed descriptors and the device outlive the context.
+    let result = unsafe { (api.create)(&mut handle, &raw mut create.header, null()) };
+    if result != OK || handle.is_null() {
+        if !handle.is_null() {
+            // SAFETY: release any partial context that the SDK returned.
+            unsafe { (api.destroy)(&mut handle, null()) };
+        }
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED
+            .call_once(|| tracing::warn!(result, "frame generation: AMD context creation failed"));
+        return None;
+    }
+    let mut selected = ProviderVersion {
+        header: header(GET_PROVIDER_VERSION),
+        id: 0,
+        name: null(),
+    };
+    // SAFETY: a live context and the SDK's provider query descriptor.
+    let result = unsafe { (api.query)(&mut handle, &raw mut selected.header) };
+    if result != OK || selected.id != state.provider {
+        tracing::warn!(
+            result,
+            provider = selected.id,
+            "frame generation: AMD selected an unexpected provider"
+        );
+        // SAFETY: context creation succeeded and its GPU work has not been recorded.
+        unsafe { (api.destroy)(&mut handle, null()) };
+        return None;
+    }
+    tracing::info!(display = ?state.display, render = ?input.max_render, "frame generation: AMD 3.1.6 context created");
+    Some(Arc::new(Context {
+        handle: UnsafeCell::new(handle),
+        create,
+        _backend: backend,
+        _version: version,
+        _provider: provider,
+        _device: device,
+    }))
+}
+
+pub(crate) fn prepare(
+    list: &ID3D12GraphicsCommandList,
+    input: Inputs<'_>,
+) -> Option<Arc<dyn std::any::Any + Send + Sync>> {
+    if !requested() {
+        return None;
+    }
+    let api = api()?;
+    // The title increments this number before it queues the host Present.
+    let frame = crate::queue::presented() + 1;
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    #[cfg(feature = "diagnostics")]
+    {
+        state.cadence.prepare_seen += 1;
+    }
+    // Keep the analytical provider's shared prep buffers and its swap-chain
+    // configuration paired with the next actual Present.
+    if state.swap_context == 0 {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.no_swap_chain += 1;
+        }
+        return None;
+    }
+    if state.prepared.is_some() {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.slot_occupied += 1;
+        }
+        return None;
+    }
+    if state.last_present.and_then(|last| last.checked_add(1)) != Some(frame) {
+        #[cfg(feature = "diagnostics")]
+        {
+            let last_present = state.last_present;
+            state.cadence.wrong_frame += 1;
+            state
+                .cadence
+                .first_frame_gap
+                .get_or_insert((last_present, frame));
+        }
+        return None;
+    }
+    if input.render_size[0] > state.display[0] || input.render_size[1] > state.display[1] {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.invalid_extent += 1;
+        }
+        return None;
+    }
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let layout = (input.max_render, input.upscale_flags & 0b1_1110);
+    if state.context.is_none() && state.refused_layout != Some(layout) {
+        state.context = make_context(api, &state, &input);
+        if state.context.is_none() {
+            state.refused_layout = Some(layout);
+        }
+    }
+    let Some(context) = state.context.clone() else {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.context_unavailable += 1;
+        }
+        return None;
+    };
+    if (context.create.max_render, context.create.flags) != layout {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.layout_changed += 1;
+        }
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            tracing::warn!(
+                ?layout,
+                "frame generation: upscaler layout changed before the swap chain"
+            );
+        });
+        return None;
+    }
+    let enabled = !input.reset;
+    if !configure(api, &state, frame, enabled) {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.configure_failed += 1;
+        }
+        return None;
+    }
+    // SDK 2.4's analytical provider accepts this description without a
+    // camera view matrix. Its legacy reset field is ignored, so present
+    // real frames only when the upscaler signals a cut.
+    let mut prepare = Prepare {
+        header: header(PREPARE_FRAMEGEN),
+        frame,
+        flags: 0,
+        command_list: list.as_raw(),
+        render_size: input.render_size,
+        jitter: input.jitter,
+        motion_scale: input.motion_scale,
+        frame_ms: input.frame_ms,
+        unused_reset: false,
+        camera: input.camera,
+        depth: Resource {
+            resource: input.depth.as_raw(),
+            description: input.depth_desc,
+            state: input.depth_state,
+        },
+        motion: Resource {
+            resource: input.motion.as_raw(),
+            description: input.motion_desc,
+            state: input.motion_state,
+        },
+    };
+    // SAFETY: the upscaler's list is still open and holds both input resources.
+    let result = unsafe { (api.dispatch)(context.handle.get(), &raw mut prepare.header) };
+    if result != OK {
+        #[cfg(feature = "diagnostics")]
+        {
+            state.cadence.prepare_failed += 1;
+        }
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            tracing::warn!(result, "frame generation: AMD prepare refused the frame")
+        });
+        // The SDK may already have recorded work before a failed return.
+        return Some(context);
+    }
+    state.prepared = Some((frame, enabled));
+    #[cfg(feature = "diagnostics")]
+    {
+        state.cadence.prepared += 1;
+    }
+    static FIRST: std::sync::Once = std::sync::Once::new();
+    FIRST.call_once(|| tracing::info!(frame, render = ?input.render_size, "frame generation: first AMD prepare recorded"));
+    Some(context)
+}
+
+unsafe extern "C" fn generate(params: *mut Header, context: *mut c_void) -> u32 {
+    let Some(api) = api() else { return ERROR };
+    // SAFETY: the SDK passes the context slot configured for its callback.
+    let result = unsafe { (api.dispatch)(context.cast(), params) };
+    if result == OK {
+        // SAFETY: the callback's header identifies the SDK's dispatch descriptor.
+        if unsafe { (*params).kind } == DISPATCH_FRAMEGEN {
+            // SAFETY: the checked descriptor type includes the generated count.
+            let count = unsafe { (*params.cast::<GenerateArgs>()).generated };
+            GENERATED.fetch_add(u64::from(count), Ordering::Relaxed);
+        }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!("frame generation: first AMD generation callback succeeded")
+        });
+    } else {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            tracing::warn!(result, "frame generation: AMD generation callback failed")
+        });
+    }
+    result
+}
+
+fn configure(api: &Api, state: &State, frame: u64, enabled: bool) -> bool {
+    let Some(context) = &state.context else {
+        return false;
+    };
+    let mut desc = ConfigureFramegen {
+        header: header(CONFIGURE_FRAMEGEN),
+        swap_chain: state.swap_chain as *mut c_void,
+        present_callback: null(),
+        present_context: null_mut(),
+        generate_callback: Some(generate),
+        generate_context: context.handle.get().cast(),
+        enabled,
+        async_workloads: false,
+        hudless: NO_RESOURCE,
+        flags: 0,
+        only_generated: false,
+        rect: [0, 0, state.display[0] as i32, state.display[1] as i32],
+        frame,
+    };
+    // SAFETY: the presenter owns the live swap chain and the context survives its callback.
+    let result = unsafe { (api.configure)(context.handle.get(), &raw mut desc.header) };
+    if result != OK {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED
+            .call_once(|| tracing::warn!(result, "frame generation: AMD configuration refused"));
+    }
+    result == OK
+}
+
+/// Set the optional image that the proxy composites after interpolation.
+/// With internal buffering, Present consumes this registration and copies
+/// the image before the game queue can update it again.
+fn register_ui(api: &Api, state: &mut State, ui: Option<&ID3D12Resource>) -> bool {
+    if ui.is_none() && state.ui.is_none() {
+        return true;
+    }
+    let [width, height] = state.display;
+    let mut setup = RegisterUi {
+        header: header(REGISTER_SWAP_CHAIN_UI),
+        resource: ui.map_or(NO_RESOURCE, |texture| Resource {
+            resource: texture.as_raw(),
+            description: [
+                TEXTURE_2D,
+                RGBA8_UNORM,
+                width,
+                height,
+                1,
+                1,
+                0,
+                RENDER_TARGET_USAGE,
+            ],
+            state: PIXEL_COMPUTE_READ,
+        }),
+        flags: ui.map_or(0, |_| PREMULTIPLIED_UI_ALPHA | INTERNAL_UI_DOUBLE_BUFFERING),
+    };
+    let mut context = state.swap_context as *mut c_void;
+    // SAFETY: the swap-chain context is live and the panel owns this image.
+    let result = unsafe { (api.configure)(&mut context, &raw mut setup.header) };
+    if result != OK {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            tracing::warn!(
+                result,
+                "frame generation: AMD could not register the performance panel"
+            )
+        });
+        return false;
+    }
+    if ui.is_some() {
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| {
+            tracing::info!(
+                "frame generation: performance panel registered for separate composition"
+            )
+        });
+    }
+    state.ui = ui.cloned();
+    true
+}
+
+pub(crate) fn present(
+    swap_chain: &IDXGISwapChain3,
+    frame: u64,
+    ui: Option<&ID3D12Resource>,
+) -> HRESULT {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    let enabled = match state.prepared.take() {
+        Some((prepared, enabled)) if prepared == frame => {
+            #[cfg(feature = "diagnostics")]
+            if !enabled {
+                state.cadence.present_reset += 1;
+            }
+            enabled
+        }
+        _unmatched => {
+            #[cfg(feature = "diagnostics")]
+            if _unmatched.is_some() {
+                state.cadence.present_wrong_frame += 1;
+            } else {
+                state.cadence.present_no_prepare += 1;
+            }
+            if let Some(api) = api() {
+                configure(api, &state, frame, false);
+            }
+            false
+        }
+    };
+    if let Some(api) = api() {
+        register_ui(api, &mut state, ui);
+    }
+    // SAFETY: the caller holds the presenter and has submitted the back buffer.
+    let status = unsafe { swap_chain.Present(0, DXGI_PRESENT(0)) };
+    state.last_present = Some(frame);
+    if status == S_OK {
+        // SAFETY: a live swap chain, serialized with the provider and resize.
+        let presented = unsafe { swap_chain.GetLastPresentCount() }.ok();
+        record_present(&mut state, presented, enabled);
+    }
+    status
+}
+
+fn record_present(state: &mut State, presented: Option<u32>, enabled: bool) {
+    state.real += 1;
+    let Some(presented) = presented else {
+        state.sample = None;
+        #[cfg(feature = "diagnostics")]
+        {
+            FRAME_RATES.store(0, Ordering::Relaxed);
+            state.cadence = Cadence::default();
+        }
+        return;
+    };
+    let now = Instant::now();
+    let generated = GENERATED.load(Ordering::Relaxed);
+    let Some((at, real_then, presented_then, generated_then)) = state.sample else {
+        state.sample = Some((now, state.real, presented, generated));
+        return;
+    };
+    let Some(presented_delta) = presented.checked_sub(presented_then) else {
+        state.sample = Some((now, state.real, presented, generated));
+        return;
+    };
+    let seconds = (now - at).as_secs_f64();
+    if seconds >= 1.0 {
+        let real_fps = (state.real - real_then) as f64 / seconds;
+        let presented_fps = f64::from(presented_delta) / seconds;
+        let generated_fps = (generated - generated_then) as f64 / seconds;
+        #[cfg(feature = "diagnostics")]
+        {
+            let rendered = u64::from((real_fps as f32).to_bits());
+            let presented = u64::from((presented_fps as f32).to_bits());
+            let rates = if generated_fps > 0.0 {
+                (rendered << 32) | presented
+            } else {
+                0
+            };
+            FRAME_RATES.store(rates, Ordering::Relaxed);
+            let cadence = std::mem::take(&mut state.cadence);
+            if cadence.prepare_seen != 0 || state.context.is_some() {
+                tracing::info!(
+                    prepare_seen = cadence.prepare_seen,
+                    no_swap_chain = cadence.no_swap_chain,
+                    slot_occupied = cadence.slot_occupied,
+                    wrong_frame = cadence.wrong_frame,
+                    first_frame_gap = ?cadence.first_frame_gap,
+                    invalid_extent = cadence.invalid_extent,
+                    context_unavailable = cadence.context_unavailable,
+                    layout_changed = cadence.layout_changed,
+                    configure_failed = cadence.configure_failed,
+                    prepare_failed = cadence.prepare_failed,
+                    prepared = cadence.prepared,
+                    present_no_prepare = cadence.present_no_prepare,
+                    present_wrong_frame = cadence.present_wrong_frame,
+                    present_reset = cadence.present_reset,
+                    "frame generation: cadence"
+                );
+            }
+        }
+        tracing::info!(
+            enabled,
+            "frame generation: {real_fps:.1} real fps, {generated_fps:.1} generated fps, {presented_fps:.1} fps presented"
+        );
+        state.sample = Some((now, state.real, presented, generated));
+    }
+}
+
+pub(crate) fn resize(
+    frame: u64,
+    width: u32,
+    height: u32,
+    format: i32,
+    resize_buffers: impl FnOnce() -> windows::core::Result<()>,
+) -> Option<windows::core::Result<()>> {
+    let api = api()?;
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+    if state.context.is_some() && !configure(api, &state, frame, false) {
+        return None;
+    }
+    let mut swap_context = state.swap_context as *mut c_void;
+    if !swap_context.is_null() {
+        // SAFETY: a live swap chain context. Wait before releasing the callback's owner.
+        let result = unsafe { (api.dispatch)(&mut swap_context, &mut header(WAIT_FOR_PRESENTS)) };
+        if result != OK {
+            tracing::warn!(
+                result,
+                "frame generation: AMD could not drain the swap chain for resize"
+            );
+            return None;
+        }
+    }
+    if !register_ui(api, &mut state, None) {
+        return None;
+    }
+    let resized = resize_buffers();
+    drop(sdk);
+    state.prepared = None;
+    state.sample = None;
+    #[cfg(feature = "diagnostics")]
+    {
+        FRAME_RATES.store(0, Ordering::Relaxed);
+        state.cadence = Cadence::default();
+    }
+    state.context = None;
+    state.refused_layout = None;
+    if resized.is_ok() {
+        state.display = [width, height];
+        state.format = surface_format(format).unwrap_or(0);
+    }
+    Some(resized)
+}

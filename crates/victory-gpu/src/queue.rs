@@ -845,7 +845,7 @@ fn system_timestamp() -> u64 {
 /// Frames presented so far.
 static FRAMES: AtomicU64 = AtomicU64::new(0);
 
-#[cfg(feature = "diagnostics")]
+#[cfg(any(windows, feature = "diagnostics"))]
 pub(crate) fn presented() -> u64 {
     FRAMES.load(Ordering::Relaxed)
 }
@@ -1096,6 +1096,14 @@ const PAGE: u64 = 64 << 10;
 /// and maps them into its tiled heap this way (title+0xf2c470, ranges of
 /// one constant page or of unmapped pages). Done at once: every earlier
 /// submission has run.
+///
+/// That last holds only where the title's thread prepares its submissions.
+/// With the line of submissions (`behind`, which `VICTORY_THIN=1` turns on)
+/// lists the title submitted before this call may not have been translated
+/// or prepared yet, and would read the new mapping where the console's queue
+/// ran them under the old one: the call is a queue's, in its order. So the
+/// line is drained first (`VICTORY_MAP_DRAIN=0`: not; A/B-able): suspected
+/// of THIN's single frames of stretched geometry.
 extern "system" fn copy_page_mappings(
     _: This,
     count: u32,
@@ -1111,6 +1119,11 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
+    #[cfg(windows)]
+    if crate::toggled!("VICTORY_MAP_DRAIN") {
+        before_sync();
+        MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
+    }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
@@ -1155,6 +1168,9 @@ extern "system" fn copy_page_mappings(
     }
     S_OK
 }
+
+/// Page mappings that drained the line first ([`copy_page_mappings`]).
+pub(crate) static MAP_DRAINS: AtomicU64 = AtomicU64::new(0);
 
 extern "system" fn desc(this: This, out: *mut QueueDesc) {
     if !out.is_null() {
