@@ -26,6 +26,10 @@ use crate::watch::PAGE;
 
 /// A title buffer's host copy.
 pub(crate) struct Shadow {
+    /// The size of `buffer` if it came from the pool of shared buffers and
+    /// goes back to it when the copy goes (`crate::host::shared_pooled`); 0:
+    /// not pooled.
+    pooled: u64,
     /// Title memory's pages of 4 KiB (from the one `start` lies in on), a bit
     /// each, that what shaders wrote was put into since a refresh last looked
     /// at them ([`Shadow::take_landed`]); empty until then.
@@ -2475,6 +2479,10 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
+        // Its buffer back to the pool, if nothing else holds it.
+        if self.pooled > 0 && self.card.is_none() && self.place.is_none() {
+            crate::host::shared_back(&self.buffer, self.data as usize, self.pooled);
+        }
         if self.place.is_some() {
             // Never counted with the copies (`Shadow::placed`).
             crate::inplace::gone(self.window, self.len);
@@ -2959,6 +2967,7 @@ impl Shadow {
         LIVE[0].fetch_add(1, Ordering::Relaxed);
         LIVE[1].fetch_add(len, Ordering::Relaxed);
         Shadow {
+            pooled: 0,
             landings: Mutex::default(),
             landing: Default::default(),
             width: Default::default(),
@@ -4974,7 +4983,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
-        let (buffer, data) = host()?.shared_buffer(size)?;
+        let (buffer, data) = crate::host::shared_pooled(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
         // memory, and the one just made is the CPU's side.
@@ -5014,6 +5023,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             );
         }
         let mut shadow = Shadow::new(buffer, data, gpu, key.0, len);
+        shadow.pooled = if card.is_none() { size } else { 0 };
         shadow.card = card;
         let shadow = Arc::new(shadow);
         if shadow.card.is_some() {
@@ -5296,7 +5306,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = host()?.shared_buffer(len)?;
+    let (buffer, data) = crate::host::shared_pooled(len)?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.
@@ -5324,6 +5334,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     );
     let mut shadow = Shadow::new(buffer, data, gpu, start, len);
     shadow.window = true;
+    shadow.pooled = if card.is_none() { len } else { 0 };
     shadow.card = card;
     let shadow = Arc::new(shadow);
     if shadow.card.is_some() {

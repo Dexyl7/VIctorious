@@ -105,6 +105,10 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   that fits it best, only 64 large ones wait idle (`VICTORY_BIG_IDLE`, `VICTORY_BIG_WORDS`),
   and a full pool lets its largest go first: the driver's command memory stops growing to the
   largest recording in every list.
+- Lists' upload buffers made by size class, and host copies' buffers by size, kept for the next
+  ones (`VICTORY_UPLOAD_POOL_MB`, 512; 0: off; after dexyl7/VIctorious' `VICTORY_BUFFER_POOL`)
+  instead of made new every time; `VICTORY_THIN` left off in `scripts\play.ps1`
+  (single frames of stretched geometry with it on, on the RX 9070 XT).
 
 ## Credits
 

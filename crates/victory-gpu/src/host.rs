@@ -396,6 +396,128 @@ fn ram_idle_for(avail_phys: Option<u64>, keep: bool) -> u64 {
 /// all, since the host's views and commands hold none. A buffer or texture
 /// with one is held by its owner alone: no descriptor slot keeps it
 /// (`HostHeap::kept`) and no list (`HostList::keep`).
+/// `VICTORY_UPLOAD_POOL_MB` (512; 0: off): the upload buffers lists make
+/// for their copies (`HostList::upload`; shared buffers with
+/// `VICTORY_CARD_STEPS=2`) are made by size class (powers of two from
+/// 64 KiB to 64 MiB) and kept after the list's reset, up to that many MB in
+/// all, for the next list. Each was made new and let go at the reset: 18,700
+/// shared buffers (12.5 GB) in four minutes of driving on Series S, while
+/// the driver's 32 and 64 MB blocks they lie in (memory shared with the
+/// card) stood at 11 to 13 GB committed on a 32 GB PC, and frames dropped
+/// when the camera turned and new textures went up. dexyl7/VIctorious
+/// measured the same with host copies (14.6 GB of the driver's blocks).
+fn upload_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_UPLOAD_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(512) << 20)
+}
+
+/// The size class of an upload of `size` bytes, if it is pooled.
+fn upload_class(size: u64) -> Option<u64> {
+    let class = size.max(64 << 10).next_power_of_two();
+    (upload_pool_most() > 0 && class <= (64 << 20) && class <= upload_pool_most() / 4).then_some(class)
+}
+
+/// Idle upload buffers by (shared, class), the bytes they hold, the order
+/// they came in (the oldest goes when it is full).
+#[derive(Default)]
+struct UploadPool {
+    idle: std::collections::HashMap<(bool, u64), Vec<(ID3D12Resource, usize)>>,
+    order: std::collections::VecDeque<(bool, u64)>,
+    bytes: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are plain
+// addresses of memory the buffers own.
+unsafe impl Send for UploadPool {}
+
+static UPLOAD_POOL: Mutex<Option<UploadPool>> = Mutex::new(None);
+
+/// Since the last line: upload buffers taken from the pool, made new, put
+/// back, let go (pool full or held elsewhere).
+pub(crate) static UPLOAD_POOL_STATS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+fn upload_pool_take(shared: bool, class: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let taken = pool.as_mut().and_then(|p| {
+        let (buffer, data) = p.idle.get_mut(&(shared, class))?.pop()?;
+        p.bytes -= class;
+        Some((buffer, data as *mut u8))
+    });
+    UPLOAD_POOL_STATS[if taken.is_some() { 0 } else { 1 }].fetch_add(1, Ordering::Relaxed);
+    taken
+}
+
+fn upload_pool_put(buffer: ID3D12Resource, data: usize, class: u64, shared: bool) {
+    // Held elsewhere (a texture keeps its staging): not ours to hand out.
+    if references(&buffer) != 1 {
+        UPLOAD_POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    pool_keep(buffer, data, class, shared);
+}
+
+/// A shared buffer of `size` bytes for a host copy of title memory: one of
+/// that size host copies let go ([`shared_back`]), else a new one. The same
+/// pool as lists' uploads (`VICTORY_UPLOAD_POOL_MB`): host copies were made
+/// and let go by the thousand while driving (12.5 GB in four minutes), and
+/// the driver's blocks they lie in stayed committed.
+pub(crate) fn shared_pooled(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if upload_pool_most() > 0
+        && size <= upload_pool_most() / 4
+        && let Some(taken) = upload_pool_take(true, size)
+    {
+        return Some(taken);
+    }
+    host()?.shared_buffer(size)
+}
+
+/// A host copy's buffer of `size` bytes, mapped at `data`, as the copy
+/// goes: kept for another copy of that size if nothing else holds it.
+pub(crate) fn shared_back(buffer: &ID3D12Resource, data: usize, size: u64) {
+    if upload_pool_most() == 0 || size > upload_pool_most() / 4 || references(buffer) != 1 {
+        return;
+    }
+    pool_keep(buffer.clone(), data, size, true);
+}
+
+/// Keeps `buffer` (`class` bytes) idle in the pool, the oldest let go first
+/// when it is full.
+fn pool_keep(buffer: ID3D12Resource, data: usize, class: u64, shared: bool) {
+    let most = upload_pool_most();
+    let mut pool = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let pool = pool.get_or_insert_with(UploadPool::default);
+    while pool.bytes + class > most {
+        let Some(oldest) = pool.order.pop_front() else { break };
+        if let Some(list) = pool.idle.get_mut(&oldest)
+            && !list.is_empty()
+        {
+            // Not freed here, under the lock.
+            retire(list.remove(0).0);
+            pool.bytes -= oldest.1;
+            UPLOAD_POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    if pool.bytes + class > most {
+        retire(buffer);
+        UPLOAD_POOL_STATS[3].fetch_add(1, Ordering::Relaxed);
+        return;
+    }
+    pool.idle.entry((shared, class)).or_default().push((buffer, data));
+    pool.order.push_back((shared, class));
+    pool.bytes += class;
+    UPLOAD_POOL_STATS[2].fetch_add(1, Ordering::Relaxed);
+}
+
+/// For the frame-rate line.
+pub(crate) fn upload_pool_line(frames: f64) {
+    let n = UPLOAD_POOL_STATS.each_ref().map(|c| c.swap(0, Ordering::Relaxed) as f64 / frames);
+    let pooled = UPLOAD_POOL.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |p| p.bytes >> 20);
+    tracing::info!(
+        "list upload buffers per frame (VICTORY_UPLOAD_POOL_MB): {:.1} from the pool, {:.1} made, {:.1} put back, {:.1} let go; {} MB idle",
+        n[0], n[1], n[2], n[3], pooled
+    );
+}
+
 pub(crate) fn references(object: &impl Interface) -> u32 {
     type Method = unsafe extern "system" fn(*mut std::ffi::c_void) -> u32;
     let raw = object.as_raw();
@@ -2212,6 +2334,9 @@ struct Deferred {
     /// Destination, source, bytes.
     copies: Vec<Step>,
     uploads: Vec<ID3D12Resource>,
+    /// Of `uploads`, the ones [`upload_pool`] may keep after the reset:
+    /// buffer, mapping, its size class, whether it is a shared buffer.
+    pooled: Vec<(ID3D12Resource, usize, u64, bool)>,
     /// The bytes of `uploads` (counted in [`ALIVE`] while they are held).
     upload_bytes: u64,
     /// Host objects the list's commands name (pipelines, root signatures,
@@ -6185,7 +6310,13 @@ impl HostList {
         let _resetting = crate::timeline::span("resetting a host list");
         self._alive.used();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let pooled = std::mem::take(&mut self.deferred().pooled);
         *self.deferred() = Deferred::default();
+        // Every submission of the list has run: its upload buffers that
+        // nothing else holds go back to the pool.
+        for (buffer, data, class, shared) in pooled {
+            upload_pool_put(buffer, data, class, shared);
+        }
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6803,9 +6934,24 @@ impl HostList {
     /// shortcut: one buffer per copy; pool them once uploads are frequent.
     pub(crate) fn upload(&self, host: &Host, size: u64) -> Option<(ID3D12Resource, *mut u8)> {
         // With [`card_steps`] the card may be the one that fills it.
-        let (buffer, data) = if card_steps::stage() > 1 { host.shared_buffer(size)? } else { host.upload_buffer(size)? };
-        name(&buffer, || format!("list upload {size:#x}"));
-        self.deferred().hold_upload(buffer.clone(), size);
+        let shared = card_steps::stage() > 1;
+        // By size class from the pool of ones lists let go ([`upload_pool`]),
+        // else made at the class's size.
+        let class = upload_class(size);
+        let (buffer, data) = match class.and_then(|c| upload_pool_take(shared, c)) {
+            Some(taken) => taken,
+            None => {
+                let made = class.unwrap_or(size);
+                let (buffer, data) = if shared { host.shared_buffer(made)? } else { host.upload_buffer(made)? };
+                name(&buffer, || format!("list upload {made:#x}"));
+                (buffer, data)
+            }
+        };
+        let mut deferred = self.deferred();
+        if let Some(c) = class {
+            deferred.pooled.push((buffer.clone(), data as usize, c, shared));
+        }
+        deferred.hold_upload(buffer.clone(), size);
         Some((buffer, data))
     }
 
@@ -8581,6 +8727,7 @@ impl Meter {
         );
         crate::shadow::exact_line(frames);
         crate::descriptor::sync_line(frames);
+        upload_pool_line(frames);
         late_line(frames);
         crate::queue::behind_line(frames);
         card_clock_line(frames, ms);

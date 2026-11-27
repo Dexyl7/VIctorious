@@ -27,7 +27,9 @@ $settings = @{
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
 } else {
-    $settings.VICTORY_THIN = '1'; $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
+    # VICTORY_THIN (list calls translated on threads of ours) is left off: on the RX 9070 XT it
+    # gave single frames of stretched geometry (vertices thrown toward the camera), gone with it off.
+    $settings.VICTORY_JOIN_PARTS = '8'; $settings.VICTORY_UPLOAD_AHEAD = '1'
 }
 # Series S shows its interface on a second plane laid over the game's (from dexyl7/VIctorious).
 if ($Console -eq 'series-s') {
