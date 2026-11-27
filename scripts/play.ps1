@@ -5,6 +5,7 @@
 # -Fsr4K        PC FidelityFX 4.1.2 at 3840x2160 (quality, balanced or performance; Series X), from Belobug and DexNom
 # -Output       the title's output size (Series X): 2560x1440, 1920x1080, 1664x936 or 1280x720; with -Fsr4K, what FSR upscales to
 # -FfxDir       the folder with AMD's amd_fidelityfx_upscaler_dx12.dll for -Fsr4K (C:\FidelityFX)
+# -SkipIntro    skips the logo and intro movies (VICTORY_SKIP_BINK=1; from C-GDev, fxceless PR 613, via CuteBooty)
 # -FrameGen     with -Fsr4K: AMD frame generation (2x), from Vice-Tay 3236af66 after PastiiJay/klbf-lab 793c56c3;
 #               needs amd_fidelityfx_framegeneration_dx12.dll and amd_fidelityfx_loader_dx12.dll in -FfxDir
 # -Build        target\diag (the default, the build all measurements are of) or target\release
@@ -27,7 +28,8 @@ param(
     [string]$RenderScale = '',
     [string]$Sharpen = '',
     [switch]$Ports,
-    [switch]$FrameGen
+    [switch]$FrameGen,
+    [switch]$SkipIntro
 )
 $settings = @{
     VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_RELAY = '2'; VICTORY_WIDE_BACK = '1'; VICTORY_CARD_REHASH_RUNS = '1'
@@ -69,6 +71,7 @@ if ($Fsr4K) {
         $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FFX_FG_DIR = $FfxDir
     }
 }
+if ($SkipIntro) { $settings.VICTORY_SKIP_BINK = '1' }
 if ($FrameGen -and -not $Fsr4K) { Write-Host '-FrameGen needs -Fsr4K (it takes the upscaler''s depth and motion).'; exit 1 }
 if ($Output -ne '') { $settings.VICTORY_OUTPUT = $Output }
 # Patch 1's ordering (each in-place indirect execution checked alone, after a full wait of the card)

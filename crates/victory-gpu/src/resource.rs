@@ -1385,6 +1385,52 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The title textures that were given a host copy (most still have it), by
+/// address: what the sweep and the memory lines walk (`VICTORY_HOSTED_WALK=0`:
+/// every texture, as before). A texture leaves it before it is freed, as it
+/// leaves [`TEXTURES`].
+///
+/// In a 43-minute run the title had over 500,000 textures alive by the end
+/// and nearly 400,000 never had a copy; the sweep and three walks for the
+/// memory lines went through all of them every second under the table's
+/// lock, which the title's threads need to make and free a texture: the
+/// sweep's look grew from 0.2 ms to 2.5 ms on average and 313 ms at its
+/// longest, and the frame from about 35 to about 88 ms (run of 2026-11-28).
+#[cfg(windows)]
+static HOSTED: std::sync::Mutex<std::collections::BTreeSet<usize>> =
+    std::sync::Mutex::new(std::collections::BTreeSet::new());
+
+/// Textures given a host copy since the last walk: noted under the copy's
+/// own lock, which a walk takes inside [`HOSTED`]'s, so they wait here
+/// (a lock nothing else is taken inside) until the next walk takes them in.
+#[cfg(windows)]
+static HOSTED_NEW: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(windows)]
+fn hosted_walk() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_HOSTED_WALK").is_none_or(|v| v != "0"))
+}
+
+/// Title textures alive (the memory map's line).
+#[cfg(windows)]
+pub(crate) fn textures_alive() -> usize {
+    textures().len()
+}
+
+/// What a walk goes through: [`HOSTED`] with the new ones taken in, or every
+/// texture ([`hosted_walk`] off).
+#[cfg(windows)]
+fn walked() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize>> {
+    if !hosted_walk() {
+        return textures();
+    }
+    let mut hosted = HOSTED.lock().unwrap_or_else(|e| e.into_inner());
+    let new = std::mem::take(&mut *HOSTED_NEW.lock().unwrap_or_else(|e| e.into_inner()));
+    hosted.extend(new);
+    hosted
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1628,6 +1674,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
         }
         KINDS[6].fetch_add(1, Relaxed);
         *made = Some((std::sync::Arc::new(host), twin));
+        HOSTED_NEW.lock().unwrap_or_else(|e| e.into_inner()).push(this as usize);
         // Slots the title wrote with views of it while it had no host copy
         // are made before the next submission runs.
         crate::descriptor::texture_made(this as usize);
@@ -1849,8 +1896,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
     // Textures the title fills without a host copy: never one, one let go.
     let mut without = [0u64; 2];
     {
-        let all = textures();
+        let total = if hosted_walk() { textures().len() as u64 } else { 0 };
+        let all = walked();
+        let mut walked_n = 0u64;
         for &at in all.iter() {
+            walked_n += 1;
             // SAFETY: as in `let_go_idle`.
             let r = unsafe { &*(at as *const Resource) };
             if !fills(&r.desc) {
@@ -1864,6 +1914,11 @@ pub(crate) fn card_accounting(room: bool, due: [u64; 5], never: Vec<(u64, u64)>,
                 }),
                 None => without[usize::from(r.host.gone.load(Relaxed))] += 1,
             }
+        }
+        // Those never given a copy are not walked: counted as never (the
+        // textures that are not the title's to fill among them too).
+        if hosted_walk() {
+            without[0] += total.saturating_sub(walked_n);
         }
     }
     let kinds = KINDS.each_ref().map(|k| k.load(Relaxed));
@@ -2047,7 +2102,9 @@ pub(crate) fn let_go_idle() {
     // For the trail (`crate::host::trail`): how many went, their bytes,
     // and the first one.
     let (mut went, mut bytes, mut first) = (0u64, 0u64, None);
-    let all = textures();
+    let mut all = walked();
+    // Those let go leave the walk's set once it is done.
+    let mut let_go: Vec<usize> = Vec::new();
     // With a limit, the longest idle first.
     let mut by_age: Vec<(u64, usize)> = Vec::new();
     if most != u64::MAX {
@@ -2112,6 +2169,7 @@ pub(crate) fn let_go_idle() {
             }
         };
         if let Some((host, _)) = gone {
+            let_go.push(at);
             r.host.gone.store(true, Relaxed);
             KINDS[2].fetch_add(1, Relaxed);
             KINDS[3].fetch_add(host.bytes, Relaxed);
@@ -2123,6 +2181,12 @@ pub(crate) fn let_go_idle() {
             crate::host::retire(host);
         }
     }
+    if hosted_walk() {
+        for at in let_go {
+            all.remove(&at);
+        }
+    }
+    drop(all);
     SWEPT_US[0].fetch_add(1, Relaxed);
     SWEPT_US[1].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
     SWEPT_US[2].fetch_max(began.elapsed().as_micros() as u64, Relaxed);
@@ -2158,7 +2222,7 @@ pub(crate) static SWEPT_US: [std::sync::atomic::AtomicU64; 3] = [const { std::sy
 pub(crate) fn targets_census() -> [u64; 12] {
     use std::sync::atomic::Ordering::Relaxed;
     let mut c = [0u64; 12];
-    let all = textures();
+    let all = walked();
     for &at in all.iter() {
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
@@ -2219,8 +2283,11 @@ pub(crate) fn census() -> [u64; 10] {
     const EVERY: u64 = 16;
     let mut count = [0u64; 10];
     let mut placed_filled = 0u64;
-    let all = textures();
+    let total = if hosted_walk() { textures().len() as u64 } else { 0 };
+    let all = walked();
+    let mut walked_n = 0u64;
     for &at in all.iter() {
+        walked_n += 1;
         // SAFETY: as in `let_go_idle`.
         let r = unsafe { &*(at as *const Resource) };
         let made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
@@ -2251,6 +2318,11 @@ pub(crate) fn census() -> [u64; 10] {
                 count[3] += footprint(&r.desc).map_or(0, |f| f.size);
             }
         }
+    }
+    // Those never given a copy are not walked ([`HOSTED`]): counted, their
+    // bytes not.
+    if hosted_walk() {
+        count[2] += total.saturating_sub(walked_n);
     }
     count
 }
@@ -2718,6 +2790,9 @@ impl Drop for Resource {
             let address = std::ptr::from_ref::<Resource>(self) as usize;
             crate::texback::released(address);
             textures().remove(&address);
+            // (Not inside the table's lock: a walk takes [`HOSTED`] alone.)
+            HOSTED.lock().unwrap_or_else(|e| e.into_inner()).remove(&address);
+            HOSTED_NEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&a| a != address);
             if !fills(&self.desc) {
                 let mut targets = TARGETS_AT.lock().unwrap_or_else(|e| e.into_inner());
                 let at = self.data() as u64;

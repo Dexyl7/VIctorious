@@ -677,6 +677,23 @@ fn log_memory_map() {
         started.elapsed().as_millis(),
         text.join("; ")
     );
+    // Which part of the process heap is ours (a run of 43 minutes grew its
+    // segments from 2.6 to 11.4 GB without saying whose).
+    {
+        let mb = |b: u64| b as f64 / (1u64 << 20) as f64;
+        tracing::info!(
+            "our own allocations alive: {:.0} MB in {} blocks under 4 KiB, {:.0} MB in {} to 64 KiB, {:.0} MB in {} to 1 MiB, {:.0} MB in {} larger; title textures alive {}",
+            mb(owned(0)),
+            owned(4),
+            mb(owned(1)),
+            owned(5),
+            mb(owned(2)),
+            owned(6),
+            mb(owned(3)),
+            owned(7),
+            crate::resource::textures_alive()
+        );
+    }
     // The private allocations the kinds above leave as "other" (and the
     // write-combined ones), grouped by their size: the sizes name their
     // owners (the pipeline library's file to the byte, a snapshot buffer

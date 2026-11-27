@@ -78,6 +78,7 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 | `-Fsr4K quality\|balanced\|performance` | PC FidelityFX FSR 4.1.2 upscaling to 3840x2160 (Series X only) |
 | `-FfxDir <folder>` | where AMD's DLLs are (default `C:\FidelityFX`): `amd_fidelityfx_upscaler_dx12.dll` for `-Fsr4K`; for `-FrameGen` also `amd_fidelityfx_framegeneration_dx12.dll` and `amd_fidelityfx_loader_dx12.dll`, all from the FSR SDK 2.4.0 release (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, `Kits/FidelityFX/signedbin`) |
 | `-FrameGen` | with `-Fsr4K`: AMD frame generation, 2x shown frames |
+| `-SkipIntro` | skips the logo and intro movies (`VICTORY_SKIP_BINK=1`; `all` skips looping menu movies too) |
 | `-Output <size>` | the title's output size (Series X): 3840x2160, 2560x1440, 1920x1080, 1664x936, 1280x720; with `-Fsr4K`, what FSR upscales to |
 | `-RenderScale 0.2-1` | the title's render size as a share of the output |
 | `-Sharpen 0-1` | sharpening of the shown frame |
@@ -85,6 +86,10 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 | `-Safe` | without the newer, faster ways: the first thing to try when something is wrong |
 | `-Build diag\|release` | which build to start (`diag`, the default, is the one measured) |
 | `-More @{NAME='value'}` | any other `VICTORY_...` setting, e.g. `-More @{VICTORY_THIN='0'}` |
+
+The title caps itself at 30 frames a second (its own setting; menus and videos run a flat
+33.3 ms), so frames that finish sooner wait: that is the headroom. `VICTORY_FRAME_INTERVAL_MS`
+changes the cap (16.667 for 60; 0 for none); left unset, the title's 30 stays.
 
 Alt+Enter or F11 switches borderless full screen. The frame rate, VRAM, RAM and run
 time are drawn in the corners of the picture; **F3 hides and shows them**
@@ -191,6 +196,19 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (single frames of stretched geometry with it on, on the RX 9070 XT).
 - PC FidelityFX FSR 4.1.2 to 4K (`scripts\play.ps1 -Fsr4K quality|balanced|performance`), Belobug's
   port (cd8dfc0) of DexNom/VIctory ab34a8b2.
+- Patch 1's ordering in batches that end at every barrier and value wait of the title's
+  (`VICTORY_PORT_BATCH_AT_SYNC=1`, off: tried once, the batches ended at nearly every execution and
+  their memory ran the card past its budget; used with `VICTORY_PORT_CONSTANTS_ORDER=1` and
+  `VICTORY_PORT_CONSTANTS_ORDER_ALONE=0`): batches that ended only after a known buffer writer still
+  let trees and cars drop out, here as in upstream's run pop-15; every in-place execution (2,400-4,600
+  a frame) is a single record without a count, so batches take all of them.
+- The texture sweep and the memory lines walk only the textures that were given a host copy
+  (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
+  textures alive, and walking all of them each second under the lock the title needs to make and free
+  textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Skipping the logo and intro movies (`-SkipIntro`, `VICTORY_SKIP_BINK`): written by C-GDev
+  (fxceless/victory-fork pull request 613; the idea from XCL pull request #1053), as carried in
+  CuteBooty/victory-8gb and trustno1-coder/victory-nvidia e31f4740.
 - With the line of submissions (`VICTORY_THIN=1` turns it on), the title's queue page mappings
   (`CopyPageMappingsBatchX`) wait until the lists submitted before them are translated and prepared
   (`VICTORY_MAP_DRAIN=0`: not): the call is a queue's, in its order, and was done at once on the

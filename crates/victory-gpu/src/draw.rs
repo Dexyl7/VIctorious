@@ -338,7 +338,9 @@ fn in_place_alone() -> bool {
 
 /// Since the last line: indirect executions with arguments in place, those
 /// clamped alone for it, and the 1 MiB ranges they came from (diagnostics).
-static IN_PLACE_INDIRECT: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Then, of the ordered ones: single records without a count (those a batch
+/// can take), and those a batch took.
+static IN_PLACE_INDIRECT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 static IN_PLACE_RANGES: std::sync::Mutex<std::collections::BTreeMap<u64, [u64; 3]>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// An indirect execution of `kind` with its arguments at `arguments` in place.
@@ -357,7 +359,7 @@ fn in_place_indirect(arguments: u64, kind: u32) {
 /// With the frame line: indirect executions with arguments in place per
 /// frame over `frames`, and the ranges most of them came from.
 pub(crate) fn in_place_indirect_line(frames: f64) {
-    let [all, alone] = [0, 1].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
+    let [all, alone, single, batched] = [0, 1, 2, 3].map(|i| IN_PLACE_INDIRECT[i].swap(0, Ordering::Relaxed));
     if all == 0 {
         return;
     }
@@ -370,9 +372,11 @@ pub(crate) fn in_place_indirect_line(frames: f64) {
         .map(|(mb, n)| format!("{:#x}+1MiB: {:.0} draws {:.0} dispatches {:.0} mesh", mb << 20, n[0] as f64 / frames, n[1] as f64 / frames, n[2] as f64 / frames))
         .collect();
     tracing::info!(
-        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER); from {} ranges of 1 MiB, the busiest: {}",
+        "renderer port 1: indirect executions with arguments or count in place per frame: {:.0}, of them {:.0} clamped after every shader write before them (VICTORY_PORT_CONSTANTS_ORDER), {:.0} single records without a count, {:.0} in batches (VICTORY_PORT_CONSTANTS_ORDER_ALONE=0); from {} ranges of 1 MiB, the busiest: {}",
         all as f64 / frames,
         alone as f64 / frames,
+        single as f64 / frames,
+        batched as f64 / frames,
         by.len(),
         top.join("; ")
     );
@@ -421,6 +425,36 @@ struct Batch {
     /// Dispatches since, which may have written arguments
     /// (`VICTORY_INDIRECT_BATCH=2`).
     wrote: bool,
+    /// It holds records of renderer port 1's in-place memory: it ends at the
+    /// title's next barrier or wait whatever was recorded ([`batch_at_sync`]).
+    in_place: bool,
+}
+
+/// Whether a batch holding records the card reads in place (renderer port 1,
+/// with `VICTORY_PORT_CONSTANTS_ORDER=1` and `..._ORDER_ALONE=0`) ends at
+/// every barrier and value wait of the title's, not only after a dispatch
+/// or a draw known to write buffers (`VICTORY_PORT_BATCH_AT_SYNC=1`; off by
+/// default; A/B-able).
+///
+/// With only those, trees and cars still came and went (here, as in
+/// upstream's run pop-15), and every in-place execution of the frame was in
+/// a batch (4,567 a frame, all single records without a count). The title
+/// puts a barrier between whatever writes arguments and the executions
+/// that read them; a batch opened after the last one reads them as they
+/// read them, whether or not we can tell the writer stores to buffers.
+/// That was meant to be a batch for each barrier group with in-place
+/// executions; in the one run with it the batches ended at nearly every
+/// execution (about 4,000 opened a frame, as many as clamps alone), and what
+/// each batch takes of the card's memory ran the card past its budget (16.6 GB
+/// of 14.5): frames of 100 ms to 16 s. Off until the batches end only where
+/// buffers can have been written.
+fn batch_at_sync() -> bool {
+    #[cfg(feature = "diagnostics")]
+    if let Some(on) = crate::ab::pick("VICTORY_PORT_BATCH_AT_SYNC") {
+        return on;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_BATCH_AT_SYNC").is_ok_and(|v| v.trim() == "1"))
 }
 
 /// The host copies arguments were read from last: what a batch opens with,
@@ -3837,7 +3871,15 @@ impl State {
 
     /// The title waits for earlier work (a barrier or a pipeline sync).
     pub(crate) fn synced(&mut self) {
-        if self.batch.as_ref().is_some_and(|b| b.wrote) {
+        if self.batch.as_ref().is_some_and(|b| b.wrote || (b.in_place && batch_at_sync())) {
+            self.batch = None;
+        }
+    }
+
+    /// The title waits for a memory value: a batch of in-place records ends
+    /// here as at a barrier ([`batch_at_sync`]).
+    pub(crate) fn waited(&mut self) {
+        if self.batch.as_ref().is_some_and(|b| b.in_place && batch_at_sync()) {
             self.batch = None;
         }
     }
@@ -3873,7 +3915,7 @@ impl State {
         self.host_pipeline = 0;
         self.host_roots[1] = 0;
         let at = table.place(id, offset, kind)?;
-        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false });
+        self.batch = Some(Batch { table, scratch: scratch.clone(), wrote: false, in_place: false });
         Some((scratch, at))
     }
 
@@ -3996,6 +4038,15 @@ impl State {
         };
         if batch.is_some() {
             self.window = None;
+        }
+        if ordered {
+            IN_PLACE_INDIRECT[2].fetch_add(u64::from(max == 1 && count.is_none()), Ordering::Relaxed);
+            IN_PLACE_INDIRECT[3].fetch_add(u64::from(batch.is_some()), Ordering::Relaxed);
+            if batch.is_some()
+                && let Some(b) = &mut self.batch
+            {
+                b.in_place = true;
+            }
         }
         // A window of records clamped in one pass (`windows`): for single
         // records without a count buffer, drawn by shaders that store to no

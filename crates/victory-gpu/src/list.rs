@@ -2232,6 +2232,9 @@ fn wait_for(this: This, address: u64, comparison: u32, reference: u64, wide: boo
             )
         });
     }
+    // What was clamped ahead of here of in-place records is not read past it.
+    #[cfg(windows)]
+    with_state(this, |_, state| state.waited());
     // The list is cut here, and the wait stands before what follows.
     #[cfg(windows)]
     if crate::queue::cuts() {
