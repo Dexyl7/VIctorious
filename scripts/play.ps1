@@ -12,7 +12,8 @@
 # -Console      series-x (default) or series-s (less title memory: for PCs with 32 GB)
 # -RenderScale  the title's render size as a share of the output, 0.2 to 1 (0.67: as Series S draws by default)
 # -Sharpen      sharpening of the shown frame, 0 to 1 (0.6 suits a render scale of 0.67)
-# -Ports        renderer patches 1, 5 and 6 (avatarmanz): constants heap and constant buffers read in place, guards' lock shared
+# -NoPorts      without renderer patches 1, 5 and 6 (avatarmanz; on by default: constants heap and constant buffers read
+#               in place, guards' lock shared; ~34 instead of ~43 ms a frame on Series S, lamps can flicker, trees pop)
 # -More         other settings: -More @{VICTORY_THIN='0'}
 # Run it from a normal window, not as administrator: the driver then keeps its shader cache elsewhere.
 param(
@@ -28,6 +29,7 @@ param(
     [string]$RenderScale = '',
     [string]$Sharpen = '',
     [switch]$Ports,
+    [switch]$NoPorts,
     [switch]$FrameGen,
     [switch]$SkipIntro
 )
@@ -75,6 +77,9 @@ if ($Console -eq 'series-s') {
 # a minute in and under 0.2 GB at 16 minutes (12 fps, audio lagging) while the card had 7 GB unused. Only while
 # a fifth of the card's budget is free, so textures keep their room; without BAR support nothing changes.
 $settings.VICTORY_WINDOWS_BAR_MB = '3584'
+# Windows of title memory in the title's private memory read in place (crate::inplace stage 1): no host copy, nothing
+# to bring up to date; windows over its page pool (views of a reserved section) are copied as before.
+$settings.VICTORY_INPLACE = '1'
 if ($RenderScale -ne '') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 if ($Sharpen -ne '') { $settings.VICTORY_SHARPEN = $Sharpen }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
@@ -95,7 +100,7 @@ if ($Output -ne '') { $settings.VICTORY_OUTPUT = $Output }
 # Patch 1's ordering (each in-place indirect execution checked alone, after a full wait of the card)
 # cost about 36 ms of the card's time a frame here (timelines tl2: 61 ms busy with it, 25 without);
 # without it trees and palms can drop out for a few frames. -More @{VICTORY_PORT_CONSTANTS_ORDER='1'} brings it back.
-if ($Ports) { $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_CONSTANTS_ORDER = '0' }
+if (-not $NoPorts) { $settings.VICTORY_PORT_CONSTANTS = '1'; $settings.VICTORY_PORT_CBV = '1'; $settings.VICTORY_PORT_GUARD = '1'; $settings.VICTORY_PORT_CONSTANTS_ORDER = '0' }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 
 $victory = Join-Path $PSScriptRoot "..\target\$Build\victory.exe"

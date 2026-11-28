@@ -84,7 +84,7 @@ target\diag\victory.exe warm --used                     # pipelines earlier runs
 |---|---|
 | `-Exe <path>` | your copy's executable (required) |
 | `-Console series-x\|series-s` | the console the title takes this PC for. `series-s` needs less memory (32 GB PCs) and lays the interface plane over the game |
-| `-Ports` | renderer patches 1, 5 and 6: the title's constants and constant buffers read in place, the write guards' lock shared. Faster; patch 1's ordering is left off (see above) |
+| `-NoPorts` | leaves out renderer patches 1, 5 and 6, which are on by default: the title's constants and constant buffers read in place, the write guards' lock shared. Faster; patch 1's ordering is left off (see above) |
 | `-Fsr4K quality\|balanced\|performance` | PC FidelityFX FSR 4.1.2 upscaling to 3840x2160 (Series X only) |
 | `-FfxDir <folder>` | where AMD's DLLs are (default `C:\FidelityFX`): `amd_fidelityfx_upscaler_dx12.dll` for `-Fsr4K`; for `-FrameGen` also `amd_fidelityfx_framegeneration_dx12.dll` and `amd_fidelityfx_loader_dx12.dll`, all from the FSR SDK 2.4.0 release (GPUOpen-LibrariesAndSDKs/FidelityFX-SDK, `Kits/FidelityFX/signedbin`) |
 | `-FrameGen` | with `-Fsr4K`: AMD frame generation, 2x shown frames |
@@ -120,6 +120,7 @@ time are drawn in the corners of the picture; **F3 hides and shows them**
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
 | `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
 | `VICTORY_WINDOW_POOL_MB` | 1024 | buffers of windows of title memory let go are kept for the next window of the same size (in the card's memory or the PC's), instead of going back to the uploads' pool or being let go: in a 16-minute Series S run the windows alive held about 3.2 GB while 8 GB were made and let go, the driver kept their blocks committed, and the PC's free memory fell from 1.8 GB to under 0.2 GB (12 fps, audio lagging at 16 minutes). `0`: as before |
+| `VICTORY_INPLACE` | 1 (play.ps1) | windows of title memory in the title's private memory read where they are (a host heap opened on them), not copied; page-pool memory is copied as before |
 | `VICTORY_WINDOWS_BAR_MB` | 3584 (play.ps1) | windows of title memory (host copies shaders read) kept in the card's memory and written through the resizable BAR, not in the PC's memory: on a 32 GB PC the free memory fell from 1.8 GB a minute in to under 0.2 GB at 16 minutes (12 fps, audio lagging) with about 3 GB of windows in the PC's memory and 7 GB of the card unused |
 | `VICTORY_AMBIENT_SPECULAR` | 0 in play.ps1 (1 in the code, with `VICTORY_AMBIENT`) | share of the ambient stand-in's estimate written as the reflections the passes below leave; `0`: the title's own (sky-blue grain and clouds on floors indoors, glass mirroring the sky) |
 | `VICTORY_AMBIENT_OTHER` | off in play.ps1 (on in the code, with `VICTORY_AMBIENT`) | `0`: the resolve's other packed light is left as the title writes it (by day up to ~90 times the room's light: colours bleached) |
