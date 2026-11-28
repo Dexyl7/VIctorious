@@ -179,11 +179,29 @@ keeps them. Everything below is what this copy changed on top, measured on the R
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Precise page-mapping drain (`VICTORY_MAP_PRECISE=1`, on in play.ps1, A/B-able): a page-mapping call drains the line only if a submission waiting in it may read or
+  write the mapped memory when it is prepared (by the lists' steps: refreshes, copies, fills, textures;
+  work of unknown reach counts). Otherwise the line is held still (what is being prepared ends, nothing
+  begins), the mapping is done, and the line goes on. In an A/B drive ~4 in 10 mappings went at once;
+  with it on for a whole drive, cars no longer vanished as they came close (their full models had come
+  too late), while textures are still late (2026-11-28).
 - Tried and left off: fresh page mappings without the drain (`VICTORY_MAP_FRESH=1` turns it on;
   A/B-able). A page-mapping call that only maps where nothing (or only the title's filler page) is
   mapped went ahead without waiting for the earlier submissions to be prepared (`VICTORY_MAP_DRAIN`).
   In two A/B drives (2026-11-28) only ~0.16 calls a frame qualified against ~0.9 that still drained
   (mappings over pages with data, and unmappings), frames were no better and textures came no sooner.
+- **The audio DSP's convolutions carried out** (`VICTORY_DSP_CONVOLVE=0`: none, `phone`: only short
+  ones): the console's audio DSP (`chad.dll`) was emulated with silent outputs, since the layout its
+  impulse responses come in was not known, so reverbs were dry and the other end of a phone call was
+  not heard. The layout, worked out from the title's own (2026-11-28, `VICTORY_DSP_DUMP=<dir>` saves
+  them): partitions of 2,048 floats, each the first 1,024 bins (real and imaginary in turn) of the
+  transform of 2,048 samples of the response, the windows 1,024 samples apart and the first beginning
+  1,024 samples before it; the second half of each window is the next 1,024 samples of the response. A
+  phone's reads back as 300-4,000 Hz with -40 dB above 6 kHz, the rooms' as reverbs of 1.3-2 s. The
+  response is rebuilt and run as a uniformly partitioned convolution (overlap-save, blocks of 1,024; a
+  numpy check of the same steps matched direct convolution to 3e-8). Before that, the short ones (at
+  most 65,536 floats) gave their input through a 300-3,400 Hz band-pass (`VICTORY_DSP_PHONE`), still
+  the fallback when the convolution is off; `VICTORY_DSP_PASS=1` passes every convolution through dry.
 - Card copies take only the changed ones (`VICTORY_CARD_TOUCHED=0`: every copy looked at, as before):
   a copy in the card's memory notes itself when its CPU side changes, instead of the submitting thread
   looking at all ~3,400 of them for every submission. The time for copies in the card's memory went

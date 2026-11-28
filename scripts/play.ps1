@@ -46,6 +46,9 @@ $settings = @{
     # The heaps' records round asked for when the title submits, made while the line gets there:
     # the submitting thread's wait for it ~6-9 -> ~1-4 ms a frame (A/B drive, 2026-11-28).
     VICTORY_SYNC_AT_SUBMIT = '1'
+    # Page mappings drain the line only if a submission in it reaches the memory mapped: cars no longer
+    # vanish on coming close (their full models came too late), 2026-11-28.
+    VICTORY_MAP_PRECISE = '1'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

@@ -1215,12 +1215,66 @@ extern "system" fn copy_page_mappings(
     if fresh {
         MAP_FRESH.fetch_add(1, Ordering::Relaxed);
     } else if crate::toggled!("VICTORY_MAP_DRAIN") {
+        // Only if something in the line reaches the memory mapped: else
+        // mapped now, with the line held still meanwhile.
+        if map_precise() && behind::on() {
+            let mut ranges: Vec<(usize, usize)> = Vec::new();
+            crate::host::join_ranges_pub(&mut ranges, gathered.iter().map(|&(to, _, len)| (to as usize, (to + len) as usize)));
+            let mut pending = Some((gathered, ok));
+            let done = behind::map_unless_read(&ranges, || {
+                if let Some((gathered, ok)) = pending.take() {
+                    apply(gathered, ok);
+                }
+            });
+            if done {
+                MAP_PRECISE.fetch_add(1, Ordering::Relaxed);
+                return S_OK;
+            }
+            let Some((back, ok_back)) = pending.take() else {
+                return S_OK;
+            };
+            before_sync();
+            MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
+            apply(back, ok_back);
+            return S_OK;
+        }
         before_sync();
         MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
     }
     apply(gathered, ok);
     S_OK
 }
+
+/// Whether a page-mapping call drains the line only when something in it
+/// may read or write the memory it maps when prepared (`VICTORY_MAP_PRECISE=1`;
+/// off by default; A/B-able). The line is held still while it looks (what
+/// is being prepared ends, nothing begins), and the mapping is done then.
+/// Most of the title's mappings are of texture and model memory that what
+/// waits in the line does not name: the drain held its streaming thread
+/// ~58 % of its sampled time while textures, models and cars came late.
+#[cfg(windows)]
+fn map_precise() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match BIT.get_or_init(|| match crate::ab::bit("VICTORY_MAP_PRECISE") {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os("VICTORY_MAP_PRECISE").is_some_and(|v| v == "1")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => crate::ab::on(*bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_PRECISE").is_some_and(|v| v == "1"))
+    }
+}
+
+/// Page mappings done without draining: nothing in the line reached them
+/// ([`map_precise`]).
+pub(crate) static MAP_PRECISE: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a page-mapping call that only maps pages where nothing is mapped
 /// goes ahead without draining the line first (`VICTORY_MAP_FRESH=1`; off

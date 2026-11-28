@@ -2848,6 +2848,41 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Whether preparing `lists` may read or write title memory in `ranges`
+/// (in order, joined), by their steps: what a page mapping there would
+/// change under them if it went first (`crate::queue`'s
+/// `VICTORY_MAP_PRECISE`). Work of unknown reach counts as yes.
+pub(crate) fn lists_reach<'a>(lists: impl Iterator<Item = &'a HostList>, ranges: &[(usize, usize)]) -> bool {
+    if ranges.is_empty() {
+        return false;
+    }
+    for list in lists {
+        for step in &list.deferred().copies {
+            let hit = match step {
+                &Step::Copy(dst, src, len) => touches(ranges, src, src + len) || touches(ranges, dst, dst + len),
+                &Step::Fill(_, src, len, _) => touches(ranges, src, src + len),
+                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => touches(ranges, *at, *at + *len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    touches(ranges, at, at + len)
+                }
+                Step::Host(_, (from, to)) => touches(ranges, *from, *to),
+                Step::Placed(p) => touches(ranges, p.src, p.src + p.len) || touches(ranges, p.dst, p.dst + p.len),
+                Step::Run(_) => true,
+            };
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `ranges` with `more`, in order, joined where they overlap or touch.
+pub(crate) fn join_ranges_pub(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
+    join_ranges(ranges, more);
+}
+
 /// `ranges` with `more`, in order, joined where they overlap or touch.
 fn join_ranges(ranges: &mut Vec<(usize, usize)>, more: impl IntoIterator<Item = (usize, usize)>) {
     ranges.extend(more.into_iter().filter(|r| r.0 < r.1));
@@ -3796,9 +3831,10 @@ fn late_line(frames: f64) {
         let drains = crate::queue::MAP_DRAINS.swap(0, Ordering::Relaxed) as f64 / frames;
         let in_line = crate::queue::MAP_IN_LINE.swap(0, Ordering::Relaxed) as f64 / frames;
         let fresh = crate::queue::MAP_FRESH.swap(0, Ordering::Relaxed) as f64 / frames;
-        if crate::list::thin::wanted() || drains > 0.0 || in_line > 0.0 || fresh > 0.0 {
+        let precise = crate::queue::MAP_PRECISE.swap(0, Ordering::Relaxed) as f64 / frames;
+        if crate::list::thin::wanted() || drains > 0.0 || in_line > 0.0 || fresh > 0.0 || precise > 0.0 {
             tracing::info!(
-                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}, mapped where nothing was without waiting (VICTORY_MAP_FRESH): {fresh:.2}; list calls written down (VICTORY_THIN): {}",
+                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}, mapped where nothing was without waiting (VICTORY_MAP_FRESH): {fresh:.2}, mapped at once as nothing in the line reached them (VICTORY_MAP_PRECISE): {precise:.2}; list calls written down (VICTORY_THIN): {}",
                 crate::list::thin::wanted()
             );
         }

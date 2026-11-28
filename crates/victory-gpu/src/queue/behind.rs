@@ -107,6 +107,8 @@ struct State<W> {
     /// Presents and submissions in the line or being done.
     presents: usize,
     runs: usize,
+    /// Callers that hold the line still ([`Lane::unless`]): no entry begins.
+    paused: usize,
 }
 
 /// See the module's text.
@@ -129,6 +131,7 @@ impl<W: Work> Lane<W> {
                 served: 0,
                 presents: 0,
                 runs: 0,
+                paused: 0,
             }),
             work: Condvar::new(),
             moved: Condvar::new(),
@@ -200,6 +203,29 @@ impl<W: Work> Lane<W> {
         while state.served < ticket {
             state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
         }
+    }
+
+    /// With the line held still (nothing begins, what is being done ends):
+    /// whether an entry in it `reads`; if none does, `then` is done before
+    /// anything in the line goes on. Whether `then` was done.
+    pub(super) fn unless(&self, reads: impl Fn(&W) -> bool, then: impl FnOnce()) -> bool {
+        let folded: Vec<W::Ask> =
+            self.lock().items.iter().filter(|e| e.what.folded()).filter_map(|e| e.what.ask()).collect();
+        folded.iter().for_each(W::settle);
+        let mut state = self.lock();
+        state.paused += 1;
+        while state.running.is_some() {
+            state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+        }
+        let read = state.items.iter().any(|e| reads(&e.what));
+        drop(state);
+        if !read {
+            then();
+        }
+        self.lock().paused -= 1;
+        self.moved.notify_all();
+        self.work.notify_one();
+        !read
     }
 
     /// Waits until at most `most` presents are in the line.
@@ -307,6 +333,10 @@ impl<W: Work> Lane<W> {
         };
         let mut entry = {
             let mut state = self.lock();
+            // Held still by a caller looking at the line ([`Lane::unless`]).
+            while state.paused > 0 {
+                state = self.moved.wait(state).unwrap_or_else(|e| e.into_inner());
+            }
             let Some(at) = state.items.iter().position(|e| e.number == number) else {
                 return false;
             };
@@ -717,6 +747,34 @@ pub(super) fn queued() -> u64 {
 /// Something a queue may stand at moved.
 pub(super) fn wake() {
     LANE.wake();
+}
+
+/// Page mappings of `ranges` (title memory, in order, joined) done by
+/// `mapping` now if nothing in the line may read or write there when it is
+/// prepared; else not done (false), and the caller drains the line first.
+pub(super) fn map_unless_read(ranges: &[(usize, usize)], mapping: impl FnOnce()) -> bool {
+    if OURS.get() {
+        return false;
+    }
+    LANE.unless(|job| job.reaches(ranges), mapping)
+}
+
+impl Job {
+    /// Whether preparing it may read or write title memory in `ranges`
+    /// ([`crate::host::lists_reach`]); lists not translated yet count as yes.
+    fn reaches(&self, ranges: &[(usize, usize)]) -> bool {
+        match self {
+            Job::Run(_, lists, order, _) | Job::Joined(_, lists, order, _, _, _) => {
+                crate::host::lists_reach(order.iter().map(|&i| lists[i].host()), ranges)
+            }
+            Job::Lists(_, recordings, _) => {
+                let hosts: Option<Vec<&crate::host::HostList>> =
+                    recordings.iter().map(|r| crate::list::host_list(r.back())).collect();
+                hosts.is_none_or(|hosts| crate::host::lists_reach(hosts.into_iter(), ranges))
+            }
+            Job::Wait(..) | Job::Value(..) | Job::Signal(..) | Job::Map(..) | Job::Present(..) => false,
+        }
+    }
 }
 
 /// Whether this is our thread, the one that does the line's work.
