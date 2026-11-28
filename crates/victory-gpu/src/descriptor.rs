@@ -1822,15 +1822,17 @@ mod tests {
         let slots = [0u64; 4];
         let at = slots.as_ptr() as u64;
         // A resource description and a view no other test uses.
-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        let mut resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+        resource[1] = 0;
+        resource[13] = 0;
         let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
         let mine = |v: &View| match v {
             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
-            View::Placed(_, r, _) => *r == resource,
+            View::Placed(_, r, _) => r[0] == resource[0],
             _ => false,
         };
         let entries = || VIEWS.read().unwrap().list.iter().filter(|(v, _)| mine(v)).count();
-        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1 == resource).count();
+        let shapes = || VIEWS.read().unwrap().shapes.iter().filter(|s| s.1[0] == resource[0]).count();
         for n in 0..20_000u64 {
             let address = 0x6_0000_0000 + n * 0x100;
             create_cbv(null, &[address as u32, (address >> 32) as u32, 512, 0], at);
@@ -1846,10 +1848,23 @@ mod tests {
         create_placed_uav(null, &resource, &desc, at);
         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
         assert_eq!(shapes(), 2);
+        // Changing only the padding reuses the SRV shape unless the
+        // diagnostic switch explicitly preserves those words.
+        let mut padded = resource;
+        padded[1] = 0x1234;
+        padded[13] = 0x5678;
+        create_placed_srv(null, &padded, &desc, at);
+        if std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1") {
+            assert_eq!(view(at), Some(View::Placed(false, padded, desc)));
+            assert_eq!(shapes(), 3);
+        } else {
+            assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+            assert_eq!(shapes(), 2);
+        }
         // Placed memory past 1 TiB (not title memory) is a table entry.
         (desc[10], desc[11]) = (0, 0x100);
-        create_placed_srv(null, &resource, &desc, at);
-        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
+        create_placed_srv(null, &padded, &desc, at);
+        assert_eq!(view(at), Some(View::Placed(false, padded, desc)));
         assert_eq!(entries(), 1);
         // A record's words are the same for the same view (the host knows
         // a slot's view by them), and differ with the address.
