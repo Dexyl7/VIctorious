@@ -867,6 +867,36 @@ const COPIED_FRAMES: u32 = 8;
 /// taken for one shaders pick by index ([`HostHeap::copied_wait`]).
 const COPIED_GRACE: u64 = 4;
 
+/// Whether the queue of textures picked by index hands out what the picture
+/// needs first ([`TextureQueue::due_by_need`]); `VICTORY_TEXTURE_ORDER=0`:
+/// as before, looks again first.
+fn texture_order() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_ORDER").is_none_or(|v| v != "0"))
+}
+
+/// Textures picked by index, since the start: the frames from a slot's view
+/// write (or its memory's change) to the first upload of all of it, counted
+/// by 0-1, 2-4, 5-15, 16-60, 61-300 and more frames; then the sum of the
+/// frames. How late textures come to the card, which the queue's census
+/// alone does not say (most of a queue of a thousand are looks again at
+/// textures uploaded already, 2026-11-28).
+pub(crate) static UPLOAD_LAG: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+
+fn upload_lag(frames: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let bucket = match frames {
+        0..=1 => 0,
+        2..=4 => 1,
+        5..=15 => 2,
+        16..=60 => 3,
+        61..=300 => 4,
+        _ => 5,
+    };
+    UPLOAD_LAG[bucket].fetch_add(1, Relaxed);
+    UPLOAD_LAG[6].fetch_add(frames, Relaxed);
+}
+
 /// In [`HostHeap::tabled`]: a draw read the slot in that frame.
 const TABLED_READ: u32 = 1 << 31;
 
@@ -997,6 +1027,9 @@ impl TextureQueue {
     ///   (run 52: 98% of the drawn pixels had no colour texture in the
     ///   first 3D frames).
     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        if texture_order() {
+            return self.due_by_need(frame, max);
+        }
         let mut again: Vec<(u64, u32, u64)> = Vec::new();
         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
@@ -1019,6 +1052,40 @@ impl TextureQueue {
         }
         order.truncate(max);
         order
+    }
+
+    /// [`TextureQueue::due`] by what the picture needs first: textures never
+    /// looked at (the title has just described them: what is on screen now),
+    /// newest first; then those uploaded in part (their sharper levels
+    /// arriving); then those waiting for their memory; and last the looks
+    /// again at textures uploaded whole already (`checked`), which went
+    /// first before: when a drive into a new place made hundreds due at once,
+    /// textures never shown waited behind looks at textures shown already.
+    fn due_by_need(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
+        // (class, newest first by the write's number)
+        let mut all: Vec<(u8, std::cmp::Reverse<u64>, u32)> = self
+            .slots
+            .iter()
+            .filter(|(_, w)| w.due <= frame)
+            .map(|(&index, w)| {
+                let class = if w.checked.2 != 0 {
+                    3
+                } else if w.mapped > 0 {
+                    1
+                } else if w.looks > 0 {
+                    2
+                } else {
+                    0
+                };
+                (class, std::cmp::Reverse(w.write), index)
+            })
+            .collect();
+        if all.len() > max {
+            all.select_nth_unstable(max - 1);
+            all.truncate(max);
+        }
+        all.sort_unstable();
+        all.into_iter().map(|(_, std::cmp::Reverse(write), index)| (index, write)).collect()
     }
 
     /// The entry of `index` if it is still the write the pass was handed.
@@ -1088,6 +1155,10 @@ impl TextureQueue {
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
         if let Some(w) = self.same(index, write) {
+            // Its first upload whole since the write: how late it came.
+            if w.checked.2 == 0 {
+                upload_lag(uploaded.saturating_sub(w.written));
+            }
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }

@@ -9157,6 +9157,21 @@ impl Meter {
                     crate::descriptor::host::STALE[4].load(Ordering::Relaxed)
                 );
             }
+            {
+                let lag = crate::descriptor::host::UPLOAD_LAG.each_ref().map(|c| c.load(Ordering::Relaxed));
+                let n: u64 = lag[..6].iter().sum();
+                tracing::info!(
+                    "textures picked by index, frames from a view's write to its whole upload, since the start: {} within 1, \
+                     {} in 2-4, {} in 5-15, {} in 16-60, {} in 61-300, {} later; {:.1} on average",
+                    lag[0],
+                    lag[1],
+                    lag[2],
+                    lag[3],
+                    lag[4],
+                    lag[5],
+                    lag[6] as f64 / n.max(1) as f64
+                );
+            }
             if crate::resource::held_only() {
                 let [copies, bytes, grown, whole] = [0, 1, 2, 3].map(|i| crate::resource::HELD[i].load(Ordering::Relaxed));
                 let [flipped, missed] = [0, 1].map(|i| crate::descriptor::host::FLIPPED[i].load(Ordering::Relaxed));
