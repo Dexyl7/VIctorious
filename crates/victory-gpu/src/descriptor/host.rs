@@ -210,6 +210,9 @@ pub(crate) struct HostHeap {
     /// other memory there makes stale, and which to look at again when the
     /// runtime maps, unmaps or writes memory ([`remapped`]).
     placed: std::sync::Arc<Mutex<Spans>>,
+    /// The slots `textures` and `placed` may hold ([`Marks`]).
+    queued_marks: std::sync::Arc<Marks>,
+    placed_marks: std::sync::Arc<Marks>,
 }
 
 /// The spans of every view heap made ([`HostHeap::placed`]), for the
@@ -519,6 +522,8 @@ pub(crate) struct Spans {
     /// out once for each (a title writes the views of a few thousand
     /// descriptions, thousands of times a frame).
     sizes: std::collections::HashMap<[u32; 14], Option<u64>>,
+    /// The slots in `by_slot` or `first` ([`Marks`]; none in tests).
+    marks: Option<std::sync::Arc<Marks>>,
 }
 
 /// When a view the title writes makes an older view of other memory stale.
@@ -629,12 +634,18 @@ impl Spans {
         }
         self.by_start.entry(start).or_insert_with(|| (end, Default::default())).1.insert(index);
         self.by_slot.insert(index, start);
+        if let Some(marks) = &self.marks {
+            marks.set(index);
+        }
         stale
     }
 
     /// The view in slot `index` starts at level `first` of its texture; the
     /// memory of that and the smaller levels ends at `end`.
     fn shows(&mut self, index: u32, first: u32, end: u64) {
+        if let Some(marks) = &self.marks {
+            marks.set(index);
+        }
         self.first.insert(index, (first, end));
     }
 
@@ -662,6 +673,9 @@ impl Spans {
     /// Slot `index` holds no placed texture view any more.
     fn forget(&mut self, index: u32) {
         self.first.remove(&index);
+        if let Some(marks) = &self.marks {
+            marks.clear(index);
+        }
         let Some(start) = self.by_slot.remove(&index) else {
             return;
         };
@@ -893,6 +907,42 @@ struct Waiting {
     checked: (u64, u64, u64, u8, u64),
 }
 
+/// Which slots a structure behind a lock may hold, read without the lock: a
+/// slot whose mark is clear is not there, so a call that would only take it
+/// out need not take the lock (the threads that make the heaps' records
+/// queued for the locks of [`TextureQueue`] and [`Spans`] at every slot,
+/// ~20 % of their time in a profile of 2026-11-28, for slots in neither).
+/// A mark is set when a slot goes in, under the structure's lock, and may
+/// stay set after it went (a lock taken for nothing). Out of range: set.
+/// `VICTORY_SLOT_MARKS=0`: the locks are always taken, as before.
+#[derive(Default)]
+pub(crate) struct Marks(Vec<std::sync::atomic::AtomicU64>);
+
+impl Marks {
+    fn new(count: u32) -> Self {
+        Marks((0..(count as usize).div_ceil(64)).map(|_| std::sync::atomic::AtomicU64::new(0)).collect())
+    }
+
+    fn set(&self, index: u32) {
+        if let Some(word) = self.0.get(index as usize / 64) {
+            word.fetch_or(1 << (index % 64), std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    fn clear(&self, index: u32) {
+        if let Some(word) = self.0.get(index as usize / 64) {
+            word.fetch_and(!(1 << (index % 64)), std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    /// Whether slot `index` may be there (always, with the switch off).
+    fn may_hold(&self, index: u32) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        !*ON.get_or_init(|| std::env::var_os("VICTORY_SLOT_MARKS").is_none_or(|v| v != "0"))
+            || self.0.get(index as usize / 64).is_none_or(|w| w.load(std::sync::atomic::Ordering::Acquire) & (1 << (index % 64)) != 0)
+    }
+}
+
 /// The queue of title slots whose texture view waits to be brought up to
 /// date for shaders that pick textures by index: which are due, and in
 /// which order (no host heap needed, so it is tested without one).
@@ -904,9 +954,17 @@ pub(crate) struct TextureQueue {
     /// they need ([`TextureQueue::hold`]), each with the write it was
     /// held as.
     held: std::collections::BTreeMap<u32, u64>,
+    /// The slots it may hold ([`Marks`]; none in tests).
+    marks: Option<std::sync::Arc<Marks>>,
 }
 
 impl TextureQueue {
+    fn mark(&self, index: u32) {
+        if let Some(marks) = &self.marks {
+            marks.set(index);
+        }
+    }
+
     /// A texture view was written into slot `index` in `frame`, due from
     /// frame `due`. `seen`: it was not written, a draw or the pass made
     /// the host slot from a view the queue may hold already, which then
@@ -917,11 +975,15 @@ impl TextureQueue {
         }
         self.writes += 1;
         let write = self.writes;
+        self.mark(index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
     fn remove(&mut self, index: u32) {
         self.slots.remove(&index);
+        if let Some(marks) = &self.marks {
+            marks.clear(index);
+        }
     }
 
     /// Up to `max` slots due at `frame`, each with its write number, in
@@ -1045,6 +1107,7 @@ impl TextureQueue {
         self.writes += 1;
         let write = self.writes;
         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+        self.mark(index);
         self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
     }
 
@@ -1523,6 +1586,8 @@ impl HostHeap {
                 Some((buffer, gpu, data as usize))
             })
             .flatten();
+        let queued_marks = std::sync::Arc::new(Marks::new(count));
+        let placed_marks = std::sync::Arc::new(Marks::new(count));
         let h = HostHeap {
             heap,
             cpu,
@@ -1548,12 +1613,14 @@ impl HostHeap {
             strides,
             buffers: Slots::new(count as usize),
             changed: Slots::new(count as usize),
-            textures: Mutex::default(),
+            textures: Mutex::new(TextureQueue { marks: Some(queued_marks.clone()), ..Default::default() }),
+            queued_marks,
+            placed_marks: placed_marks.clone(),
             tabled: (0..if sampler { 0 } else { count })
                 .map(|_| std::sync::atomic::AtomicU32::new(0))
                 .collect(),
             placed: {
-                let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                let spans = std::sync::Arc::new(Mutex::new(Spans { marks: Some(placed_marks), ..Default::default() }));
                 if !sampler {
                     PLACED_SPANS
                         .lock()
@@ -2388,6 +2455,10 @@ impl HostHeap {
         // Made now by a draw of this frame that read it through a table:
         // up to date.
         let read_now = seen && stamp == now | TABLED_READ;
+        // Only to take it out, and it is not there.
+        if !(texture && !read_now) && !self.queued_marks.may_hold(index) {
+            return;
+        }
         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
         if texture && !read_now {
             let due = if lately && !seen {
@@ -2472,7 +2543,10 @@ impl HostHeap {
             }
             _ => None,
         };
-        let stale = {
+        let stale = if placed_view.is_none() && !self.placed_marks.may_hold(index) {
+            // Only to forget it, and it is not there.
+            Vec::new()
+        } else {
             use std::sync::atomic::Ordering::Relaxed;
             let mut placed = self.placed.lock().unwrap_or_else(|e| e.into_inner());
             let span = placed_view.and_then(|(resource, start, first, held)| {

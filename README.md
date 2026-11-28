@@ -217,6 +217,11 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Slot marks (`VICTORY_SLOT_MARKS=0`: off): a slot update that would only take a slot out of the
+  queue of textures picked by index, or out of the placed-texture spans, skips that structure's lock
+  when a lock-free mark says the slot is not there. The threads that make the heaps' records spent
+  ~20 % of their time queued for those two locks in a profile while driving, mostly for slots in
+  neither.
 - Tried and left off: page mappings in the line (`VICTORY_MAP_IN_LINE=1` turns it on; A/B-able). The
   title's page-mapping calls became a job in their queue's order, done by the submitting thread, instead
   of the title's streaming thread waiting for every submission before them (`VICTORY_MAP_DRAIN`; that
