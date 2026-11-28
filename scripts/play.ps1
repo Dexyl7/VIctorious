@@ -83,6 +83,11 @@ $settings.VICTORY_INPLACE = '1'
 # All the title's view memory (its page pool) read in place through views of ours (renderer port 1's way, beyond its
 # 32-bit heap): no host copies to keep, bring up to date, send or fetch back. -More @{VICTORY_PORT_ALL='0'}: as before.
 $settings.VICTORY_PORT_ALL = '1'
+# The streaming log: every DirectStorage read (queued, submitted, started, finished), when the title saw it done,
+# and each second's cost of the title's page mappings, written to stream.txt beside this script's repository
+# (some 10 MB a minute). It shows whether textures wait on the reads, on the mappings or on the title itself.
+# -More @{VICTORY_DSTORAGE_LOG=''}: none.
+$settings.VICTORY_DSTORAGE_LOG = (Join-Path (Split-Path $PSScriptRoot -Parent) 'stream.txt')
 if ($RenderScale -ne '') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 if ($Sharpen -ne '') { $settings.VICTORY_SHARPEN = $Sharpen }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }

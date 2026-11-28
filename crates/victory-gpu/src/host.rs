@@ -2848,6 +2848,28 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// What held page mappings back since the last summary (`VICTORY_MAP_DRAIN`):
+/// [0] lists in the line not translated yet (their reach unknown), then the
+/// first step found reaching the mapped memory: [1] a buffer copy, [2] a fill
+/// of upload memory, [3] a refresh, [4] a shader write, [5] a step of ours on
+/// host memory, [6] a copy on the card, [7] a step of ours of unknown reach,
+/// [8] a texture's detiling (where textures do not let it go first).
+pub(crate) static MAP_HELD_BY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+
+/// [`MAP_HELD_BY`]'s place for a step.
+fn held_by(step: &Step) -> usize {
+    match step {
+        Step::Copy(..) => 1,
+        Step::Fill(..) => 2,
+        Step::Refresh(..) => 3,
+        Step::GpuWrite(..) => 4,
+        Step::Host(..) => 5,
+        Step::Placed(_) => 6,
+        Step::Run(_) => 7,
+        Step::Texture(_) => 8,
+    }
+}
+
 /// Whether preparing `lists` reaches title memory in `ranges` only by
 /// textures' detiling (`Step::Texture`): `None` if a step of another kind
 /// reaches it (or work of unknown reach), else the staging buffers that do
@@ -2878,6 +2900,7 @@ pub(crate) fn lists_reach_textures<'a>(
                 Step::Run(_) => true,
             };
             if other {
+                MAP_HELD_BY[held_by(step)].fetch_add(1, Ordering::Relaxed);
                 return None;
             }
         }
@@ -2908,6 +2931,7 @@ pub(crate) fn lists_reach<'a>(lists: impl Iterator<Item = &'a HostList>, ranges:
                 Step::Run(_) => true,
             };
             if hit {
+                MAP_HELD_BY[held_by(step)].fetch_add(1, Ordering::Relaxed);
                 return true;
             }
         }
@@ -3875,6 +3899,11 @@ fn late_line(frames: f64) {
             tracing::info!(
                 "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}, mapped where nothing was without waiting (VICTORY_MAP_FRESH): {fresh:.2}, mapped at once as nothing in the line reached them (VICTORY_MAP_PRECISE): {precise:.2}, mapped at once after detiling the textures in the line that read there (VICTORY_MAP_TEXTURES): {textures:.2} ({detiled:.1} textures); list calls written down (VICTORY_THIN): {}",
                 crate::list::thin::wanted()
+            );
+            let held: Vec<f64> = MAP_HELD_BY.iter().map(|n| n.swap(0, Ordering::Relaxed) as f64 / frames).collect();
+            tracing::info!(
+                "what held those page mappings back, per frame: lists in the line not translated yet {:.2}, a buffer copy {:.2}, a fill of upload memory {:.2}, a refresh {:.2}, a shader write {:.2}, a step of ours on host memory {:.2}, a copy on the card {:.2}, a step of ours of unknown reach {:.2}, a texture {:.2}",
+                held[0], held[1], held[2], held[3], held[4], held[5], held[6], held[7], held[8]
             );
         }
     }

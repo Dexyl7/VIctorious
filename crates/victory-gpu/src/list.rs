@@ -1567,6 +1567,15 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
             with_state(this, |_, state| state.copied());
             return;
         }
+        // A copy whose reach is known: page mappings elsewhere need not wait
+        // for it (a step of ours of unknown reach holds back every one while
+        // it is in the line), and the journal learns what it wrote. One that
+        // overlaps itself stays a step of ours (a move).
+        let (d, s) = (dst as usize, src as usize);
+        if reach_known_copies() && (d + len <= s || s + len <= d) {
+            list.defer_copy(dst as *mut u8, src as *const u8, len);
+            return;
+        }
         list.defer(move || {
             if crate::texture::committed(src as *const u8, len)
                 && crate::texture::committed(dst as *const u8, len)
@@ -1578,6 +1587,15 @@ extern "system" fn copy_memory(this: This, dst: u64, src: u64, len: u64, _flags:
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src, len);
+}
+
+/// Whether the title's `CopyMemoryToMemoryX` copies done on the CPU are
+/// buffer copies with their reach known (`VICTORY_COPY_REACH=0`: steps of
+/// ours that may write anywhere, as before).
+#[cfg(windows)]
+fn reach_known_copies() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_REACH").is_none_or(|v| v != "0"))
 }
 
 /// `DriverHintX(feature, value)`: no hints for the host.

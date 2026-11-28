@@ -799,7 +799,13 @@ impl Job {
             Job::Lists(_, recordings, _) => {
                 let hosts: Option<Vec<&crate::host::HostList>> =
                     recordings.iter().map(|r| crate::list::host_list(r.back())).collect();
-                hosts.is_none_or(|hosts| crate::host::lists_reach_textures(hosts.into_iter(), ranges, out).is_none())
+                match hosts {
+                    Some(hosts) => crate::host::lists_reach_textures(hosts.into_iter(), ranges, out).is_none(),
+                    None => {
+                        crate::host::MAP_HELD_BY[0].fetch_add(1, Relaxed);
+                        true
+                    }
+                }
             }
             Job::Wait(..) | Job::Value(..) | Job::Signal(..) | Job::Map(..) | Job::Present(..) => false,
         }
@@ -815,7 +821,13 @@ impl Job {
             Job::Lists(_, recordings, _) => {
                 let hosts: Option<Vec<&crate::host::HostList>> =
                     recordings.iter().map(|r| crate::list::host_list(r.back())).collect();
-                hosts.is_none_or(|hosts| crate::host::lists_reach(hosts.into_iter(), ranges))
+                match hosts {
+                    Some(hosts) => crate::host::lists_reach(hosts.into_iter(), ranges),
+                    None => {
+                        crate::host::MAP_HELD_BY[0].fetch_add(1, Relaxed);
+                        true
+                    }
+                }
             }
             Job::Wait(..) | Job::Value(..) | Job::Signal(..) | Job::Map(..) | Job::Present(..) => false,
         }
