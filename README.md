@@ -201,6 +201,13 @@ keeps them. Everything below is what this copy changed on top, measured on the R
   the room's light by day) is bounded by it. The two later programs are matched by their hashes (their
   containers have no names); MiamiGame/XTP's shader-roles analysis was read to place them. Found with
   frame captures and their pixel history (2026-11-28); not confirmed in play, so play.ps1 leaves both off.
+- A leak of our own fixed: the shapes of views of placed memory (a view's description without its
+  address, meant to be as many as the title has kinds of textures and buffers) kept the resource
+  description's padding words 1 and 13, where the title leaves what its stack held, so every leftover was
+  a new shape: 570 to 3.7 million in a 35-minute Series S run, our own allocations 3.0 to 5.3 GB, the PC's
+  free memory down to ~0.1 GB. The padding is left out of the shape as `texture_at` already left it out of
+  its key (`VICTORY_PLACED_FILLER=1`: kept, as before), and the log's count of such leftovers stops at
+  65,536 (2026-11-28).
 - Frame replay fixes: buffers in heaps opened from existing memory lose their cross-adapter mark
   (D3D12 refused them once the heap's sharing was dropped); memory made not resident is made resident
   (the first copy into a texture faulted); `--breadcrumbs` now says, when the card is lost, where it

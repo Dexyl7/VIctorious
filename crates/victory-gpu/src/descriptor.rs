@@ -1012,12 +1012,27 @@ fn constant_of(i: u32, generation: u32) -> View {
 }
 
 /// A placed view's shape and its address.
+///
+/// Words 1 and 13 of the resource description are its layout's padding,
+/// where the title leaves what its stack held (`crate::resource::texture_at`
+/// keeps them out of its key for the same reason): kept in the shape, every
+/// such leftover made a shape of its own, and the shapes, meant to be as many
+/// as the title has kinds of textures and buffers, grew without end: 570 to
+/// 3.7 million in 35 minutes, about 1.7 GB of our own allocations in blocks
+/// under 4 KiB and the big tables beside them, and with them the PC's memory
+/// (2026-11-28). Zeroed here (`VICTORY_PLACED_FILLER=1`: kept, as before).
 fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape, u64) {
+    static KEPT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let mut resource = *resource;
+    if !*KEPT.get_or_init(|| std::env::var_os("VICTORY_PLACED_FILLER").is_some_and(|v| v == "1")) {
+        resource[1] = 0;
+        resource[13] = 0;
+    }
     let mut rest = [0u32; 14];
     rest[..10].copy_from_slice(&desc[..10]);
     rest[10..].copy_from_slice(&desc[12..]);
     (
-        (unordered, *resource, rest),
+        (unordered, resource, rest),
         u64::from(desc[10]) | u64::from(desc[11]) << 32,
     )
 }

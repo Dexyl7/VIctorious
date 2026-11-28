@@ -3180,7 +3180,9 @@ pub(crate) fn texture_at(address: u64, desc: &[u32; 14]) -> Option<This> {
     // the log: `placed_filler_twins`).
     if raw != key {
         let mut seen = PLACED_RAW.lock().unwrap_or_else(|e| e.into_inner());
-        if seen.insert((address, raw)) {
+        // A count for the log only: past this many the set stops growing (it
+        // held every leftover ever seen, for the whole run).
+        if seen.len() < 65_536 && seen.insert((address, raw)) {
             let others = seen.range((address, [0; 14])..=(address, [u32::MAX; 14])).filter(|(_, r)| {
                 let mut blank = *r;
                 blank[1] = 0;
