@@ -3337,6 +3337,33 @@ pub(crate) fn settle_for_fence() {
     settle_now(WHY_FENCE);
 }
 
+/// Whether the host lists of settled flights are reset by the thread that
+/// settles flights ([`late_helper`]), not by the submitting thread after
+/// each submission it sends (`VICTORY_LAND_ASIDE=1`; off by default: an A/B
+/// drive of 2026-11-28 showed no change in the submitting thread's time or
+/// the frames; A/B-able). Resetting them, their command allocators
+/// and what they held took ~9 % of the submitting thread's sampled time
+/// while driving (profile of 2026-11-28), on the thread every frame waits
+/// for.
+fn land_aside() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: OnceLock<Result<bool, u32>> = OnceLock::new();
+        match BIT.get_or_init(|| match crate::ab::bit("VICTORY_LAND_ASIDE") {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => crate::ab::on(*bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: OnceLock<bool> = OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_LAND_ASIDE").is_some_and(|v| v == "1"))
+    }
+}
+
 /// Resets the host lists of settled flights and keeps them for reuse, as
 /// a queue does for the lists it ran (`crate::list::recycle`).
 fn land() {
@@ -5317,8 +5344,14 @@ impl Host {
             LINE_MOVED.notify_one();
         }
         drop(submitted);
-        let _landing = crate::timeline::span("landed lists reset and given back");
-        land();
+        if land_aside() {
+            // The thread that settles flights resets them ([`late_helper`]).
+            line().poke = true;
+            LINE_MOVED.notify_one();
+        } else {
+            let _landing = crate::timeline::span("landed lists reset and given back");
+            land();
+        }
     }
 
     /// Sends `list`, a closed list of ours (the present's copy), as a
