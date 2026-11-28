@@ -111,6 +111,116 @@ impl Made {
     }
 }
 
+/// One bit per dynamic descriptor, searched in allocation order under the heap lock.
+struct DynamicBits {
+    words: Vec<u64>,
+    len: usize,
+}
+
+impl DynamicBits {
+    fn new(len: usize) -> Self {
+        Self { words: vec![0; len.div_ceil(64)], len }
+    }
+
+    /// Index of the first set bit in `[start, end)`, or `None` if all are 0.
+    fn first_taken(&self, start: usize, end: usize) -> Option<usize> {
+        let mut at = start;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let hit = self.words[w] & mask;
+            if hit != 0 {
+                return Some(w * 64 + hit.trailing_zeros() as usize);
+            }
+            at += bits;
+        }
+        None
+    }
+
+    fn find_in(&self, start: usize, limit: usize, n: usize) -> Option<usize> {
+        if n > limit - start {
+            return None;
+        }
+        let mut carry = 0;
+        for w in start / 64..limit.div_ceil(64) {
+            let base = w * 64;
+            let mut free = !self.words[w];
+            free &= u64::MAX << start.saturating_sub(base);
+            free &= u64::MAX >> 64usize.saturating_sub(limit - base);
+            let prefix = free.trailing_ones() as usize;
+            if carry + prefix >= n {
+                return Some(base - carry);
+            }
+            if free == u64::MAX {
+                carry += 64;
+                continue;
+            }
+            if n <= 64 {
+                // Each set bit is the start of a free run. Intersect shifted
+                // copies to grow the required length, doubling where possible.
+                let mut starts = free;
+                let mut width = 1;
+                while width < n && starts != 0 {
+                    let step = width.min(n - width);
+                    starts &= starts >> step;
+                    width += step;
+                }
+                if starts != 0 {
+                    return Some(base + starts.trailing_zeros() as usize);
+                }
+            }
+            carry = free.leading_ones() as usize;
+        }
+        None
+    }
+
+    fn find_run(&self, cursor: usize, n: usize) -> Option<usize> {
+        if n == 0 || n > self.len {
+            return None;
+        }
+        if cursor + n <= self.len && self.first_taken(cursor, cursor + n).is_none() {
+            return Some(cursor);
+        }
+        if let Some(at) = self.find_in(cursor, self.len, n) {
+            return Some(at);
+        }
+        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(self.len);
+        self.find_in(0, second_end, n)
+    }
+
+    fn set_taken(&mut self, first: usize, n: usize) {
+        let end = (first + n).min(self.len);
+        let mut at = first;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            self.words[w] |= mask;
+            at += bits;
+        }
+    }
+
+    fn clear_taken(&mut self, first: usize, n: usize) -> u32 {
+        let end = (first + n).min(self.len);
+        let mut at = first;
+        let mut freed = 0u32;
+        while at < end {
+            let w = at / 64;
+            let b = at % 64;
+            let bits = (end - at).min(64 - b);
+            let mask = if bits == 64 { !0u64 } else { ((1u64 << bits) - 1) << b };
+            let prev = self.words[w];
+            freed += (prev & mask).count_ones();
+            self.words[w] = prev & !mask;
+            at += bits;
+        }
+        freed
+    }
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -157,7 +267,7 @@ pub(crate) struct HostHeap {
     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
-    next: Mutex<(u32, Vec<bool>)>,
+    next: Mutex<(u32, DynamicBits)>,
     /// How many dynamic slots are free (changed under `next`'s lock): with
     /// fewer than a table needs, the search is not made. Once the world
     /// had taken them all, every later table of the frame searched every
@@ -1386,7 +1496,9 @@ pub(crate) fn slot_story(slot: u32) -> String {
         let mut text = if index < host.count {
             format!("title slot {index}, made from {}", host.describe_slot(index).unwrap_or_default())
         } else {
-            let taken = host.next.lock().unwrap_or_else(|e| e.into_inner()).1.get((index - host.count) as usize).copied();
+            let guard = host.next.lock().unwrap_or_else(|e| e.into_inner());
+            let at = (index - host.count) as usize;
+            let taken = (at < guard.1.len).then(|| guard.1.first_taken(at, at + 1).is_some());
             format!("dynamic slot {} (taken {taken:?})", index - host.count)
         };
         if twin {
@@ -1678,7 +1790,7 @@ impl HostHeap {
             waiting: Mutex::default(),
             away: Mutex::default(),
             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
-            next: Mutex::new((0, vec![false; extra as usize])),
+            next: Mutex::new((0, DynamicBits::new(extra as usize))),
             free: std::sync::atomic::AtomicU32::new(extra),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
             strides,
@@ -1800,27 +1912,8 @@ impl HostHeap {
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
         let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
-        let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
-            }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
-        }
+        let found = if enough { taken.find_run(*next as usize, n) } else { None };
         let Some(first) = found else {
             if enough {
                 self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
@@ -1837,7 +1930,7 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
+        taken.set_taken(first, n);
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
@@ -2677,12 +2770,10 @@ impl HostHeap {
             return;
         };
         let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let end = (at + n).min(self.dynamic) as usize;
-        if let Some(slots) = guard.1.get_mut(at as usize..end) {
-            let given = slots.iter().filter(|taken| **taken).count() as u32;
+        if at <= self.dynamic {
+            let given = guard.1.clear_taken(at as usize, n as usize);
             self.free.fetch_add(given, std::sync::atomic::Ordering::Relaxed);
             self.too_long.store(u32::MAX, std::sync::atomic::Ordering::Relaxed);
-            slots.fill(false);
         }
     }
 
@@ -4881,6 +4972,34 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packed_dynamic_slots_match_next_fit() {
+        for len in [1, 7, 63, 64, 65, 129] {
+            let mut slots = DynamicBits::new(len);
+            let mut used = vec![false; len];
+            let mut state = 531u32;
+            for step in 0..160 {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let at = state as usize % len;
+                let n = (state >> 16) as usize % (len - at) + 1;
+                if step % 3 == 0 {
+                    slots.set_taken(at, n);
+                    used[at..at + n].fill(true);
+                } else {
+                    let freed = used[at..at + n].iter().filter(|&&v| v).count();
+                    assert_eq!(slots.clear_taken(at, n) as usize, freed);
+                    used[at..at + n].fill(false);
+                }
+                for count in [1, 3, 16, 63, 64, 65, len] {
+                    let expected = (at..len).chain(0..at).find(|&start| {
+                        start + count <= len && !used[start..start + count].contains(&true)
+                    });
+                    assert_eq!(slots.find_run(at, count), expected);
+                }
+            }
+        }
+    }
 
     /// A view of a host copy that begins at a later level shows the same
     /// levels of it.
