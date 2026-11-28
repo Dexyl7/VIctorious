@@ -27,9 +27,11 @@ use crate::pipeline::host::HostPipeline;
 /// Shader interface metadata shared by every pipeline variant and draw.
 pub(crate) struct TablePlan {
     groups: Vec<TableGroup>,
-    // Direct entries can interleave slots. Preserve their declaration order
-    // when recording resource reads, writes, and transitions.
-    direct: Vec<(usize, usize)>,
+    // Entries outside constant-buffer groups can be direct. Keep them in
+    // declaration order for resource reads, writes, and transitions.
+    direct: Box<[UsedResource]>,
+    // Total table declarations, part of the fresh-table reader key.
+    declaration_count: usize,
 }
 
 struct TableGroup {
@@ -50,6 +52,7 @@ impl TablePlan {
             .filter(|u| u.root == RootType::Table)
             .map(|u| u.slot)
             .collect();
+        let declaration_count = slots.len();
         slots.sort_unstable();
         slots.dedup();
         let mut groups: Vec<_> = slots
@@ -64,7 +67,6 @@ impl TablePlan {
                 indexed: indexed.iter().filter(|v| v.table_slot == slot).copied().collect(),
             })
             .collect();
-        let mut direct = Vec::new();
         for &u in used.iter().filter(|u| u.root == RootType::Table) {
             let i = slots
                 .binary_search(&u.slot)
@@ -73,17 +75,23 @@ impl TablePlan {
             group.has_cbv |= u.kind == ResourceType::Cbv;
             group.has_uav |= u.kind == ResourceType::Uav;
             group.max_dword = group.max_dword.max(u.table_offset_dwords);
-            direct.push((i, group.entries.len()));
             group
                 .by_descriptor
                 .push((u.table_offset_dwords / 8, group.entries.len()));
             group.entries.push(u);
         }
+        let mut has_cbv = [false; 256];
         for group in &mut groups {
+            has_cbv[usize::from(group.slot)] = group.has_cbv;
             group.by_descriptor.sort_unstable();
             group.by_descriptor.dedup_by_key(|item| item.0);
         }
-        Self { groups, direct }
+        let direct = used
+            .iter()
+            .copied()
+            .filter(|u| u.root == RootType::Table && !has_cbv[usize::from(u.slot)])
+            .collect();
+        Self { groups, direct, declaration_count }
     }
 }
 
@@ -3421,10 +3429,9 @@ impl State {
                 fresh[usize::from(slot / 64)] |= 1u64 << (slot % 64);
             }
         }
-        for &(g, e) in &plan.direct {
-            let group = &plan.groups[g];
-            if !selected_slot(&fresh, group.slot) {
-                self.table_entry(list, &group.entries[e], compute);
+        for u in &plan.direct {
+            if !selected_slot(&fresh, u.slot) {
+                self.table_entry(list, u, compute);
             }
         }
         let mut made = Few::default();
@@ -3481,7 +3488,7 @@ impl State {
                 (table, n, h.0)
             };
             // Who reads of it, and as what, as far as [`readable`] goes by it.
-            let reader = (std::ptr::from_ref(plan) as usize, plan.direct.len(), STORES.get(), TESTED_DEPTH.get().0);
+            let reader = (std::ptr::from_ref(plan) as usize, plan.declaration_count, STORES.get(), TESTED_DEPTH.get().0);
             if let Some(known) = self.fresh_tables.get_mut(&key) {
                 let first = known.first;
                 // This reader had it brought up to date, and nothing in the
@@ -4791,6 +4798,29 @@ mod record_hash_tests {
             few.sort_unstable();
             assert_eq!(few.to_vec(), (1..=n).collect::<Vec<_>>());
         }
+    }
+
+    #[test]
+    fn direct_plan_preserves_interleaved_declarations_and_skips_whole_cbv_groups() {
+        use super::{ResourceType, RootType, TablePlan, UsedResource};
+        let entry = |slot, kind, offset| UsedResource {
+            kind,
+            slot,
+            root: RootType::Table,
+            table_offset_dwords: offset,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+        };
+        let a = entry(255, ResourceType::Srv, 0);
+        let b = entry(64, ResourceType::Uav, 8);
+        let later_cbv = entry(255, ResourceType::Cbv, 8);
+        let c = entry(0, ResourceType::Srv, 0);
+        let root_view = UsedResource { root: RootType::Descriptor, ..b };
+        let plan = TablePlan::new(&[a, b, c, later_cbv, root_view, b], &[]);
+        assert_eq!(&*plan.direct, &[b, c, b]);
+        assert_eq!(plan.declaration_count, 5);
     }
 
     #[test]
