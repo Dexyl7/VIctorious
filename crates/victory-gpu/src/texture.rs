@@ -1656,6 +1656,34 @@ fn readable(at: usize, len: usize, all: bool) -> (usize, usize) {
     (there, of)
 }
 
+/// Whether any of `[at, at + len)` is committed memory (a mapped view or
+/// committed pages), by the regions `VirtualQuery` reports: a few questions
+/// for a range, however long.
+pub(crate) fn any_committed(at: *const u8, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
+    let mut p = at as usize;
+    let end = p.saturating_add(len);
+    while p < end {
+        // SAFETY: plain data filled in by the query.
+        let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out pointer of the right size.
+        let n = unsafe { VirtualQuery(p as *const _, &mut info, size_of_val(&info)) };
+        if n == 0 {
+            // Not known: taken as committed (the caller then waits).
+            return true;
+        }
+        if info.State == MEM_COMMIT {
+            return true;
+        }
+        let next = info.BaseAddress as usize + info.RegionSize;
+        if next <= p {
+            return true;
+        }
+        p = next;
+    }
+    false
+}
+
 fn committed_by_query(at: *const u8, len: usize) -> bool {
     use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, VirtualQuery};
     let mut p = at as usize;

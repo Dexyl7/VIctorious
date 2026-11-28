@@ -179,6 +179,19 @@ keeps them. Everything below is what this copy changed on top, measured on the R
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Tried and left off: fresh page mappings without the drain (`VICTORY_MAP_FRESH=1` turns it on;
+  A/B-able). A page-mapping call that only maps where nothing (or only the title's filler page) is
+  mapped went ahead without waiting for the earlier submissions to be prepared (`VICTORY_MAP_DRAIN`).
+  In two A/B drives (2026-11-28) only ~0.16 calls a frame qualified against ~0.9 that still drained
+  (mappings over pages with data, and unmappings), frames were no better and textures came no sooner.
+- Card copies take only the changed ones (`VICTORY_CARD_TOUCHED=0`: every copy looked at, as before):
+  a copy in the card's memory notes itself when its CPU side changes, instead of the submitting thread
+  looking at all ~3,400 of them for every submission. The time for copies in the card's memory went
+  from ~4.4-5.6 to ~2.7 ms a frame on Series S (2026-11-28).
+- Series X with today's settings (2026-11-28, no FSR, 10 minutes): ~39 ms on average (~25 fps), slowest
+  tenth ~46 ms, VRAM 12.1 of 13.9 GB, free RAM down to ~0.1 GB on 32 GB. With `-Fsr4K quality`: ~61 ms,
+  and about three times the title memory copied per frame. `-RenderScale 0.8` on Series S ended in the
+  title's own break point while loading.
 - Tried and left off: landed lists reset aside (`VICTORY_LAND_ASIDE=1` turns it on; A/B-able). The
   host lists of flights the card has run were reset and pooled by the thread that settles flights, not
   by the submitting thread (~9 % of its sampled time in an earlier profile). In an A/B drive

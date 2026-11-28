@@ -1126,6 +1126,9 @@ extern "system" fn copy_page_mappings(
     // What goes where: (to, from, bytes); from 0 unmaps.
     let mut ok = true;
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
+    // Of each range: where, how long, and whether it shows one page over
+    // and over (the title's filler for places with nothing in them).
+    let mut filled: Vec<(u64, u64, bool)> = Vec::new();
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1138,9 +1141,18 @@ extern "system" fn copy_page_mappings(
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
             match r.kind {
-                0 if inside(r.count) => gathered.push((at, source, len)),
-                1 if inside(1) => gathered.extend((0..u64::from(r.count)).map(|k| (at + k * PAGE, source, PAGE))),
-                2 => gathered.push((at, 0, len)),
+                0 if inside(r.count) => {
+                    gathered.push((at, source, len));
+                    filled.push((at, len, false));
+                }
+                1 if inside(1) => {
+                    gathered.extend((0..u64::from(r.count)).map(|k| (at + k * PAGE, source, PAGE)));
+                    filled.push((at, len, true));
+                }
+                2 => {
+                    gathered.push((at, 0, len));
+                    filled.push((at, len, false));
+                }
                 3 => {}
                 _ => ok = false,
             }
@@ -1169,14 +1181,83 @@ extern "system" fn copy_page_mappings(
         return S_OK;
     }
     let _ = this;
+    // Pages mapped where nothing is mapped now: nothing the title gave this
+    // queue before may read there (it would read nothing on the console
+    // too), so what is in the line need not be prepared first.
+    // (Or where only the title's filler page is: what read it before reads
+    // the texture's own bytes instead, sooner than on the console.)
     #[cfg(windows)]
-    if crate::toggled!("VICTORY_MAP_DRAIN") {
+    let fresh = map_fresh() && ok && !gathered.is_empty() && {
+        let filler = FILLER.lock().unwrap_or_else(|e| e.into_inner());
+        gathered.iter().all(|&(to, from, len)| {
+            from != 0
+                && (0..len.div_ceil(PAGE)).all(|k| {
+                    let page = to + k * PAGE;
+                    filler.contains(&page) || !crate::texture::any_committed(page as *const u8, PAGE as usize)
+                })
+        })
+    };
+    // What shows the filler from here on.
+    #[cfg(windows)]
+    {
+        let mut filler = FILLER.lock().unwrap_or_else(|e| e.into_inner());
+        for &(at, len, one) in &filled {
+            for k in 0..len.div_ceil(PAGE) {
+                if one {
+                    filler.insert(at + k * PAGE);
+                } else {
+                    filler.remove(&(at + k * PAGE));
+                }
+            }
+        }
+    }
+    #[cfg(windows)]
+    if fresh {
+        MAP_FRESH.fetch_add(1, Ordering::Relaxed);
+    } else if crate::toggled!("VICTORY_MAP_DRAIN") {
         before_sync();
         MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
     }
     apply(gathered, ok);
     S_OK
 }
+
+/// Whether a page-mapping call that only maps pages where nothing is mapped
+/// goes ahead without draining the line first (`VICTORY_MAP_FRESH=1`; off
+/// by default; A/B-able). The drain is for submissions before the call that
+/// would read the old mapping when prepared; where there is none, none can.
+/// The title's streaming thread stood ~58 % of its sampled time in that
+/// drain while driving (profile of 2026-11-28), and textures waited for
+/// their pages meanwhile. An unmapping or a mapping over pages that are
+/// mapped still drains.
+#[cfg(windows)]
+fn map_fresh() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match BIT.get_or_init(|| match crate::ab::bit("VICTORY_MAP_FRESH") {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os("VICTORY_MAP_FRESH").is_some_and(|v| v == "1")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => crate::ab::on(*bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_FRESH").is_some_and(|v| v == "1"))
+    }
+}
+
+/// The pages (64 KiB, by address) that show the title's filler: mapped by a
+/// range of one page over and over ([`copy_page_mappings`], kind 1).
+#[cfg(windows)]
+static FILLER: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<u64>>> = std::sync::LazyLock::new(Default::default);
+
+/// Page mappings that did not drain the line: all of them where nothing
+/// was mapped ([`map_fresh`]).
+pub(crate) static MAP_FRESH: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a page-mapping call goes into the line as a job of its queue's,
 /// done by our thread in order, and returns at once
