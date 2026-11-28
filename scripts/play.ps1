@@ -38,6 +38,10 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
     # Recording threads: a table's descriptor copies in one call; lookups forgotten only where buffers changed.
     VICTORY_TABLE_BATCH = '1'; VICTORY_FIND_BY_RANGE = '1'
+    # Title buffers of 1 MB and more get their copy on the card and are compared there (trustno1-coder/
+    # victory-nvidia's setting; the way is fxceless/victory-fork's): 80 such copies instead of 43 here,
+    # the submitting thread's snapshots 4.0 -> 1.6 ms and the copy-back 8-10 -> 6-7 ms a frame.
+    VICTORY_CARD_BUFFERS_MIN_MB = '1'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'

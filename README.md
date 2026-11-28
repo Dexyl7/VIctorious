@@ -114,6 +114,7 @@ time are drawn in the corners of the picture; **F3 hides and shows them**
 | `VICTORY_PORT_CONSTANTS_ORDER` | 0 with `-Ports` | 1: patch 1's in-place indirect arguments checked one by one (lights and trees right, the card ~36 ms slower a frame) |
 | `VICTORY_TABLE_BATCH` | 1 (play.ps1) | a table's descriptor copies in one driver call |
 | `VICTORY_FIND_BY_RANGE` | 1 (play.ps1) | buffer lookups forgotten only where buffers changed |
+| `VICTORY_CARD_BUFFERS_MIN_MB` | 1 (play.ps1; 4 on a 16 GB card without it) | title buffers of that size and more copied to the card and compared there, not on the CPU (setting from trustno1-coder/victory-nvidia, the method from fxceless/victory-fork): the sending thread's snapshots 4.0 → 1.6 ms, copy-back 8-10 → 6-7 ms a frame |
 | `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
 | `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
@@ -216,6 +217,9 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- The sampling profiler (`VICTORY_PROFILE`) stops a thread's stack walk where a function's frame
+  register does not point into that thread's stack: a sample of a title thread taken mid-function
+  read through a garbage frame pointer and ended the process.
 - Tried and left off (`VICTORY_CRITICAL_PRIORITY=1` turns it on): the threads a submission waits
   for (the heaps' records, the relay and its landing threads) at above-normal priority. The wait for
   the heaps' records fell from ~8 to ~4 ms a frame, but the picture froze for seconds at a time, often,

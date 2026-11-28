@@ -678,6 +678,43 @@ pub(crate) fn unwind_into(context: CONTEXT, low: usize, high: usize, frames: &mu
             context.Rip = unsafe { (rsp as *const u64).read() };
             context.Rsp += 8;
         } else {
+            // A function that addresses its frame through a register reads
+            // the stack through it once past its prologue: from a thread
+            // stopped anywhere (the profiler's samples), that register may
+            // hold anything (a sample of the title's thread faulted at
+            // 0xffff_ffff_ffff_ffff, with floats in r8 and r9, and ended
+            // the process). Stop where it does not point into the stack.
+            // SAFETY: the entry's three 32-bit fields (begin, end, the
+            // unwind data's offset); that data lies in `image`, its fourth
+            // byte the frame register (low nibble), its second the
+            // prologue's size.
+            let (begin, prolog, register) = unsafe {
+                let fields = entry as *const u32;
+                let info = (image as usize + fields.add(2).read() as usize) as *const u8;
+                (fields.read() as u64, u64::from(info.add(1).read()), info.add(3).read() & 0x0f)
+            };
+            if register != 0 && context.Rip.wrapping_sub(image + begin) >= prolog {
+                let value = match register {
+                    1 => context.Rcx,
+                    2 => context.Rdx,
+                    3 => context.Rbx,
+                    5 => context.Rbp,
+                    6 => context.Rsi,
+                    7 => context.Rdi,
+                    8 => context.R8,
+                    9 => context.R9,
+                    10 => context.R10,
+                    11 => context.R11,
+                    12 => context.R12,
+                    13 => context.R13,
+                    14 => context.R14,
+                    15 => context.R15,
+                    _ => context.Rsp,
+                } as usize;
+                if value < low || value >= high {
+                    break;
+                }
+            }
             let (mut data, mut frame) = (null_mut(), 0);
             // SAFETY: `entry` belongs to `image`; the context is our copy.
             unsafe {
