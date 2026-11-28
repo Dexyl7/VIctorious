@@ -86,6 +86,21 @@ pub fn run(
         let cache = cfg.cache_subdir(&format!("images/fsr-{}-4k-sdr", preset.name()))?;
         victory_loader::load(&prepared, &cache)?
     } else {
+        // `VICTORY_FSR_HOST=1`: the title's own FidelityFX calls served by the
+        // PC build (FSR 4.1.2) without the Series X 4K profile, at the sizes the
+        // title asks for (Series S: its 2/3 render, upscaled to its output), so
+        // that frame generation (`VICTORY_FRAMEGEN`) has the upscaler's depth and
+        // motion on Series S too. Needs the title to pick FidelityFX
+        // (`VICTORY_UPSCALER=7`, play.ps1's -FrameGen on Series S sets it).
+        if std::env::var_os("VICTORY_FSR_HOST").is_some_and(|v| v == "1") {
+            let dir = cfg.fidelityfx_dir.as_deref().context(
+                "VICTORY_FSR_HOST requires amd_fidelityfx_upscaler_dx12.dll. Set VICTORY_FIDELITYFX_DIR or [paths].fidelityfx_dir to its folder.",
+            )?;
+            // Select the provider before the first lookup builds the import registry.
+            victory_hle::modules::fidelityfx::use_host_dir(dir)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| format!("loading FSR 4.1.2 from {}", dir.display()))?;
+        }
         victory_loader::load(&prepared, &images)?
     };
     // The program is mapped from the copy `load` wrote: the file's bytes

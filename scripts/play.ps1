@@ -6,7 +6,7 @@
 # -Output       the title's output size (Series X): 2560x1440, 1920x1080, 1664x936 or 1280x720; with -Fsr4K, what FSR upscales to
 # -FfxDir       the folder with AMD's amd_fidelityfx_upscaler_dx12.dll for -Fsr4K (C:\FidelityFX)
 # -SkipIntro    skips the logo and intro movies (VICTORY_SKIP_BINK=1; from C-GDev, fxceless PR 613, via CuteBooty)
-# -FrameGen     with -Fsr4K: AMD frame generation (2x), from Vice-Tay 3236af66 after PastiiJay/klbf-lab 793c56c3;
+# -FrameGen     AMD frame generation (2x): Series X with -Fsr4K; Series S on its own (the title's FidelityFX, PC build), from Vice-Tay 3236af66 after PastiiJay/klbf-lab 793c56c3;
 #               needs amd_fidelityfx_framegeneration_dx12.dll and amd_fidelityfx_loader_dx12.dll in -FfxDir
 # -Build        target\diag (the default, the build all measurements are of) or target\release
 # -Console      series-x (default) or series-s (less title memory: for PCs with 32 GB)
@@ -98,7 +98,16 @@ if ($Fsr4K) {
     }
 }
 if ($SkipIntro) { $settings.VICTORY_SKIP_BINK = '1' }
-if ($FrameGen -and -not $Fsr4K) { Write-Host '-FrameGen needs -Fsr4K (it takes the upscaler''s depth and motion).'; exit 1 }
+if ($FrameGen -and -not $Fsr4K) {
+    if ($Console -ne 'series-s') { Write-Host '-FrameGen on Series X needs -Fsr4K (it takes the upscaler''s depth and motion).'; exit 1 }
+    # Series S: the title's FidelityFX (instead of its own upscaler) served by the PC build at the title's own sizes,
+    # and AMD frame generation on its depth and motion (VICTORY_FSR_HOST, apps/victory/src/run.rs).
+    foreach ($dll in 'amd_fidelityfx_upscaler_dx12.dll', 'amd_fidelityfx_framegeneration_dx12.dll', 'amd_fidelityfx_loader_dx12.dll') {
+        if (-not (Test-Path (Join-Path $FfxDir $dll))) { Write-Host "No $dll in $FfxDir (-FfxDir): -FrameGen needs it."; exit 1 }
+    }
+    $settings.VICTORY_OWN_UPSCALER = '0'; $settings.VICTORY_UPSCALER = '7'; $settings.VICTORY_FSR_HOST = '1'
+    $settings.VICTORY_FIDELITYFX_DIR = $FfxDir; $settings.VICTORY_FRAMEGEN = '1'; $settings.VICTORY_FFX_FG_DIR = $FfxDir
+}
 if ($Output -ne '') { $settings.VICTORY_OUTPUT = $Output }
 # Patch 1's ordering (each in-place indirect execution checked alone, after a full wait of the card)
 # cost about 36 ms of the card's time a frame here (timelines tl2: 61 ms busy with it, 25 without);
