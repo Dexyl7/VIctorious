@@ -114,6 +114,7 @@ time are drawn in the corners of the picture; **F3 hides and shows them**
 | `VICTORY_PORT_CONSTANTS_ORDER` | 0 with `-Ports` | 1: patch 1's in-place indirect arguments checked one by one (lights and trees right, the card ~36 ms slower a frame) |
 | `VICTORY_TABLE_BATCH` | 1 (play.ps1) | a table's descriptor copies in one driver call |
 | `VICTORY_FIND_BY_RANGE` | 1 (play.ps1) | buffer lookups forgotten only where buffers changed |
+| `VICTORY_SYNC_AT_SUBMIT` | 1 (play.ps1) | the descriptor records round a submission waits for is asked for when the title submits it, not when it is prepared |
 | `VICTORY_CARD_BUFFERS_MIN_MB` | 1 (play.ps1; 4 on a 16 GB card without it) | title buffers of that size and more copied to the card and compared there, not on the CPU (setting from trustno1-coder/victory-nvidia, the method from fxceless/victory-fork): the sending thread's snapshots 4.0 → 1.6 ms, copy-back 8-10 → 6-7 ms a frame |
 | `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
@@ -217,11 +218,17 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Heaps' records asked for at submit (`VICTORY_SYNC_AT_SUBMIT=1`, on in play.ps1, A/B-able): the round that mirrors the descriptor records the title copied into its
+  heap is asked for when the title submits, and made beside the line while it gets there, instead of
+  when the submitting thread prepares the submission. That thread waited 6-9 ms a frame for those
+  rounds, which also took in what the title had written since for the submissions behind. In an A/B
+  drive (2026-11-28, 20 s each way) the wait went from ~6-9 to ~1-4 ms a frame, the slowest tenth of
+  frames from mostly ~40 to mostly ~38 ms, with no new visual faults seen.
 - Slot marks (`VICTORY_SLOT_MARKS=0`: off): a slot update that would only take a slot out of the
   queue of textures picked by index, or out of the placed-texture spans, skips that structure's lock
   when a lock-free mark says the slot is not there. The threads that make the heaps' records spent
   ~20 % of their time queued for those two locks in a profile while driving, mostly for slots in
-  neither.
+  neither; the wait for the records did not measurably change with it (2026-11-28).
 - Tried and left off: page mappings in the line (`VICTORY_MAP_IN_LINE=1` turns it on; A/B-able). The
   title's page-mapping calls became a job in their queue's order, done by the submitting thread, instead
   of the title's streaming thread waiting for every submission before them (`VICTORY_MAP_DRAIN`; that

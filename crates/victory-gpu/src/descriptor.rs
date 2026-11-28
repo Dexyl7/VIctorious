@@ -206,12 +206,90 @@ static SYNC_ROUNDS: (std::sync::Mutex<(u64, u64)>, std::sync::Condvar) = (std::s
 #[cfg(windows)]
 pub(crate) struct SyncedHeaps(Option<u64>);
 
+/// Whether the heaps' records round a submission waits for is asked for
+/// when the title submits it, not when our thread prepares it
+/// (`VICTORY_SYNC_AT_SUBMIT=1`; off by default; A/B-able). The title wrote
+/// the records a submission's lists read before it submitted them; asked
+/// then, the round is made beside the line of submissions while the line
+/// gets there. Asked when preparing, it also took in what the title wrote
+/// since for the submissions behind it, and the submitting thread waited
+/// 6-9 ms a frame for those rounds (2026-11-28).
+#[cfg(windows)]
+fn sync_at_submit() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match BIT.get_or_init(|| match crate::ab::bit("VICTORY_SYNC_AT_SUBMIT") {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os("VICTORY_SYNC_AT_SUBMIT").is_some_and(|v| v == "1")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => crate::ab::on(*bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_SYNC_AT_SUBMIT").is_some_and(|v| v == "1"))
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    /// The round asked for when the title submitted what this thread
+    /// prepares now (0: none, ask one).
+    static ROUND_FOR_THIS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Since the last line: submissions whose round was asked for when the
+/// title submitted them ([`sync_at_submit`]).
+#[cfg(windows)]
+pub(crate) static SYNC_ASKED_AT_SUBMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// What this thread prepares next was submitted with heaps' records round
+/// `round` ([`ask_sync_round`]; 0: none).
+#[cfg(windows)]
+pub(crate) fn sync_round_for_this(round: u64) {
+    ROUND_FOR_THIS.set(round);
+}
+
+/// A heaps' records round asked for now, for a submission the title makes
+/// now ([`sync_at_submit`]); 0 if not.
+#[cfg(windows)]
+pub(crate) fn ask_sync_round() -> u64 {
+    if !sync_at_submit() || !sync_aside() || !sync_thread() {
+        return 0;
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    rounds.0 += 1;
+    let mine = rounds.0;
+    drop(rounds);
+    SYNC_ROUNDS.1.notify_all();
+    mine
+}
+
 #[cfg(windows)]
 pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
-    if !sync_aside() {
+    if !sync_aside() || !sync_thread() {
         sync_heaps();
         return SyncedHeaps(None);
     }
+    let asked = ROUND_FOR_THIS.get();
+    if asked != 0 {
+        SYNC_ASKED_AT_SUBMIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return SyncedHeaps(Some(asked));
+    }
+    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+    rounds.0 += 1;
+    let mine = rounds.0;
+    drop(rounds);
+    SYNC_ROUNDS.1.notify_all();
+    SyncedHeaps(Some(mine))
+}
+
+/// Starts the thread that makes the rounds, once: whether there is one.
+#[cfg(windows)]
+fn sync_thread() -> bool {
     static STARTED: std::sync::Once = std::sync::Once::new();
     static THREAD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     STARTED.call_once(|| {
@@ -257,16 +335,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
         });
         THREAD.store(made.is_ok(), std::sync::atomic::Ordering::Release);
     });
-    if !THREAD.load(std::sync::atomic::Ordering::Acquire) {
-        sync_heaps();
-        return SyncedHeaps(None);
-    }
-    let mut rounds = SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
-    rounds.0 += 1;
-    let mine = rounds.0;
-    drop(rounds);
-    SYNC_ROUNDS.1.notify_all();
-    SyncedHeaps(Some(mine))
+    THREAD.load(std::sync::atomic::Ordering::Acquire)
 }
 
 #[cfg(windows)]
@@ -544,7 +613,8 @@ pub(crate) fn sync_line(frames: f64) {
          {:.1} changed heap pages, {:.0} slots looked at, {:.1} whose record was new and was mirrored, {:.1} new ones of \
          draws' tables left to the draws, {:.1} that waited for a draw first, {:.2} ms ({:.2} ms waited for); of the mirrored \
          {:.0} no views (with those of slots that show none), {:.0} of objects, {:.0} others, {:.0} samplers, {:.0} that waited and no draw came; \
-         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making",
+         {:.1} of the pages guarded views, {:.1} MB read; {:.2} ms asking, {:.2} reading and comparing, {:.2} making; \
+         {:.1} submissions whose round was asked for when the title submitted them (VICTORY_SYNC_AT_SUBMIT)",
         pages as f64 / frames,
         looked as f64 / frames,
         mirrored as f64 / frames,
@@ -561,7 +631,8 @@ pub(crate) fn sync_line(frames: f64) {
         split[1] / (1 << 20) as f64 / frames,
         split[2] / 1e6 / frames,
         split[3] / 1e6 / frames,
-        split[4] / 1e6 / frames
+        split[4] / 1e6 / frames,
+        SYNC_ASKED_AT_SUBMIT.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames
     );
 }
 

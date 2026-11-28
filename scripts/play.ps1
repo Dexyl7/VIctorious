@@ -42,6 +42,9 @@ $settings = @{
     # victory-nvidia's setting; the way is fxceless/victory-fork's): 80 such copies instead of 43 here,
     # the submitting thread's snapshots 4.0 -> 1.6 ms and the copy-back 8-10 -> 6-7 ms a frame.
     VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    # The heaps' records round asked for when the title submits, made while the line gets there:
+    # the submitting thread's wait for it ~6-9 -> ~1-4 ms a frame (A/B drive, 2026-11-28).
+    VICTORY_SYNC_AT_SUBMIT = '1'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
