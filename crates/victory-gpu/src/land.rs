@@ -238,6 +238,11 @@ impl Pool {
         for i in 1..threads {
             // (A helper that is not there is only missed.)
             let _ = std::thread::Builder::new().name(format!("{name}-{i}")).spawn(move || {
+                // The frame waits for these two: the heaps' records and the
+                // landings of what the card wrote.
+                if name == "victory-records" || name == "victory-land" {
+                    crate::cores::raise_for_frame(name);
+                }
                 if name == "victory-land" {
                     crate::cores::keep_helper_on_fast_cores(name);
                 } else {

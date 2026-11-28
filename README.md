@@ -216,6 +216,11 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Tried and left off (`VICTORY_CRITICAL_PRIORITY=1` turns it on): the threads a submission waits
+  for (the heaps' records, the relay and its landing threads) at above-normal priority. The wait for
+  the heaps' records fell from ~8 to ~4 ms a frame, but the picture froze for seconds at a time, often,
+  while the game went on: with 13 of our threads above the title's own, those stood until Windows
+  lifted them.
 - Host copies of placed textures whose console memory is no longer mapped are let go once idle for
   30 seconds (2 seconds made 16,800 of 78,000 come back, uploaded again), whether or not the card is near its limit (`VICTORY_DEAD_SWEEP=0`: kept, as before):
   11 minutes into a Series S run 2.7 GB of them were still on the card while 9.3 GB of the PC's

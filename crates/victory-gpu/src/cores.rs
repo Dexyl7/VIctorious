@@ -69,6 +69,29 @@ pub(crate) fn keep_many_on_fast_cores(what: &str) {
     ask(what, 3);
 }
 
+/// Raises the calling thread, whose work a submission waits for, to the
+/// priority of the thread that prepares submissions (above normal), so the
+/// translation, decompression and the title's busy threads do not push it
+/// aside on a processor with more threads at work than it runs at once: in a
+/// Series S drive the submitting thread waited 6-8 ms a frame for the heaps'
+/// records, made by 6 threads among some 40 of ours.
+/// Off unless `VICTORY_CRITICAL_PRIORITY=1`: with it on (13 threads of ours
+/// above normal on a processor of 16) the wait for the records fell from
+/// ~8 to ~4 ms a frame, but the picture froze for seconds at a time, often,
+/// while the title went on: the title's own threads, at normal priority,
+/// stood until the system lifted them.
+pub(crate) fn raise_for_frame(what: &str) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_CRITICAL_PRIORITY").is_some_and(|v| v == "1")) {
+        return;
+    }
+    // SAFETY: this thread's own priority.
+    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } == 0 {
+        tracing::debug!(what, "no higher priority");
+    }
+}
+
 fn ask(what: &str, from: u32) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
     if stage() < from {
