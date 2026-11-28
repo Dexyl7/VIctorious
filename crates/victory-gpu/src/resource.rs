@@ -2192,7 +2192,9 @@ pub(crate) fn let_go_idle() {
     static DEAD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *DEAD.get_or_init(|| std::env::var_os("VICTORY_DEAD_SWEEP").is_none_or(|v| v != "0")) {
         const DEAD_PART: usize = 16384;
-        const DEAD_MS: u64 = 2_000;
+        // 2 s let 16,800 of 78,000 come back (2.5 GB uploaded again, textures
+        // blurry or missing meanwhile): the title maps memory there again.
+        const DEAD_MS: u64 = 30_000;
         static DEAD_FROM: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
         let (mut dead_went, mut dead_bytes) = (0u64, 0u64);
         let from = DEAD_FROM.load(Relaxed);

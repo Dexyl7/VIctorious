@@ -30,6 +30,8 @@ Long sessions (Series S, `-Ports`, same machine):
 | 2026-11-28, hosted-only walk | 11 min | ~33-44 ms | 0.3 GB | 166,000 title textures alive; 8.6 GB of host textures on the card, ~2.7 GB of them for memory the title had unmapped; 9.3 GB of the PC's memory shared with the card |
 | 2026-11-28, plus the dead-texture sweep | 14 min | ~33-40 ms → ~44-54 ms | 0.1-0.5 GB | 113,000 host copies (11.4 GB) let go as their memory was unmapped; host textures on the card ~4.5-5 GB instead of 8.6 GB |
 
+None of these runs crashed: each ended with the window closed by hand.
+
 What is known to be wrong:
 
 - A little geometry flicker remains (characters' clothing, single frames).
@@ -215,7 +217,7 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
 - Host copies of placed textures whose console memory is no longer mapped are let go once idle for
-  2 seconds, whether or not the card is near its limit (`VICTORY_DEAD_SWEEP=0`: kept, as before):
+  30 seconds (2 seconds made 16,800 of 78,000 come back, uploaded again), whether or not the card is near its limit (`VICTORY_DEAD_SWEEP=0`: kept, as before):
   11 minutes into a Series S run 2.7 GB of them were still on the card while 9.3 GB of the PC's
   memory was shared with it. The same checks as the existing sweep (no list, no slot, nothing else
   holds it); a later use makes the copy again.
