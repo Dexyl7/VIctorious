@@ -102,10 +102,38 @@ static BOUNDS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// touch it, their bytes.
 static STATS: [AtomicU64; 13] = [const { AtomicU64::new(0) }; 13];
 
+/// `VICTORY_PORT_ALL=1`: the same for all the title's view memory (its page
+/// pool and the rest `xmem` maps from sections), not only its 32-bit
+/// graphics heap: title buffers and windows there are read and written by
+/// the card where the title has them, and no host copy of them is kept,
+/// brought up to date, sent to the card or fetched back. That copying was
+/// 65-100 MB and 12-16 ms of the submitting thread a frame in the stutters
+/// of 2026-11-28, and the host copies about 3.9 GB of the PC's memory.
+/// Memory that is not one stretch of a section stays a copy, as before.
+///
+/// What it assumes, as port 1 does: our CPU steps that read such memory at
+/// submission read what the title's CPU wrote, not what a submission still
+/// in the air writes there.
+pub(crate) fn all() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PORT_ALL").is_ok_and(|v| v.trim() == "1"))
+}
+
+/// The most bytes of regions in place at once with [`all`]
+/// (`VICTORY_PORT_ALL_MB`, 8192): an opened region's pages are locked into
+/// the PC's memory while its heap stands.
+fn all_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| std::env::var("VICTORY_PORT_ALL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(8192) << 20)
+}
+
 /// Whether `[at, at + len)` may be ported: in the title's 32-bit graphics
-/// memory.
+/// memory, or (with [`all`]) anywhere.
 pub(crate) fn wanted(at: u64, len: u64) -> bool {
-    on() && at.checked_add(len).is_some_and(|end| end <= LOW && len > 0)
+    let Some(end) = at.checked_add(len) else {
+        return false;
+    };
+    len > 0 && ((on() && end <= LOW) || all())
 }
 
 /// Title memory `[start, start + len)` in place, if [`wanted`] and the
@@ -150,6 +178,12 @@ pub(crate) fn place_in(device: &ID3D12Device, start: u64, len: u64) -> Result<Pl
     let i = match regions.iter().position(|r| r.start <= at && end <= r.end) {
         Some(i) => i,
         None => {
+            if end > LOW {
+                let alive: u64 = regions.iter().map(|r| r.end - r.start).sum();
+                if alive + (end - at) > all_most() {
+                    return Err((3, format!("over VICTORY_PORT_ALL_MB ({} MB in place)", alive >> 20)));
+                }
+            }
             let region = open_region(device, at, end)?;
             regions.push(region);
             let n = regions.len() - 1;
@@ -176,7 +210,7 @@ fn open_region(device: &ID3D12Device, at: u64, end: u64) -> Result<Region, (usiz
     // The whole stretch, kept to what may be ported: the next buffer in it
     // finds the region made.
     let (mut first, mut bytes, mut offset) = (first as u64, bytes as u64, offset);
-    if first < LOW && first + bytes > LOW {
+    if !all() && first < LOW && first + bytes > LOW {
         bytes = LOW.saturating_sub(first);
     }
     if bytes > MOST {
@@ -286,13 +320,13 @@ pub(crate) fn copied(dst: usize, src: usize, len: usize) {
 /// For the frame-rate line: what is in place, and what of ours read or
 /// wrote it on the CPU per frame.
 pub(crate) fn log(frames: f64) {
-    if !on() {
+    if !on() && !all() {
         return;
     }
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     let per: Vec<f64> = STATS[9..].iter().map(|s| s.swap(0, Ordering::Relaxed) as f64 / frames).collect();
     tracing::info!(
-        "renderer port 1 (VICTORY_PORT_CONSTANTS=1): {} regions of the title's graphics memory in place ({} MB), {} title buffers and windows placed in them \
+        "renderer port 1 (VICTORY_PORT_CONSTANTS=1, VICTORY_PORT_ALL=1: all view memory): {} regions of the title's memory in place ({} MB), {} title buffers and windows placed in them \
          (no host copy, nothing sent up or fetched back for them); per frame on the CPU: {:.0} fills read out of them ({:.1} KB), {:.1} buffer copies \
          touching them ({:.1} KB); since the start refused: {} not one stretch of a section, {} not committed, {} by the host, {} no buffer; {} regions \
          forgotten (other pages mapped there)",

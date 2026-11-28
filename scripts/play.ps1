@@ -80,6 +80,9 @@ $settings.VICTORY_WINDOWS_BAR_MB = '3584'
 # Windows of title memory in the title's private memory read in place (crate::inplace stage 1): no host copy, nothing
 # to bring up to date; windows over its page pool (views of a reserved section) are copied as before.
 $settings.VICTORY_INPLACE = '1'
+# All the title's view memory (its page pool) read in place through views of ours (renderer port 1's way, beyond its
+# 32-bit heap): no host copies to keep, bring up to date, send or fetch back. -More @{VICTORY_PORT_ALL='0'}: as before.
+$settings.VICTORY_PORT_ALL = '1'
 if ($RenderScale -ne '') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 if ($Sharpen -ne '') { $settings.VICTORY_SHARPEN = $Sharpen }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }
