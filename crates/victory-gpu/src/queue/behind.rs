@@ -759,7 +759,52 @@ pub(super) fn map_unless_read(ranges: &[(usize, usize)], mapping: impl FnOnce())
     LANE.unless(|job| job.reaches(ranges), mapping)
 }
 
+/// As [`map_unless_read`], but what in the line reaches `ranges` only by
+/// textures' detiling does not hold the mapping back: those textures are
+/// detiled now, from the memory as it is before the mapping, and the
+/// mapping is done. Anything else that reaches there still makes the
+/// caller drain the line. `Some(textures detiled)` if `mapping` was done.
+pub(super) fn map_unless_read_but_textures(ranges: &[(usize, usize)], mapping: impl FnOnce()) -> Option<usize> {
+    if OURS.get() {
+        return None;
+    }
+    let found: std::cell::RefCell<Vec<std::sync::Arc<crate::texture::Staging>>> = std::cell::RefCell::new(Vec::new());
+    let mut detiled = 0;
+    let done = LANE.unless(
+        |job| job.reaches_but_textures(ranges, &mut found.borrow_mut()),
+        || {
+            let mut textures = std::mem::take(&mut *found.borrow_mut());
+            textures.sort_by_key(|s| std::sync::Arc::as_ptr(s) as usize);
+            textures.dedup_by_key(|s| std::sync::Arc::as_ptr(s) as usize);
+            for staging in &textures {
+                staging.refresh();
+            }
+            detiled = textures.len();
+            mapping();
+        },
+    );
+    done.then_some(detiled)
+}
+
 impl Job {
+    /// Whether preparing it reaches title memory in `ranges` by anything but
+    /// textures' detiling; the staging buffers of those it reaches go to
+    /// `out` ([`crate::host::lists_reach_textures`]). Lists not translated
+    /// yet count as yes.
+    fn reaches_but_textures(&self, ranges: &[(usize, usize)], out: &mut Vec<std::sync::Arc<crate::texture::Staging>>) -> bool {
+        match self {
+            Job::Run(_, lists, order, _) | Job::Joined(_, lists, order, _, _, _) => {
+                crate::host::lists_reach_textures(order.iter().map(|&i| lists[i].host()), ranges, out).is_none()
+            }
+            Job::Lists(_, recordings, _) => {
+                let hosts: Option<Vec<&crate::host::HostList>> =
+                    recordings.iter().map(|r| crate::list::host_list(r.back())).collect();
+                hosts.is_none_or(|hosts| crate::host::lists_reach_textures(hosts.into_iter(), ranges, out).is_none())
+            }
+            Job::Wait(..) | Job::Value(..) | Job::Signal(..) | Job::Map(..) | Job::Present(..) => false,
+        }
+    }
+
     /// Whether preparing it may read or write title memory in `ranges`
     /// ([`crate::host::lists_reach`]); lists not translated yet count as yes.
     fn reaches(&self, ranges: &[(usize, usize)]) -> bool {

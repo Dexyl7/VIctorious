@@ -1221,14 +1221,34 @@ extern "system" fn copy_page_mappings(
             let mut ranges: Vec<(usize, usize)> = Vec::new();
             crate::host::join_ranges_pub(&mut ranges, gathered.iter().map(|&(to, _, len)| (to as usize, (to + len) as usize)));
             let mut pending = Some((gathered, ok));
-            let done = behind::map_unless_read(&ranges, || {
-                if let Some((gathered, ok)) = pending.take() {
-                    apply(gathered, ok);
+            if map_textures() {
+                let done = behind::map_unless_read_but_textures(&ranges, || {
+                    if let Some((gathered, ok)) = pending.take() {
+                        apply(gathered, ok);
+                    }
+                });
+                match done {
+                    Some(0) => {
+                        MAP_PRECISE.fetch_add(1, Ordering::Relaxed);
+                        return S_OK;
+                    }
+                    Some(n) => {
+                        MAP_TEXTURES.fetch_add(1, Ordering::Relaxed);
+                        MAP_TEXTURES_DETILED.fetch_add(n as u64, Ordering::Relaxed);
+                        return S_OK;
+                    }
+                    None => {}
                 }
-            });
-            if done {
-                MAP_PRECISE.fetch_add(1, Ordering::Relaxed);
-                return S_OK;
+            } else {
+                let done = behind::map_unless_read(&ranges, || {
+                    if let Some((gathered, ok)) = pending.take() {
+                        apply(gathered, ok);
+                    }
+                });
+                if done {
+                    MAP_PRECISE.fetch_add(1, Ordering::Relaxed);
+                    return S_OK;
+                }
             }
             let Some((back, ok_back)) = pending.take() else {
                 return S_OK;
@@ -1275,6 +1295,23 @@ fn map_precise() -> bool {
 /// Page mappings done without draining: nothing in the line reached them
 /// ([`map_precise`]).
 pub(crate) static MAP_PRECISE: AtomicU64 = AtomicU64::new(0);
+
+/// With [`map_precise`]: a page mapping that only textures in the line read
+/// there (their detiling when prepared) does not wait for the line: those
+/// textures are detiled now, from the memory before the mapping, and the
+/// mapping is done (`VICTORY_MAP_TEXTURES`, on unless `0`). On Series X the
+/// drains came back at 0.3-0.7 a frame, the title's streaming thread standing
+/// in them, and cars vanished again as they came close (2026-11-28); the
+/// worst a texture can show is its new contents a frame early.
+fn map_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_TEXTURES").is_none_or(|v| v != "0"))
+}
+
+/// Mappings done at once after detiling textures ([`map_textures`]), and the
+/// textures detiled for them.
+pub(crate) static MAP_TEXTURES: AtomicU64 = AtomicU64::new(0);
+pub(crate) static MAP_TEXTURES_DETILED: AtomicU64 = AtomicU64::new(0);
 
 /// Whether a page-mapping call that only maps pages where nothing is mapped
 /// goes ahead without draining the line first (`VICTORY_MAP_FRESH=1`; off

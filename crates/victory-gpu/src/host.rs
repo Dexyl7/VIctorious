@@ -2848,6 +2848,43 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
     ranges.get(at).is_some_and(|r| r.0 < to)
 }
 
+/// Whether preparing `lists` reaches title memory in `ranges` only by
+/// textures' detiling (`Step::Texture`): `None` if a step of another kind
+/// reaches it (or work of unknown reach), else the staging buffers that do
+/// (pushed to `out`). For [`crate::queue`]'s `VICTORY_MAP_TEXTURES`.
+pub(crate) fn lists_reach_textures<'a>(
+    lists: impl Iterator<Item = &'a HostList>,
+    ranges: &[(usize, usize)],
+    out: &mut Vec<std::sync::Arc<crate::texture::Staging>>,
+) -> Option<()> {
+    if ranges.is_empty() {
+        return Some(());
+    }
+    for list in lists {
+        for step in &list.deferred().copies {
+            let other = match step {
+                &Step::Copy(dst, src, len) => touches(ranges, src, src + len) || touches(ranges, dst, dst + len),
+                &Step::Fill(_, src, len, _) => touches(ranges, src, src + len),
+                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => touches(ranges, *at, *at + *len),
+                Step::Texture(staging) => {
+                    let (at, len) = staging.memory();
+                    if touches(ranges, at, at + len) {
+                        out.push(staging.clone());
+                    }
+                    false
+                }
+                Step::Host(_, (from, to)) => touches(ranges, *from, *to),
+                Step::Placed(p) => touches(ranges, p.src, p.src + p.len) || touches(ranges, p.dst, p.dst + p.len),
+                Step::Run(_) => true,
+            };
+            if other {
+                return None;
+            }
+        }
+    }
+    Some(())
+}
+
 /// Whether preparing `lists` may read or write title memory in `ranges`
 /// (in order, joined), by their steps: what a page mapping there would
 /// change under them if it went first (`crate::queue`'s
@@ -3832,9 +3869,11 @@ fn late_line(frames: f64) {
         let in_line = crate::queue::MAP_IN_LINE.swap(0, Ordering::Relaxed) as f64 / frames;
         let fresh = crate::queue::MAP_FRESH.swap(0, Ordering::Relaxed) as f64 / frames;
         let precise = crate::queue::MAP_PRECISE.swap(0, Ordering::Relaxed) as f64 / frames;
-        if crate::list::thin::wanted() || drains > 0.0 || in_line > 0.0 || fresh > 0.0 || precise > 0.0 {
+        let textures = crate::queue::MAP_TEXTURES.swap(0, Ordering::Relaxed) as f64 / frames;
+        let detiled = crate::queue::MAP_TEXTURES_DETILED.swap(0, Ordering::Relaxed) as f64 / frames;
+        if crate::list::thin::wanted() || drains > 0.0 || in_line > 0.0 || fresh > 0.0 || precise > 0.0 || textures > 0.0 {
             tracing::info!(
-                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}, mapped where nothing was without waiting (VICTORY_MAP_FRESH): {fresh:.2}, mapped at once as nothing in the line reached them (VICTORY_MAP_PRECISE): {precise:.2}; list calls written down (VICTORY_THIN): {}",
+                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}, mapped where nothing was without waiting (VICTORY_MAP_FRESH): {fresh:.2}, mapped at once as nothing in the line reached them (VICTORY_MAP_PRECISE): {precise:.2}, mapped at once after detiling the textures in the line that read there (VICTORY_MAP_TEXTURES): {textures:.2} ({detiled:.1} textures); list calls written down (VICTORY_THIN): {}",
                 crate::list::thin::wanted()
             );
         }
