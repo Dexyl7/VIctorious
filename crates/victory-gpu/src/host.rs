@@ -2856,6 +2856,18 @@ fn touches(ranges: &[(usize, usize)], from: usize, to: usize) -> bool {
 /// [8] a texture's detiling (where textures do not let it go first).
 pub(crate) static MAP_HELD_BY: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
+/// Whether a buffer read in place (`crate::inplace`: no host copy, the card
+/// reads the title's own bytes) does not hold page mappings back
+/// (`VICTORY_MAP_IN_PLACE=0`: it does, as before). Its refresh copies
+/// nothing on the CPU, whenever it is prepared, so waiting for it orders
+/// nothing: the card reads when it runs either way. Most mappings that
+/// waited were held by such refreshes (0.5-0.7 a frame of 0.6-0.8, run of
+/// 2026-11-29 on Series S).
+fn map_past_in_place() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_IN_PLACE").is_none_or(|v| v != "0"))
+}
+
 /// [`MAP_HELD_BY`]'s place for a step.
 fn held_by(step: &Step) -> usize {
     match step {
@@ -2887,7 +2899,9 @@ pub(crate) fn lists_reach_textures<'a>(
             let other = match step {
                 &Step::Copy(dst, src, len) => touches(ranges, src, src + len) || touches(ranges, dst, dst + len),
                 &Step::Fill(_, src, len, _) => touches(ranges, src, src + len),
-                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => touches(ranges, *at, *at + *len),
+                Step::Refresh(shadow, at, len) | Step::GpuWrite(shadow, at, len) => {
+                    !(map_past_in_place() && shadow.in_place()) && touches(ranges, *at, *at + *len)
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     if touches(ranges, at, at + len) {
@@ -2921,7 +2935,9 @@ pub(crate) fn lists_reach<'a>(lists: impl Iterator<Item = &'a HostList>, ranges:
             let hit = match step {
                 &Step::Copy(dst, src, len) => touches(ranges, src, src + len) || touches(ranges, dst, dst + len),
                 &Step::Fill(_, src, len, _) => touches(ranges, src, src + len),
-                Step::Refresh(_, at, len) | Step::GpuWrite(_, at, len) => touches(ranges, *at, *at + *len),
+                Step::Refresh(shadow, at, len) | Step::GpuWrite(shadow, at, len) => {
+                    !(map_past_in_place() && shadow.in_place()) && touches(ranges, *at, *at + *len)
+                }
                 Step::Texture(staging) => {
                     let (at, len) = staging.memory();
                     touches(ranges, at, at + len)
