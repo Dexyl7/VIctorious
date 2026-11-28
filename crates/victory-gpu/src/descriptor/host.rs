@@ -5300,7 +5300,9 @@ mod tests {
             // SAFETY: a live buffer.
             unsafe { made.GetDesc() }.Width
         };
-        for (off, raw, len) in [(8, true, 128u64), (8, false, 4 * 456)] {
+        // Window bases are page-aligned. At +12 the structured view can
+        // never land on a 456-byte element (456 is a multiple of 8).
+        for (off, raw, len) in [(8, true, 128u64), (12, false, 4 * 456)] {
             let v = view(start + off, raw);
             assert_eq!(width(&v), len.next_multiple_of(256));
             let (copy, address, bytes) = buffer_copy(&v).unwrap();
@@ -5315,23 +5317,43 @@ mod tests {
         }
     }
 
-    /// The queue of textures picked by index serves the slots looked at
-    /// before first, then the newest write and the oldest in turns; a
-    /// slot whose memory is not there is looked at again after
-    /// 1, 2, 4 frames up to the limit; and what the pass reports about a
-    /// slot written again meanwhile is dropped.
+    /// Fresh, partial, unmapped and already uploaded slots compete for a
+    /// limited budget. Both queue orders must return the right prefix.
     #[test]
-    fn the_texture_queue_serves_the_newest_writes_first() {
+    fn the_texture_queue_orders_due_slots() {
+        let mut q = TextureQueue::default();
+        for index in 10..17 {
+            q.written(index, 1, 0, false);
+        }
+        for (index, write) in q.due(1, 7) {
+            match index {
+                14 => q.later(index, write, 1, 4),
+                15 => q.partly(index, write, 2, 4096),
+                16 => q.recheck(index, write, 2, (0x1000, 8192), 1, 1, 1),
+                _ => {}
+            }
+        }
+        let expected = if texture_order() {
+            [13, 12, 11, 10, 15, 14, 16]
+        } else {
+            [16, 15, 14, 13, 10, 12, 11]
+        };
+        for max in 1..=expected.len() {
+            let indices: Vec<_> = q.due(2, max).into_iter().map(|(index, _)| index).collect();
+            assert_eq!(indices, expected[..max]);
+        }
+    }
+
+    /// Retry unmapped slots after 1, 2, 4 frames up to the limit, and
+    /// discard results for a slot that was written again meanwhile.
+    #[test]
+    fn the_texture_queue_retries_only_current_writes() {
         let mut q = TextureQueue::default();
         // Slots 10..18 written in frames 1..9, slot 5 last.
         for i in 0..8u32 {
             q.written(10 + i, u64::from(i) + 1, 0, false);
         }
         q.written(5, 9, 0, false);
-        let order: Vec<u32> = q.due(9, 100).into_iter().map(|d| d.0).collect();
-        // newest, oldest, newest, oldest, and so on
-        assert_eq!(order, [5, 10, 17, 11, 16, 12, 15, 13, 14]);
-        assert_eq!(q.due(9, 2).len(), 2);
         assert_eq!(q.census(9), [9, 9, 0, 0, 8]);
         // Slot 17's memory is not mapped: again next frame, then in 2, 4, 4.
         let write = |q: &TextureQueue, index: u32| q.due(u64::MAX, 100).iter().find(|d| d.0 == index).unwrap().1;
@@ -5341,8 +5363,7 @@ mod tests {
             q.later(17, w17, frame, 4);
             assert!(!q.due(frame + wait - 1, 100).iter().any(|d| d.0 == 17));
             frame += wait;
-            // Due again, and ahead of every slot never looked at.
-            assert_eq!(q.due(frame, 100)[0].0, 17);
+            assert!(q.due(frame, 100).contains(&(17, w17)));
         }
         assert_eq!(q.census(9)[2], 1);
         q.done(17, w17);
@@ -5351,7 +5372,7 @@ mod tests {
         let w16 = write(&q, 16);
         q.partly(16, w16, 12, 4096);
         assert_eq!(q.mapped(16), 4096);
-        assert_eq!(q.due(12, 100)[0].0, 16);
+        assert!(q.due(12, 100).contains(&(16, w16)));
         // The title writes slot 16 again while the pass works on it: what
         // the pass then says about the old write changes nothing.
         q.written(16, 13, 0, false);
