@@ -217,6 +217,18 @@ In short; the reasons and the measurements are in [docs/findings.md](docs/findin
   (`VICTORY_HOSTED_WALK=0`: all, as before): over a 43-minute run the title had more than 500,000
   textures alive, and walking all of them each second under the lock the title needs to make and free
   textures grew to 313 ms at a time while the frame went from about 35 to about 88 ms.
+- Tried and left off: page mappings in the line (`VICTORY_MAP_IN_LINE=1` turns it on; A/B-able). The
+  title's page-mapping calls became a job in their queue's order, done by the submitting thread, instead
+  of the title's streaming thread waiting for every submission before them (`VICTORY_MAP_DRAIN`; that
+  thread stood ~58 % of its sampled time in that wait in a profile while driving). In an A/B drive
+  (2026-11-28) frames were worse with it (means 50-58 ms against 38-43 ms off) and textures no faster.
+  Turning the drain off instead was no faster either and was followed by a device removal.
+- Read-back buffers for textures the title reads back are kept after their texels land and handed
+  out again by size (`VICTORY_READBACK_POOL=0`: made each time, as before): making one at every
+  list's close took 3-5 % of the translating threads' time in a profile while driving.
+- `VICTORY_TABLE_REUSE_COUNT=1` counts how many descriptor tables a list makes that an earlier list
+  made with the same records (nothing changes): building tables took ~47 % of the translating threads'
+  time in that profile, every list making each of its tables anew.
 - The sampling profiler (`VICTORY_PROFILE`) stops a thread's stack walk where a function's frame
   register does not point into that thread's stack: a sample of a title thread taken mid-function
   read through a garbage frame pointer and ended the process.

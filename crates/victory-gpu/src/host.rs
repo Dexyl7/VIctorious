@@ -3767,9 +3767,10 @@ fn late_line(frames: f64) {
     crate::shadow::found_line(frames);
     {
         let drains = crate::queue::MAP_DRAINS.swap(0, Ordering::Relaxed) as f64 / frames;
-        if crate::list::thin::wanted() || drains > 0.0 {
+        let in_line = crate::queue::MAP_IN_LINE.swap(0, Ordering::Relaxed) as f64 / frames;
+        if crate::list::thin::wanted() || drains > 0.0 || in_line > 0.0 {
             tracing::info!(
-                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}; list calls written down (VICTORY_THIN): {}",
+                "page mappings per frame that waited for the line of submissions first (VICTORY_MAP_DRAIN): {drains:.2}, put in the line instead (VICTORY_MAP_IN_LINE): {in_line:.2}; list calls written down (VICTORY_THIN): {}",
                 crate::list::thin::wanted()
             );
         }

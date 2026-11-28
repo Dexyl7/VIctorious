@@ -140,6 +140,57 @@ impl Back {
     }
 }
 
+/// Read-back buffers whose texels have landed, kept by size class (powers
+/// of two from 64 KiB) for the next read-back, up to [`POOL_MOST`] bytes:
+/// each was made new when a list closed and let go once it landed, and the
+/// making took 3-5 % of the translating threads' time while driving (a
+/// profile of 2026-11-28: `CreateCommittedResource` in `record`, from
+/// `HostList::close`). One is handed out again only when nothing else holds
+/// it. `VICTORY_READBACK_POOL=0`: made each time, as before.
+struct Pool(Vec<(u64, ID3D12Resource)>, u64);
+// SAFETY: D3D12 resources are free-threaded.
+unsafe impl Send for Pool {}
+static POOL: Mutex<Pool> = Mutex::new(Pool(Vec::new(), 0));
+const POOL_MOST: u64 = 128 << 20;
+/// Since the start: read-back buffers taken from the pool, made new.
+static POOLED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+fn pool_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_READBACK_POOL").is_none_or(|v| v != "0"))
+}
+
+fn pool_class(size: u64) -> u64 {
+    size.max(64 << 10).next_power_of_two()
+}
+
+fn pool_take(class: u64) -> Option<ID3D12Resource> {
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let at = pool.0.iter().position(|(c, b)| *c == class && crate::host::references(b) == 1)?;
+    let (_, buffer) = pool.0.swap_remove(at);
+    pool.1 -= class;
+    Some(buffer)
+}
+
+/// After its texels landed: the list that wrote it has run.
+fn pool_keep(buffer: &ID3D12Resource) {
+    // SAFETY: a live buffer of ours.
+    let class = unsafe { buffer.GetDesc() }.Width;
+    if !pool_on() || class != pool_class(class) {
+        return;
+    }
+    let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
+    // The oldest go first when it is full (released when the last holder lets go).
+    while pool.1 + class > POOL_MOST && !pool.0.is_empty() {
+        let (c, _) = pool.0.remove(0);
+        pool.1 -= c;
+    }
+    if pool.1 + class <= POOL_MOST {
+        pool.0.push((class, buffer.clone()));
+        pool.1 += class;
+    }
+}
+
 /// Records a host copy from a texture already in COPY_SOURCE.
 pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option<Back> {
     if !target.ticket.valid.load(Ordering::Acquire) {
@@ -177,7 +228,21 @@ pub(crate) fn record(list: &ID3D12GraphicsCommandList, target: Target) -> Option
             .checked_mul(u64::from(format.Depth))?;
         total = total.max(footprint.Offset.checked_add(pitched)?);
     }
-    let buffer = host.read_back_buffer(total)?;
+    let buffer = if pool_on() {
+        let class = pool_class(total);
+        match pool_take(class) {
+            Some(buffer) => {
+                POOLED[0].fetch_add(1, Ordering::Relaxed);
+                buffer
+            }
+            None => {
+                POOLED[1].fetch_add(1, Ordering::Relaxed);
+                host.read_back_buffer(class)?
+            }
+        }
+    } else {
+        host.read_back_buffer(total)?
+    };
     for (i, footprint) in footprints.iter().enumerate() {
         let to = D3D12_TEXTURE_COPY_LOCATION {
             // SAFETY: a borrowed pointer the location never releases.
@@ -241,10 +306,17 @@ pub(crate) fn land(back: &Back) {
     }
     // SAFETY: mapped above.
     unsafe { back.buffer.Unmap(0, None) };
+    pool_keep(&back.buffer);
     crate::host::copy_mapped(at as *mut u8, tiled.as_ptr(), size, true);
     let copied = COPIED.fetch_add(1, Ordering::Relaxed) + 1;
     if copied == 1 || copied.is_multiple_of(128) {
-        tracing::info!(copied, bytes = size, "texture readback landed");
+        tracing::info!(
+            copied,
+            bytes = size,
+            pooled = POOLED[0].load(Ordering::Relaxed),
+            made = POOLED[1].load(Ordering::Relaxed),
+            "texture readback landed (read-back buffers from the pool and made, VICTORY_READBACK_POOL)"
+        );
     }
 }
 

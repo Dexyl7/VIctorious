@@ -3503,6 +3503,7 @@ impl State {
                 made.push((slot, u32::MAX));
                 continue;
             };
+            table_reuse_count(key, n);
             self.fresh_tables.insert(key, FreshTable { first, epoch: 0, ready: Vec::new() });
             self.dynamic
                 .push((std::ptr::from_ref(heap) as usize, first, n));
@@ -4339,6 +4340,56 @@ impl<T, const N: usize> std::ops::DerefMut for Few<T, N> {
 }
 
 /// A table made afresh in dynamic slots, in a list ([`State::tables`]).
+/// How often a table a list makes was made, with the same records, by an
+/// earlier list in the last 120 frames, and its slots
+/// (`VICTORY_TABLE_REUSE_COUNT=1`; counting only, nothing changes): what
+/// keeping made tables across lists would save, before it is built. A line
+/// every 5 s.
+fn table_reuse_count(key: (u64, u32, u64), n: u32) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_REUSE_COUNT").is_some_and(|v| v == "1")) {
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    type Shard = std::sync::Mutex<std::collections::HashMap<u64, u64>>;
+    static SHARDS: std::sync::OnceLock<[Shard; 16]> = std::sync::OnceLock::new();
+    // Tables made, of them made before; their slots likewise.
+    static COUNTS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+    static LINE: AtomicU64 = AtomicU64::new(0);
+    let frame = crate::frame::current();
+    // At the same place in the heap, and anywhere (the title writes a
+    // draw's table into a ring: the same records at another place each frame).
+    let shards = SHARDS.get_or_init(|| std::array::from_fn(|_| Default::default()));
+    let seen = |h: u64| {
+        let mut map = shards[(h >> 60) as usize].lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 200_000 {
+            map.retain(|_, at| *at + 120 >= frame);
+        }
+        map.insert(h, frame).is_some_and(|at| at + 120 >= frame)
+    };
+    let here = seen(key.0.rotate_left(17) ^ u64::from(key.1).rotate_left(41) ^ key.2);
+    let anywhere = seen((u64::from(key.1).rotate_left(41) ^ key.2).rotate_left(7) ^ 0x9e37_79b9_7f4a_7c15);
+    COUNTS[0].fetch_add(1, Relaxed);
+    COUNTS[2].fetch_add(u64::from(n), Relaxed);
+    if here {
+        COUNTS[1].fetch_add(1, Relaxed);
+        COUNTS[3].fetch_add(u64::from(n), Relaxed);
+    }
+    if anywhere {
+        COUNTS[4].fetch_add(1, Relaxed);
+        COUNTS[5].fetch_add(u64::from(n), Relaxed);
+    }
+    let now = crate::host::now_ms();
+    let last = LINE.load(Relaxed);
+    if now >= last + 5_000 && LINE.compare_exchange(last, now, Relaxed, Relaxed).is_ok() {
+        let [made, again, slots, slots_again, anywhere, slots_anywhere] = COUNTS.each_ref().map(|c| c.swap(0, Relaxed));
+        tracing::info!(
+            "tables made by lists in the last {:.1} s (VICTORY_TABLE_REUSE_COUNT): {made}, {again} of them made with the same records at the same place by an earlier list in the last 120 frames, {anywhere} with the same records anywhere; their slots {slots}, {slots_again}, {slots_anywhere}",
+            (now - last.max(now.saturating_sub(5_000))) as f64 / 1e3
+        );
+    }
+}
+
 struct FreshTable {
     first: u32,
     /// The list's epoch ([`HostList::epoch`]) at which all its entries that

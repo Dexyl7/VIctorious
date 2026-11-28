@@ -391,6 +391,9 @@ enum Job {
     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
     /// A signal of the queue's.
     Signal(usize, u64),
+    /// The queue's page mappings (`super::copy_page_mappings`), done when the
+    /// line gets there.
+    Map(Box<dyn FnOnce() + Send>),
     /// A frame is shown: the texture and the state its lists leave it in,
     /// and the plane laid over it (`crate::compose`) the same way.
     Present(Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, Option<(std::sync::Arc<crate::resource::HostTexture>, u32)>, super::Shown),
@@ -492,7 +495,7 @@ impl Work for Job {
                     return Err(next);
                 }
             }
-            Job::Joined(..) | Job::Present(..) | Job::Lists(..) => return Err(next),
+            Job::Joined(..) | Job::Present(..) | Job::Lists(..) | Job::Map(..) => return Err(next),
         }
         let taken = std::mem::replace(self, Job::Wait(0, 0));
         let (queue, mut lists, mut order, mut parts, mut signals) = match taken {
@@ -525,6 +528,7 @@ impl Work for Job {
             Job::Joined(..) => "the line: submissions joined",
             Job::Present(..) => "the line: a present",
             Job::Signal(..) => "the line: a signal",
+            Job::Map(..) => "the line: page mappings",
             _ => "the line: a wait that is met",
         });
         if forced {
@@ -570,6 +574,7 @@ impl Work for Job {
                     crate::fence::set(fence as This, value);
                 }
             }
+            Job::Map(mapping) => mapping(),
             Job::Present(texture, over, shown) => {
                 if let Some((texture, state)) = texture {
                     // (Where its lists were not translated when the title
@@ -704,6 +709,27 @@ pub(super) fn queued() -> u64 {
 /// Something a queue may stand at moved.
 pub(super) fn wake() {
     LANE.wake();
+}
+
+/// Whether this is our thread, the one that does the line's work.
+pub(super) fn ours() -> bool {
+    OURS.get()
+}
+
+/// Page mappings of queue `this`: after what is in the line of it, or now
+/// if nothing of its is (with nothing of the queue's able to come in
+/// between).
+pub(super) fn map(this: This, mapping: Box<dyn FnOnce() + Send>) {
+    // One of the two runs it: the job when the line gets there, or `now`.
+    let once = std::sync::Arc::new(std::sync::Mutex::new(Some(mapping)));
+    let run = |once: &std::sync::Mutex<Option<Box<dyn FnOnce() + Send>>>| {
+        let taken = once.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(mapping) = taken {
+            mapping();
+        }
+    };
+    let later = once.clone();
+    LANE.push_behind(this as usize, false, Job::Map(Box::new(move || run(&later))), || run(&once));
 }
 
 /// This thread does work the line waits for.

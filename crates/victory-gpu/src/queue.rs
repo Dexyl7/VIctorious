@@ -1105,7 +1105,7 @@ const PAGE: u64 = 64 << 10;
 /// line is drained first (`VICTORY_MAP_DRAIN=0`: not; A/B-able): suspected
 /// of THIN's single frames of stretched geometry.
 extern "system" fn copy_page_mappings(
-    _: This,
+    this: This,
     count: u32,
     batches: *const PageBatch,
     pool: u64,
@@ -1119,25 +1119,13 @@ extern "system" fn copy_page_mappings(
         return E_INVALIDARG;
     }
     let _called = crate::timeline::span("the title's CopyPageMappings");
-    #[cfg(windows)]
-    if crate::toggled!("VICTORY_MAP_DRAIN") {
-        before_sync();
-        MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
-    }
     let batches = (count > 0).then(|| {
         // SAFETY: the title passes `count` batches.
         unsafe { std::slice::from_raw_parts(batches, count as usize) }
     });
+    // What goes where: (to, from, bytes); from 0 unmaps.
     let mut ok = true;
-    let many = crate::resource::many_page_mapper();
     let mut gathered: Vec<(u64, u64, u64)> = Vec::new();
-    let mut map = |to: u64, from: u64, len: u64| match many {
-        Some(_) => {
-            gathered.push((to, from, len));
-            true
-        }
-        None => map(to, from, len),
-    };
     for b in batches.into_iter().flatten() {
         if b.ranges.is_null() {
             continue;
@@ -1149,25 +1137,74 @@ extern "system" fn copy_page_mappings(
             let len = u64::from(r.count) * PAGE;
             let inside = |pages: u32| r.start.checked_add(pages).is_some_and(|e| e <= pool_pages);
             let source = pool + u64::from(r.start) * PAGE;
-            ok &= match r.kind {
-                0 if inside(r.count) => map(at, source, len),
-                1 if inside(1) => (0..u64::from(r.count)).all(|k| map(at + k * PAGE, source, PAGE)),
-                2 => map(at, 0, len),
-                3 => true,
-                _ => false,
-            };
+            match r.kind {
+                0 if inside(r.count) => gathered.push((at, source, len)),
+                1 if inside(1) => gathered.extend((0..u64::from(r.count)).map(|k| (at + k * PAGE, source, PAGE))),
+                2 => gathered.push((at, 0, len)),
+                3 => {}
+                _ => ok = false,
+            }
             at += len;
         }
     }
-    if let Some(many) = many {
-        ok &= many(&gathered);
+    let many = crate::resource::many_page_mapper();
+    let apply = move |gathered: Vec<(u64, u64, u64)>, ok: bool| {
+        let ok = match many {
+            Some(many) => many(&gathered) && ok,
+            None => gathered.iter().fold(ok, |ok, &(to, from, len)| map(to, from, len) && ok),
+        };
+        if !ok {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+        }
+    };
+    // In the queue's order, by our thread when it gets there, instead of
+    // the title's streaming thread waiting for the whole line: in a drive the
+    // streaming thread stood ~58 % of its sampled time in that drain
+    // (profile of 2026-11-28), while textures waited for their pages.
+    #[cfg(windows)]
+    if map_in_line() && behind::on() && !behind::ours() {
+        MAP_IN_LINE.fetch_add(1, Ordering::Relaxed);
+        behind::map(this, Box::new(move || apply(gathered, ok)));
+        return S_OK;
     }
-    if !ok {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| tracing::warn!(pool = format_args!("{pool:#x}"), "a page mapping failed"));
+    let _ = this;
+    #[cfg(windows)]
+    if crate::toggled!("VICTORY_MAP_DRAIN") {
+        before_sync();
+        MAP_DRAINS.fetch_add(1, Ordering::Relaxed);
     }
+    apply(gathered, ok);
     S_OK
 }
+
+/// Whether a page-mapping call goes into the line as a job of its queue's,
+/// done by our thread in order, and returns at once
+/// (`VICTORY_MAP_IN_LINE=1`; off by default; A/B-able). The title's
+/// streaming thread then does not wait for every submission before it to be
+/// prepared. Off: the line is drained first ([`copy_page_mappings`]).
+#[cfg(windows)]
+fn map_in_line() -> bool {
+    #[cfg(feature = "diagnostics")]
+    {
+        static BIT: std::sync::OnceLock<Result<bool, u32>> = std::sync::OnceLock::new();
+        match BIT.get_or_init(|| match crate::ab::bit("VICTORY_MAP_IN_LINE") {
+            Some(bit) => Err(bit),
+            None => Ok(std::env::var_os("VICTORY_MAP_IN_LINE").is_some_and(|v| v == "1")),
+        }) {
+            Ok(on) => *on,
+            Err(bit) => crate::ab::on(*bit),
+        }
+    }
+    #[cfg(not(feature = "diagnostics"))]
+    {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("VICTORY_MAP_IN_LINE").is_some_and(|v| v == "1"))
+    }
+}
+
+/// Page mappings put in the line ([`map_in_line`]).
+pub(crate) static MAP_IN_LINE: AtomicU64 = AtomicU64::new(0);
 
 /// Page mappings that drained the line first ([`copy_page_mappings`]).
 pub(crate) static MAP_DRAINS: AtomicU64 = AtomicU64::new(0);
