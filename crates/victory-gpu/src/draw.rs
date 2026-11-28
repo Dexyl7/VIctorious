@@ -96,6 +96,15 @@ impl TableGroup {
         Some(&self.entries[self.by_descriptor[i].1])
     }
 
+    /// Walk the whole snapshot, including holes a shader may address dynamically.
+    fn snapshot_slots(&self, count: u32) -> impl Iterator<Item = (u32, Option<&UsedResource>)> {
+        let mut declared = self.by_descriptor.iter().copied().peekable();
+        (0..count).map(move |slot| {
+            let entry = declared.next_if(|&(k, _)| k == slot).map(|(_, i)| &self.entries[i]);
+            (slot, entry)
+        })
+    }
+
     fn needs_snapshot(&self, heap: &crate::descriptor::Heap, host_count: u32, table: u64) -> bool {
         let index_at = |dword: u32| {
             table
@@ -3550,8 +3559,14 @@ impl State {
             // which may lie over slots shaders pick by index, only the ones
             // the shader names.)
             if let Some(title) = title_first {
-                for k in (0..n).filter(|&k| n <= 64 || group.entry(k).is_some()) {
-                    host.slot_tabled(title + k);
+                if n <= 64 {
+                    for k in 0..n {
+                        host.slot_tabled(title + k);
+                    }
+                } else {
+                    for &(k, _) in &group.by_descriptor {
+                        host.slot_tabled(title + k);
+                    }
                 }
             }
             let list_views = crate::descriptor::host::list_views();
@@ -3565,7 +3580,7 @@ impl State {
             crate::descriptor::host::copies_begin();
             // The whole range: a shader may index past the entries its
             // used-resource list names (descriptor arrays).
-            for k in 0..n {
+            for (k, used) in group.snapshot_slots(n) {
                 let index = first + k;
                 // A view this list has made before: its descriptor copied,
                 // and nothing more if nothing changed in the list since.
@@ -3573,8 +3588,7 @@ impl State {
                     && let Some(words) = crate::descriptor::record_at(table + u64::from(k) * 32)
                     && let Some(mut listed) = host.make_listed(recording, words, index)
                 {
-                    let kind = group
-                        .entry(k)
+                    let kind = used
                         .map(|u| u.kind)
                         .or_else(|| selected.binary_search(&k).ok().and(listed.kind));
                     let was = (listed.ready, listed.tabled);
@@ -3609,7 +3623,6 @@ impl State {
                     }
                     continue;
                 }
-                let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
                         // Renderer port 5: title memory in place is the
@@ -4759,6 +4772,34 @@ fn staging_budget_per_frame(vram_budget: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::staging_budget_per_frame;
+
+    #[test]
+    fn snapshot_slots_preserve_holes_and_the_first_declaration() {
+        use super::{ResourceType, RootType, TablePlan, UsedResource};
+        let resource = |slot: u32, kind| UsedResource {
+            kind,
+            root: RootType::Table,
+            table_offset_dwords: slot * 8,
+            lower_bound: 0,
+            stride: 0,
+            dwords: 8,
+            user_data: 0,
+            slot: 0,
+        };
+        let used = [
+            resource(64, ResourceType::Srv),
+            resource(2, ResourceType::Cbv),
+            resource(64, ResourceType::Uav),
+            resource(0, ResourceType::Uav),
+        ];
+        let plan = TablePlan::new(&used, &[]);
+        let group = &plan.groups[0];
+        for count in [0, 1, 64, 65, 100] {
+            let expected: Vec<_> = (0..count).map(|k| (k, group.entry(k))).collect();
+            assert_eq!(group.snapshot_slots(count).collect::<Vec<_>>(), expected);
+        }
+        assert_eq!(group.entry(64), Some(&used[0]));
+    }
 
     #[test]
     fn staging_budget_scales_with_vram_budget() {
