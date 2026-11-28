@@ -521,6 +521,91 @@ fn window_mapped_most() -> u64 {
 /// Bytes alive of windows in card memory the CPU maps.
 static WINDOW_MAPPED_BYTES: AtomicU64 = AtomicU64::new(0);
 
+/// The buffers of windows let go, kept for the next window of the same size
+/// and kind (in card memory the CPU maps, or the PC's): which, bytes,
+/// buffer, mapping. Windows are made and let go all the time while the alive
+/// ones hold about the same (3.2 GB in a 16-minute Series S run, 8 GB let
+/// go meanwhile, 4 GB of it in the last three minutes), and the driver keeps
+/// the blocks of buffers let go committed: the PC's free memory fell from
+/// 1.8 GB to under 0.2 GB and the run to 12 fps. They went back to the pool
+/// lists' uploads share (512 MB, oldest out first, so windows rarely stayed),
+/// and not at all when a list still held them as they went, nor ever from
+/// card memory. Kept here, the memory windows take is what is alive at most,
+/// not what was ever made.
+struct WindowPool {
+    idle: std::collections::VecDeque<(bool, u64, ID3D12Resource, usize)>,
+    bytes: u64,
+}
+
+// SAFETY: D3D12 resources are free-threaded; the mappings are plain
+// addresses of memory the buffers own.
+unsafe impl Send for WindowPool {}
+
+static WINDOW_POOL: Mutex<WindowPool> = Mutex::new(WindowPool { idle: std::collections::VecDeque::new(), bytes: 0 });
+
+/// Since the start: windows' buffers taken from the pool, put in it, let go
+/// from it (full).
+pub(crate) static WINDOW_POOL_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// The most bytes of idle windows' buffers kept (`VICTORY_WINDOW_POOL_MB`,
+/// 1024 unless set; 0: none, as before).
+fn window_pool_most() -> u64 {
+    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MOST.get_or_init(|| {
+        std::env::var("VICTORY_WINDOW_POOL_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(1024) << 20
+    })
+}
+
+/// An idle window's buffer of `len` bytes of that kind, if one is kept and
+/// nothing holds it any more (a list in the air keeps its reference until its
+/// reset, after the card is done with it).
+fn window_pool_take(mapped: bool, len: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if window_pool_most() == 0 {
+        return None;
+    }
+    let mut pool = WINDOW_POOL.lock().unwrap_or_else(|e| e.into_inner());
+    let at = pool
+        .idle
+        .iter()
+        .position(|(m, l, b, _)| *m == mapped && *l == len && crate::host::references(b) == 1)?;
+    let (_, l, buffer, data) = pool.idle.remove(at)?;
+    pool.bytes -= l;
+    WINDOW_POOL_STATS[0].fetch_add(1, Ordering::Relaxed);
+    Some((buffer, data as *mut u8))
+}
+
+/// Keeps a window's buffer for the next window of its size; false if the
+/// pool takes none (off, or too large for it).
+fn window_pool_put(mapped: bool, len: u64, buffer: &ID3D12Resource, data: usize) -> bool {
+    let most = window_pool_most();
+    if most == 0 || len > most / 4 {
+        return false;
+    }
+    let mut out = Vec::new();
+    {
+        let mut pool = WINDOW_POOL.lock().unwrap_or_else(|e| e.into_inner());
+        pool.idle.push_back((mapped, len, buffer.clone(), data));
+        pool.bytes += len;
+        while pool.bytes > most {
+            let Some((_, l, b, _)) = pool.idle.pop_front() else { break };
+            pool.bytes -= l;
+            out.push(b);
+        }
+    }
+    WINDOW_POOL_STATS[1].fetch_add(1, Ordering::Relaxed);
+    WINDOW_POOL_STATS[2].fetch_add(out.len() as u64, Ordering::Relaxed);
+    // Not freed under the lock, and not before the card is done.
+    for b in out {
+        crate::host::retire_resource(b);
+    }
+    true
+}
+
+/// Idle bytes the window pool holds.
+pub(crate) fn window_pool_bytes() -> u64 {
+    WINDOW_POOL.lock().unwrap_or_else(|e| e.into_inner()).bytes
+}
+
 /// A buffer for a window of `size` bytes in card memory the CPU maps, if it is
 /// to be there ([`window_mapped_most`]).
 fn window_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
@@ -2553,8 +2638,14 @@ static LIVE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::Ato
 
 impl Drop for Shadow {
     fn drop(&mut self) {
-        // Its buffer back to the pool, if nothing else holds it.
-        if self.pooled > 0 && self.card.is_none() && self.place.is_none() {
+        // Its buffer back to a pool: a window's to the windows' (`WINDOW_POOL`),
+        // which keeps it even while a list in the air still holds it.
+        let windows_pool = self.window
+            && self.card.is_none()
+            && self.place.is_none()
+            && (self.mapped || self.pooled > 0)
+            && window_pool_put(self.mapped, if self.mapped { self.len } else { self.pooled }, &self.buffer, self.data as usize);
+        if !windows_pool && self.pooled > 0 && self.card.is_none() && self.place.is_none() {
             crate::host::shared_back(&self.buffer, self.data as usize, self.pooled);
         }
         if self.place.is_some() {
@@ -5471,8 +5562,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    // One buffer in the card's memory, filled by the CPU through the bus.
-    if let Some((buffer, data)) = window_mapped_for(len) {
+    // One buffer in the card's memory, filled by the CPU through the bus
+    // (one a window let go, if one of this size is idle).
+    let reused = (window_mapped_most() > 0)
+        .then(|| window_pool_take(true, len))
+        .flatten()
+        .inspect(|_| {
+            WINDOW_MAPPED_BYTES.fetch_add(len, Ordering::Relaxed);
+        });
+    if let Some((buffer, data)) = reused.or_else(|| window_mapped_for(len)) {
         crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x} mapped on the card"));
         // SAFETY: a live buffer.
         let gpu = unsafe { buffer.GetGPUVirtualAddress() };
@@ -5484,7 +5582,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         map.insert((start, len), shadow.clone());
         return Some(shadow);
     }
-    let (buffer, data) = crate::host::shared_pooled(len)?;
+    let (buffer, data) = window_pool_take(false, len).or_else(|| crate::host::shared_pooled(len))?;
     crate::host::name(&buffer, || format!("title memory {start:#x}+{len:#x}"));
     // With room for windows on the card (`window_card_most`): shaders get a
     // buffer there, and the one just made is the CPU's side.

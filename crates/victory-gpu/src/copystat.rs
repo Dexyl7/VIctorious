@@ -835,6 +835,18 @@ fn log_memory() {
         mb(stagings[1]),
         mb(windows[2]),
     );
+    {
+        use std::sync::atomic::Ordering::Relaxed;
+        let pool = &crate::shadow::WINDOW_POOL_STATS;
+        tracing::info!(
+            "windows' buffers reused (VICTORY_WINDOW_POOL_MB), since the start: {} taken from the pool, {} put in it, \
+             {} let go from it (full); {:.0} MB idle in it now",
+            pool[0].load(Relaxed),
+            pool[1].load(Relaxed),
+            pool[2].load(Relaxed),
+            mb(crate::shadow::window_pool_bytes()),
+        );
+    }
     tracing::info!(
         "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
          left to commit); host copies of title memory: {} alive {:.0} MB, of them {} windows \

@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -572,7 +572,9 @@ impl Player {
         let folder = find(folder)?;
         let began = Instant::now();
         let frame = Frame::read(&folder.join("frame.bin"))?;
+        BREADCRUMBS.store(options.breadcrumbs, Ordering::Relaxed);
         let (device, info) = make_device(&frame, options.debug, options.breadcrumbs)?;
+        gpu::keep_device(&device);
         // SAFETY: plain creation and queries.
         let (queue, frequency) = unsafe {
             let queue: ID3D12CommandQueue =
@@ -747,8 +749,11 @@ impl Player {
                 _ => gpu::to_props(p),
             }
         };
-        // Flags a replay has no use for: sharing, display, not zeroed.
-        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x1000;
+        // Flags a replay has no use for: sharing, display, not zeroed, and
+        // not resident (the runtime makes such memory resident itself, with
+        // `MakeResident`, once mapped; a replay never does, and the card
+        // faults at the first touch).
+        const DROP: i32 = 0x1 | 0x8 | 0x20 | 0x800 | 0x1000;
         let used_by_buffers_only: HashSet<u32> = {
             let mut textures = HashSet::new();
             for r in &self.frame.resources {
@@ -788,7 +793,14 @@ impl Player {
                 let m = moves.entry(format!("{seen:?}")).or_insert((0u32, 0u64));
                 *m = (m.0 + 1, m.1 + r.desc.width);
             }
-            let desc = gpu::to_desc(&r.desc);
+            let mut desc = gpu::to_desc(&r.desc);
+            // Buffers placed in heaps opened from existing memory (`-Ports`,
+            // `inplace::place`) are cross-adapter, as those heaps are shared.
+            // The heaps made here drop the sharing (`DROP`), and a buffer has
+            // no use for the mark without it: D3D12 refuses the pair.
+            if is_buffer {
+                desc.Flags = D3D12_RESOURCE_FLAGS(desc.Flags.0 & !D3D12_RESOURCE_FLAG_ALLOW_CROSS_ADAPTER.0);
+            }
             let mut made: Option<ID3D12Resource> = None;
             let clear: Option<D3D12_CLEAR_VALUE> = r.clear.map(|c| {
                 // SAFETY: 20 bytes that were a clear value.
@@ -843,6 +855,18 @@ impl Player {
             };
             match (result, made) {
                 (Ok(()), Some(res)) => {
+                    // By the capture's id, for device-removed data to name.
+                    if options_breadcrumbs() {
+                        // SAFETY: a live resource.
+                        let _ = unsafe { res.SetName(&windows::core::HSTRING::from(format!("r{}", r.id))) };
+                        let heap = match &r.place {
+                            Place::Placed { heap, .. } => {
+                                self.frame.heaps.iter().find(|h| h.id == *heap).map(|h| format!("{h:?}"))
+                            }
+                            _ => None,
+                        };
+                        gpu::note_resource(r.id, format!("{r:?}; heap {}", heap.unwrap_or_default()));
+                    }
                     // SAFETY: a live resource.
                     let va = if is_buffer {
                         unsafe { res.GetGPUVirtualAddress() }
@@ -3543,4 +3567,11 @@ mod tests {
         };
         assert!(o.edited() && !o.plain().edited() && o.plain().buffers == Buffers::Card);
     }
+}
+
+/// `--breadcrumbs` is on: resources are named for the device-removed data.
+static BREADCRUMBS: AtomicBool = AtomicBool::new(false);
+
+fn options_breadcrumbs() -> bool {
+    BREADCRUMBS.load(Ordering::Relaxed)
 }

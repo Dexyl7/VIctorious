@@ -7,7 +7,7 @@
 //! are in, `edit` the experiments, `gpu` helpers.
 
 mod edit;
-mod gpu;
+pub mod gpu;
 mod hook;
 pub mod play;
 mod pso;

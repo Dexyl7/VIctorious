@@ -49,6 +49,8 @@ $settings = @{
     # Page mappings drain the line only if a submission in it reaches the memory mapped: cars no longer
     # vanish on coming close (their full models came too late), 2026-11-28.
     VICTORY_MAP_PRECISE = '1'
+    # The ambient stand-in's reflection and glare patches (2026-11-28) are left off: never confirmed in play.
+    VICTORY_AMBIENT_SPECULAR = '0'; VICTORY_AMBIENT_OTHER = '0'
 }
 if ($Safe) {
     $settings.VICTORY_UNDER_WIDE = '0'; $settings.VICTORY_LAND_ECHO = '0'
@@ -68,6 +70,11 @@ if ($Console -eq 'series-s') {
     # left 2-3 GB of the card unused while city roads and buildings waited black for room).
     $settings.VICTORY_OWN_UPSCALER = '1'; $settings.VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1536'; $settings.VICTORY_TEXTURE_ROOM_PERCENT = '94'
 }
+# Windows of title memory (host copies shaders read, about 3 GB) in the card's memory, written by the CPU
+# through the resizable BAR (Smart Access Memory) instead of kept in the PC's memory: the PC had 1.8 GB free
+# a minute in and under 0.2 GB at 16 minutes (12 fps, audio lagging) while the card had 7 GB unused. Only while
+# a fifth of the card's budget is free, so textures keep their room; without BAR support nothing changes.
+$settings.VICTORY_WINDOWS_BAR_MB = '3584'
 if ($RenderScale -ne '') { $settings.VICTORY_RENDER_SCALE = $RenderScale }
 if ($Sharpen -ne '') { $settings.VICTORY_SHARPEN = $Sharpen }
 if ($RayTracing) { $settings.VICTORY_BVH_BUILDER = '1' }

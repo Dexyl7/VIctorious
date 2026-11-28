@@ -2907,7 +2907,7 @@ impl State {
     /// The stand-in for the indirect light after a dispatch of `p`
     /// (`crate::ambient`). Whether it recorded anything.
     fn ambient(&self, list: &HostList, p: &HostPipeline, role: crate::ambient::Role) -> bool {
-        use crate::ambient::{AIR, DEPTH, LIGHT, RADIANCE, Role, Views};
+        use crate::ambient::{AIR, DEPTH, LIGHT, OTHER, OTHER_TOO, RADIANCE, Role, SPEC, SPEC_RAW, SPEC_TOO, Views};
         let Some(t) = p.stages.first().map(|s| s.translated()) else {
             return false;
         };
@@ -2935,29 +2935,65 @@ impl State {
             let desc = unsafe { host.GetDesc() };
             Some((desc, heap.gpu_handle((start + offset * 4) / 32)))
         };
-        let at = match role {
-            Role::Resolve => LIGHT,
-            Role::Radiance => RADIANCE,
-            Role::Air => AIR,
+        let image = match role {
+            Role::Resolve => entry(ResourceType::Uav, LIGHT),
+            Role::Radiance => entry(ResourceType::Uav, RADIANCE),
+            Role::Air => entry(ResourceType::Uav, AIR),
+            // Known by its hash, not its tables: the image of the picture's
+            // size it writes, R11G11B10 or packed (no other of its images is).
+            Role::Reflect => t
+                .used
+                .iter()
+                .filter(|u| u.kind == ResourceType::Uav && u.root == RootType::Table)
+                .filter_map(|u| entry(ResourceType::Uav, (u.slot, u.table_offset_dwords)))
+                .filter(|(d, _)| {
+                    matches!(d.Format.0, 26 | 42) && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.Width >= 640
+                })
+                .max_by_key(|(d, _)| d.Width),
         };
-        let image = entry(ResourceType::Uav, at);
         let depth = match role {
             Role::Resolve => entry(ResourceType::Srv, DEPTH),
-            Role::Radiance | Role::Air => image,
+            Role::Radiance | Role::Air | Role::Reflect => image,
         };
         let (Some((of, image)), Some((seen, depth))) = (image, depth) else {
             once!(?role, "no stand-in for the indirect light: other tables");
             return false;
         };
         // (R32_UINT holding R9G9B9E5; R11G11B10_FLOAT.)
-        let format = if role == Role::Resolve { 42 } else { 26 };
+        let format = match role {
+            Role::Resolve => 42,
+            Role::Reflect => of.Format.0,
+            _ => 26,
+        };
         let volume = of.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D;
         if of.Format.0 != format || (seen.Width, seen.Height) != (of.Width, of.Height) || volume != (role == Role::Air) {
             once!(?role, format = of.Format.0, "no stand-in for the indirect light: another image");
             return false;
         }
+        // The rough reflections the resolve writes beside the light.
+        let other = (role == Role::Resolve)
+            .then(|| entry(ResourceType::Uav, OTHER).or_else(|| entry(ResourceType::Uav, OTHER_TOO)))
+            .flatten()
+            .filter(|(d, _)| d.Format.0 == 42 && (d.Width, d.Height) == (of.Width, of.Height))
+            .map(|(_, h)| h);
+        let (spec, spec_raw) = if role == Role::Reflect {
+            if of.Format.0 == 42 { (Some(image), None) } else { (None, Some(image)) }
+        } else if role == Role::Resolve {
+            let fits = |e: Option<(D3D12_RESOURCE_DESC, D3D12_GPU_DESCRIPTOR_HANDLE)>, format: i32| {
+                e.filter(|(d, _)| d.Format.0 == format && (d.Width, d.Height) == (of.Width, of.Height)).map(|(_, h)| h)
+            };
+            (
+                fits(entry(ResourceType::Uav, SPEC).or_else(|| entry(ResourceType::Uav, SPEC_TOO)), 42),
+                fits(entry(ResourceType::Uav, SPEC_RAW), 26),
+            )
+        } else {
+            (None, None)
+        };
         crate::ambient::after(list, role, &Views {
             image,
+            spec,
+            spec_raw,
+            other,
             depth,
             size: [of.Width as u32, of.Height],
             slices: u32::from(of.DepthOrArraySize),
@@ -4167,6 +4203,13 @@ impl State {
         }
         if kind == DISPATCH {
             self.buffers_written();
+            if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+                && crate::ambient::on()
+                && self.ambient(list, p, role)
+            {
+                self.host_pipeline = 0;
+                self.host_roots[1] = 0;
+            }
         } else {
             self.drew(Some(p));
         }

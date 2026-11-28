@@ -119,6 +119,10 @@ time are drawn in the corners of the picture; **F3 hides and shows them**
 | `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
 | `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
+| `VICTORY_WINDOW_POOL_MB` | 1024 | buffers of windows of title memory let go are kept for the next window of the same size (in the card's memory or the PC's), instead of going back to the uploads' pool or being let go: in a 16-minute Series S run the windows alive held about 3.2 GB while 8 GB were made and let go, the driver kept their blocks committed, and the PC's free memory fell from 1.8 GB to under 0.2 GB (12 fps, audio lagging at 16 minutes). `0`: as before |
+| `VICTORY_WINDOWS_BAR_MB` | 3584 (play.ps1) | windows of title memory (host copies shaders read) kept in the card's memory and written through the resizable BAR, not in the PC's memory: on a 32 GB PC the free memory fell from 1.8 GB a minute in to under 0.2 GB at 16 minutes (12 fps, audio lagging) with about 3 GB of windows in the PC's memory and 7 GB of the card unused |
+| `VICTORY_AMBIENT_SPECULAR` | 0 in play.ps1 (1 in the code, with `VICTORY_AMBIENT`) | share of the ambient stand-in's estimate written as the reflections the passes below leave; `0`: the title's own (sky-blue grain and clouds on floors indoors, glass mirroring the sky) |
+| `VICTORY_AMBIENT_OTHER` | off in play.ps1 (on in the code, with `VICTORY_AMBIENT`) | `0`: the resolve's other packed light is left as the title writes it (by day up to ~90 times the room's light: colours bleached) |
 
 ### Measuring
 
@@ -185,6 +189,20 @@ keeps them. Everything below is what this copy changed on top, measured on the R
   begins), the mapping is done, and the line goes on. In an A/B drive ~4 in 10 mappings went at once;
   with it on for a whole drive, cars no longer vanished as they came close (their full models had come
   too late), while textures are still late (2026-11-28).
+- Reflections and daylight glare from the ambient stand-in (`VICTORY_AMBIENT_SPECULAR`,
+  `VICTORY_AMBIENT_OTHER`, both on with `VICTORY_AMBIENT`): without the ray-tracing structures the
+  title's reflection rays find only the sky. The estimate of the room's light (beloooo's stand-in, below)
+  is written over the rough reflections the screen-probe resolve (`CS_ScreenProbes_TemporalResolve`)
+  leaves, over those `63381c3250b287fa` writes again after it, and over the reflections of see-through
+  surfaces (`34992f2b65a789a5`, glass); the resolve's third output (fed by `940c2635dc1312f4`, ~90 times
+  the room's light by day) is bounded by it. The two later programs are matched by their hashes (their
+  containers have no names); MiamiGame/XTP's shader-roles analysis was read to place them. Found with
+  frame captures and their pixel history (2026-11-28); not confirmed in play, so play.ps1 leaves both off.
+- Frame replay fixes: buffers in heaps opened from existing memory lose their cross-adapter mark
+  (D3D12 refused them once the heap's sharing was dropped); memory made not resident is made resident
+  (the first copy into a texture faulted); `--breadcrumbs` now says, when the card is lost, where it
+  faulted, in which resource (named by its capture id, with its record) and the command each list
+  stopped at; the recorder removes its `go` file once it fires.
 - Tried and left off: fresh page mappings without the drain (`VICTORY_MAP_FRESH=1` turns it on;
   A/B-able). A page-mapping call that only maps where nothing (or only the title's filler page) is
   mapped went ahead without waiting for the earlier submissions to be prepared (`VICTORY_MAP_DRAIN`).
@@ -306,6 +324,8 @@ commits taken from elsewhere name the commit and its author.
   every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
   reads into title memory.
 - **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
+- **[MiamiGame/XTP](https://github.com/MiamiGame/XTP)**: its shader-roles analysis, read to
+  place the reflection programs (no code of it is here).
 - **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
   title behaves under another layer; no code of it is here.
 - **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**: the fork this

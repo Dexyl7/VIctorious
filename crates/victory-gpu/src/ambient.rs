@@ -30,6 +30,17 @@
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
+//! The same program resolves the rough reflections, in two more images
+//! (packed, and as R11G11B10): without rays they hold the sky wherever a
+//! probe's ray left the room, sky-blue grain on floors indoors that the
+//! title's history smears into clouds. The estimate stands in for them too
+//! (`VICTORY_AMBIENT_SPECULAR=<share>`, 1 unless set; `0`: the title's).
+//!
+//! A later program (`63381c3250b287fa`, known by its hash) writes the rough
+//! reflections again from its own rays, which find the sky too; right after
+//! it, the estimate the resolve's stand-in kept that frame is written there
+//! again.
+//!
 //! The air of a room is lit by the same probes: without rays they hold the
 //! sky's light indoors too, a brown veil at sunset. `VICTORY_AMBIENT_AIR`
 //! bounds what the air scatters by a multiple of the light around.
@@ -51,6 +62,26 @@ pub(crate) enum Role {
     /// Adds the lamps' light to what the air scatters (the last program
     /// that writes that volume before it is summed up along the view).
     Air,
+    /// Writes reflections after the resolve from rays that find only the
+    /// sky without the structures: the rough ones again (an indirect
+    /// dispatch over tiles, R11G11B10), those of glass (packed).
+    Reflect,
+}
+
+/// Programs known by their container's hash (`crate::pipeline::Shader`'s,
+/// the first 16 hex digits of blake3), where the container has no name.
+pub(crate) fn role_by_hash(hash: &str) -> Option<Role> {
+    match hash {
+        // Found with a frame capture's pixel history (2026-11-28): after
+        // the resolve has written the room's light, it writes sky blue
+        // there, which `71883e40620a567a` filters and `dce085c07b9414b6`
+        // keeps over frames (MiamiGame/XTP's shader roles name those two).
+        "63381c3250b287fa" => Some(Role::Reflect),
+        // The reflections of see-through surfaces (glass), packed: sky blue
+        // on a glass table indoors, read by its draw (capture 6).
+        "34992f2b65a789a5" => Some(Role::Reflect),
+        _ => None,
+    }
 }
 
 /// The program's part in this, by its name in the container.
@@ -73,6 +104,14 @@ pub(crate) fn role(container: &[u8]) -> Option<Role> {
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 pub(crate) const DEPTH: (u8, u32) = (0, 464);
 pub(crate) const RADIANCE: (u8, u32) = (1, 16);
+/// Where the resolve writes its rough reflections: packed as the light is
+/// (two views of one image), and as R11G11B10.
+pub(crate) const SPEC: (u8, u32) = (1, 152);
+pub(crate) const SPEC_TOO: (u8, u32) = (1, 200);
+pub(crate) const SPEC_RAW: (u8, u32) = (1, 192);
+/// Its other packed light (two views of one image).
+pub(crate) const OTHER: (u8, u32) = (1, 160);
+pub(crate) const OTHER_TOO: (u8, u32) = (1, 168);
 /// Where the light the air scatters is.
 pub(crate) const AIR: (u8, u32) = (1, 32);
 
@@ -112,6 +151,27 @@ fn air() -> f32 {
     })
 }
 
+/// Share of the estimate that stands in for the rough reflections
+/// (`VICTORY_AMBIENT_SPECULAR=<share>`; unset: 1; `0`: the title's own,
+/// which hold the sky indoors).
+fn specular() -> f32 {
+    static SET: OnceLock<f32> = OnceLock::new();
+    *SET.get_or_init(|| {
+        let set = std::env::var("VICTORY_AMBIENT_SPECULAR").unwrap_or_default();
+        match set.trim() {
+            "" => 1.0,
+            v => v.parse().ok().filter(|v: &f32| v.is_finite() && *v >= 0.0).unwrap_or(0.0),
+        }
+    })
+}
+
+/// Whether the resolve's other packed light is bounded by the room's
+/// (`VICTORY_AMBIENT_OTHER=0`: not).
+fn other_bound() -> bool {
+    static SET: OnceLock<bool> = OnceLock::new();
+    *SET.get_or_init(|| std::env::var_os("VICTORY_AMBIENT_OTHER").is_none_or(|v| v != "0"))
+}
+
 /// Strength and radius of the creases' shade.
 fn shade() -> [f32; 2] {
     static SET: OnceLock<[f32; 2]> = OnceLock::new();
@@ -128,7 +188,7 @@ fn shade() -> [f32; 2] {
 }
 
 const SOURCE: &str = r#"
-#define RS "RootConstants(num32BitConstants=12, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2)"
+#define RS "RootConstants(num32BitConstants=14, b0), DescriptorTable(SRV(t0)), DescriptorTable(UAV(u0)), UAV(u1), UAV(u2), DescriptorTable(UAV(u3)), DescriptorTable(UAV(u4)), UAV(u5), DescriptorTable(UAV(u6))"
 #define CX 64
 #define CY 36
 #define CELLS (CX * CY)
@@ -138,6 +198,9 @@ cbuffer Set : register(b0) {
     float level; float constant; float strength; float radius;
     float near; float tan_y; uint width; uint height;
     float follow; float most; float air; float unused;
+    // Share of the estimate written as the rough reflections, and which of
+    // their images are bound (1: packed, 2: R11G11B10).
+    float spec; uint spec_has;
 };
 Texture2D<float> depth : register(t0);
 // Cells: the light they send out (then, at CELLS, the slow mean), from
@@ -146,6 +209,28 @@ RWStructuredBuffer<float4> cells : register(u1);
 // Three a point: red, green and blue, each a mean and a direction.
 RWStructuredBuffer<float4> points : register(u2);
 static const float3 LUMA = float3(0.2126, 0.7152, 0.0722);
+// The rough reflections' images (packed, R11G11B10), and the estimate of
+// the frame's resolve kept for the later pass that writes them again
+// (half floats: red and green, blue).
+RWTexture2D<uint> spec_packed : register(u3);
+RWTexture2D<float3> spec_float : register(u4);
+RWStructuredBuffer<uint2> kept_light : register(u5);
+// The resolve's other packed light (fed by the second final gather, which
+// sees the sky too): bounded by the room's light (spec_has & 4).
+RWTexture2D<uint> other_light : register(u6);
+// R9G9B9E5 in 32-bit integers.
+float3 unpack(uint v) {
+    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+}
+uint pack(float3 c) {
+    c = clamp(c, 0.0, 65408.0);
+    float top = max(c.r, max(c.g, c.b));
+    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
+    float scale = exp2(float(24 - e));
+    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
+    uint3 m = min(uint3(c * scale + 0.5), 511u);
+    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+}
 
 // The point seen at a texel, in metres from the eye (x right, y up, z away).
 float3 seen(int2 p, float2 size) {
@@ -249,18 +334,42 @@ void clear_air(uint3 at : SV_DispatchThreadID) {
 #endif
 
 #ifdef RAISE
-RWTexture2D<uint> light : register(u0);
-float3 unpack(uint v) {
-    return float3(v & 511, (v >> 9) & 511, (v >> 18) & 511) * exp2(float(v >> 27) - 24.0);
+// By day it held up to 90 times the room's light (a red bed grey-white,
+// floors fogged); at night the sky is dark and it was right.
+void bound_other(int2 p, float3 found) {
+    if (!(spec_has & 4)) return;
+    float3 o = unpack(other_light[p]);
+    float has = dot(o, LUMA);
+    float top = max(dot(found, LUMA), 1e-6);
+    if (has > top) other_light[p] = pack(o * (top / has));
 }
-uint pack(float3 c) {
-    c = clamp(c, 0.0, 65408.0);
-    float top = max(c.r, max(c.g, c.b));
-    int e = clamp(int(floor(log2(max(top, 1e-9)))) + 16, 0, 31);
-    float scale = exp2(float(24 - e));
-    if (top * scale >= 511.5) { e = min(e + 1, 31); scale = exp2(float(24 - e)); }
-    uint3 m = min(uint3(c * scale + 0.5), 511u);
-    return m.r | (m.g << 9) | (m.b << 18) | (uint(e) << 27);
+#endif
+
+#ifdef REFLECT
+// After the program that writes the rough reflections again: the room's
+// light, as the resolve's stand-in found it this frame.
+[RootSignature(RS)]
+[numthreads(8, 8, 1)]
+void reflect_again(uint3 at : SV_DispatchThreadID) {
+    if (at.x >= width || at.y >= height) return;
+    uint2 v = kept_light[at.y * width + at.x];
+    float3 f = float3(f16tof32(v.x), f16tof32(v.x >> 16), f16tof32(v.y));
+    if (spec_has & 1) spec_packed[at.xy] = pack(f * spec);
+    if (spec_has & 2) spec_float[at.xy] = f * spec;
+}
+#endif
+
+#ifdef RAISE
+RWTexture2D<uint> light : register(u0);
+// The rough reflections: without rays they hold the sky wherever a probe's
+// ray left the room (sky-blue grain on floors indoors, smeared into clouds
+// by the title's history). The light of the room stands in for them.
+void reflect_room(int2 p, float3 found) {
+    kept_light[p.y * width + p.x] = uint2(f32tof16(found.r) | (f32tof16(found.g) << 16), f32tof16(found.b));
+    if (spec <= 0.0) return;
+    float3 s = found * spec;
+    if (spec_has & 1) spec_packed[p] = pack(s);
+    if (spec_has & 2) spec_float[p] = s;
 }
 [RootSignature(RS)]
 [numthreads(8, 8, 1)]
@@ -296,6 +405,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
         light[p] = pack(found);
+        reflect_room(p, found);
+        bound_other(p, found);
         return;
     }
     // Between the four points around, those at its own depth first; which
@@ -327,6 +438,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
     float has = dot(was, LUMA);
     was *= min(1.0, top / max(has, 1e-6));
     light[p] = pack(max(was, found));
+    reflect_room(p, found);
+    bound_other(p, found);
 }
 #endif
 "#;
@@ -335,6 +448,8 @@ void raise(uint3 at : SV_DispatchThreadID) {
 const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
+/// The kept estimate: up to 1920x1080, 8 bytes a texel.
+const KEPT_BYTES: u64 = 1920 * 1080 * 8;
 
 struct Pass {
     root: ID3D12RootSignature,
@@ -344,8 +459,10 @@ struct Pass {
     gather: ID3D12PipelineState,
     raise: ID3D12PipelineState,
     air: ID3D12PipelineState,
+    reflect: ID3D12PipelineState,
     cells: ID3D12Resource,
     points: ID3D12Resource,
+    kept: ID3D12Resource,
 }
 // SAFETY: D3D12 objects are free-threaded.
 unsafe impl Send for Pass {}
@@ -375,6 +492,7 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
     let gather = pipeline("GATHER", s!("gather"))?;
     let raise = pipeline("RAISE", s!("raise"))?;
     let air = pipeline("AIR", s!("clear_air"))?;
+    let reflect = pipeline("REFLECT", s!("reflect_again"))?;
     let made = |bytes| buffer(bytes).ok_or_else(windows::core::Error::empty);
     Ok(Pass {
         root: root.ok_or_else(windows::core::Error::empty)?,
@@ -384,8 +502,10 @@ fn make(device: &ID3D12Device, buffer: impl Fn(u64) -> Option<ID3D12Resource>) -
         gather,
         raise,
         air,
+        reflect,
         cells: made(CELL_BYTES)?,
         points: made(POINT_BYTES)?,
+        kept: made(KEPT_BYTES)?,
     })
 }
 
@@ -410,10 +530,20 @@ fn uav_barrier(list: &ID3D12GraphicsCommandList) {
 /// to begin with.
 static KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The size of the image the resolve's stand-in last kept its estimate for
+/// (width << 16 | height; 0: none yet).
+static RESOLVED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// What the passes read and write, as views in the heap the list has set.
 pub(crate) struct Views {
     /// The image the title's program just wrote.
     pub(crate) image: D3D12_GPU_DESCRIPTOR_HANDLE,
+    /// For [`Role::Resolve`]: its rough reflections, packed (R32_UINT
+    /// holding R9G9B9E5) and as R11G11B10, where it has them.
+    pub(crate) spec: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
+    pub(crate) spec_raw: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
+    /// For [`Role::Resolve`]: its other packed light, where it has it.
+    pub(crate) other: Option<D3D12_GPU_DESCRIPTOR_HANDLE>,
     /// The scene's depth, for [`Role::Resolve`].
     pub(crate) depth: D3D12_GPU_DESCRIPTOR_HANDLE,
     /// The size of the image, and how many slices it has.
@@ -440,19 +570,42 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     if role == Role::Air && (constant > 0.0 || air() == 0.0) {
         return false;
     }
-    static SAID: Mutex<u32> = Mutex::new(0);
+    let size_word = views.size[0] << 16 | views.size[1];
+    if role == Role::Resolve && views.size[0] * views.size[1] * 8 > KEPT_BYTES as u32 {
+        return false;
+    }
+    if role == Role::Reflect
+        && (specular() == 0.0
+            || (views.spec.is_none() && views.spec_raw.is_none())
+            || RESOLVED.load(Ordering::Relaxed) != size_word)
+    {
+        return false;
+    }
+    static SAID: Mutex<[u32; 4]> = Mutex::new([0; 4]);
     {
         let mut said = SAID.lock().unwrap_or_else(|e| e.into_inner());
-        if *said < 4 {
+        let said = &mut said[role as usize];
+        if *said < 2 {
             *said += 1;
-            tracing::info!(?role, size = ?views.size, level, constant, "a stand-in for the indirect light");
+            tracing::info!(
+                ?role,
+                size = ?views.size,
+                level,
+                constant,
+                reflections = specular(),
+                packed = views.spec.is_some(),
+                raw = views.spec_raw.is_some(),
+                other = views.other.is_some(),
+                "a stand-in for the indirect light"
+            );
         }
     }
     list.keep(&pass.cells);
     list.keep(&pass.points);
+    list.keep(&pass.kept);
     let [strength, radius] = shade();
     let floats = [level, constant, strength, radius, 0.1, 0.45];
-    let mut words = [0u32; 12];
+    let mut words = [0u32; 14];
     for (to, v) in words.iter_mut().zip(floats) {
         *to = v.to_bits();
     }
@@ -461,6 +614,12 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = 0.04f32.to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
+    if matches!(role, Role::Resolve | Role::Reflect) {
+        words[12] = specular().to_bits();
+        words[13] = u32::from(views.spec.is_some())
+            | u32::from(views.spec_raw.is_some()) << 1
+            | u32::from(role == Role::Resolve && views.other.is_some() && other_bound()) << 2;
+    }
     let l = &list.list;
     // SAFETY: an open list with the heap of the views set; the title's
     // program has just used both views, so their textures are in the states
@@ -468,11 +627,17 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     unsafe {
         uav_barrier(l);
         l.SetComputeRootSignature(&pass.root);
-        l.SetComputeRoot32BitConstants(0, 12, words.as_ptr().cast(), 0);
+        l.SetComputeRoot32BitConstants(0, 14, words.as_ptr().cast(), 0);
         l.SetComputeRootDescriptorTable(1, views.depth);
         l.SetComputeRootDescriptorTable(2, views.image);
         l.SetComputeRootUnorderedAccessView(3, pass.cells.GetGPUVirtualAddress());
         l.SetComputeRootUnorderedAccessView(4, pass.points.GetGPUVirtualAddress());
+        // Unbound ones are not touched (`spec_has`); the light's view
+        // stands in so the tables are set.
+        l.SetComputeRootDescriptorTable(5, views.spec.unwrap_or(views.image));
+        l.SetComputeRootDescriptorTable(6, views.spec_raw.unwrap_or(views.image));
+        l.SetComputeRootUnorderedAccessView(7, pass.kept.GetGPUVirtualAddress());
+        l.SetComputeRootDescriptorTable(8, views.other.unwrap_or(views.image));
         let run = |pso: &ID3D12PipelineState, x, y, z| {
             l.SetPipelineState(pso);
             l.Dispatch(x, y, z);
@@ -491,7 +656,9 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
                     run(&pass.gather, 20, 45, 1);
                 }
                 run(&pass.raise, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1);
+                RESOLVED.store(size_word, Ordering::Relaxed);
             }
+            Role::Reflect => run(&pass.reflect, views.size[0].div_ceil(8), views.size[1].div_ceil(8), 1),
         }
     }
     true
@@ -517,6 +684,8 @@ mod tests {
         assert_eq!(role(b"..CS_CacheScreenSpaceRadiance_eed2fc35.."), Some(Role::Radiance));
         assert_eq!(role(b"CS_AccumulateLocalLightInscatteringVolume_7e2f5eef"), Some(Role::Air));
         assert_eq!(role(b"CS_TemporalResolve"), None);
+        assert_eq!(role_by_hash("63381c3250b287fa"), Some(Role::Reflect));
+        assert_eq!(role_by_hash("34fb51b8a0312e82"), None);
     }
 
     /// The passes compile with the system's compiler and the host takes them.

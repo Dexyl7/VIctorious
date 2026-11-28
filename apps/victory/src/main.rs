@@ -228,7 +228,7 @@ fn main() -> Result<()> {
             run::run(&exe, unimplemented, strict, execute, console)
         }
         #[cfg(all(windows, feature = "diagnostics"))]
-        Command::Replay(options) => replay::run(options),
+        Command::Replay(options) => replay::run(options).inspect_err(|_| victory_hle::replay::gpu::report_lost()),
         Command::Config => show_config(),
     }
 }

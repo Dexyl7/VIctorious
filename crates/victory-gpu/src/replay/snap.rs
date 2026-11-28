@@ -135,7 +135,14 @@ pub(super) fn present(r: &Recorder, texture: &ID3D12Resource, state: u32) {
                 At::Frame(f) => presents >= f,
                 At::Trigger => false,
             };
-            if due || r.settings.folder.join("go").exists() {
+            let go = r.settings.folder.join("go");
+            let asked = go.exists();
+            if due || asked {
+                // Used up: one left behind would fire the next run's capture
+                // at its very start.
+                if asked && let Err(e) = std::fs::remove_file(&go) {
+                    tracing::warn!("frame recorder: {} not removed: {e}", go.display());
+                }
                 tracing::info!(presents, "frame recorder: lists are recorded from now on");
                 r.arm(true);
                 phase.stage = Stage::Armed(presents);

@@ -88,7 +88,11 @@ impl Worker {
                 self.fence.SetEventOnCompletion(value, self.event)?;
                 WaitForSingleObject(self.event, INFINITE);
             }
-            self.device.GetDeviceRemovedReason()
+            let reason = self.device.GetDeviceRemovedReason();
+            if reason.is_err() {
+                lost(&self.device);
+            }
+            reason
         }
     }
 
@@ -466,4 +470,205 @@ mod tests {
         d.dimension = 4;
         assert_eq!(subresources(&d), 8);
     }
+}
+
+/// Once, when the card is lost: what the system's device-removed data says
+/// (with `--breadcrumbs`): the faulting address and the resources it lies in
+/// (named `r<id>` after the capture's), and for each list that did not
+/// finish, the command it stopped at and the ones around it.
+pub(super) fn lost(device: &ID3D12Device) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if SAID.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut text = String::new();
+    // SAFETY: the outputs are the runtime's, valid while the device lives;
+    // nodes are walked as linked, histories by their counts.
+    unsafe {
+        let Ok(dred) = device.cast::<ID3D12DeviceRemovedExtendedData1>() else {
+            tracing::error!("the card was lost; no device-removed data (run with --breadcrumbs)");
+            return;
+        };
+        if let Ok(fault) = dred.GetPageFaultAllocationOutput1() {
+            if fault.PageFaultVA != 0 {
+                text.push_str(&format!("page fault at {:#x}", fault.PageFaultVA));
+                let mut records: Vec<String> = Vec::new();
+                for (what, head) in [
+                    ("inside", fault.pHeadExistingAllocationNode),
+                    ("inside freed", fault.pHeadRecentFreedAllocationNode),
+                ] {
+                    let mut names = Vec::new();
+                    let mut node = head;
+                    while let Some(n) = node.as_ref()
+                        && names.len() < 12
+                    {
+                        let name = if n.ObjectNameW.is_null() {
+                            "unnamed".to_owned()
+                        } else {
+                            n.ObjectNameW.to_string().unwrap_or_default()
+                        };
+                        names.push(format!("{name} (type {})", n.AllocationType.0));
+                        if let Some(record) = noted(&name) {
+                            records.push(format!("{name}: {record}"));
+                        }
+                        node = n.pNext;
+                    }
+                    if !names.is_empty() {
+                        text.push_str(&format!("; {what} {names:?}"));
+                    }
+                }
+                for r in &records {
+                    text.push_str(&format!("\n  {r}"));
+                }
+            } else {
+                text.push_str("no page fault");
+            }
+        }
+        match dred.GetAutoBreadcrumbsOutput1() {
+            Err(e) => text.push_str(&format!("; no breadcrumbs ({e})")),
+            Ok(crumbs) => {
+                let mut node = crumbs.pHeadAutoBreadcrumbNode;
+                let mut index = 0usize;
+                let mut finished = 0usize;
+                while let Some(p) = node.as_ref() {
+                    let done = p.pLastBreadcrumbValue.as_ref().copied().unwrap_or(0);
+                    let count = p.BreadcrumbCount;
+                    if done >= count {
+                        finished += 1;
+                    } else if !p.pCommandHistory.is_null() {
+                        let history = std::slice::from_raw_parts(p.pCommandHistory, count as usize);
+                        let from = (done as usize).saturating_sub(6);
+                        let to = (done as usize + 4).min(count as usize);
+                        let around: Vec<String> = (from..to)
+                            .map(|i| {
+                                let mark = if i == done as usize { "*" } else { "" };
+                                format!("{mark}{i}:{}", op_name(history[i].0))
+                            })
+                            .collect();
+                        let name = if p.pCommandListDebugNameW.is_null() {
+                            String::new()
+                        } else {
+                            p.pCommandListDebugNameW.to_string().unwrap_or_default()
+                        };
+                        text.push_str(&format!(
+                            "; list #{index} \"{name}\" stopped at command {done} of {count}: {around:?}"
+                        ));
+                        // What its draws and dispatches bound, if the
+                        // runtime kept it (context markers).
+                        let mut ctx = Vec::new();
+                        if !p.pBreadcrumbContexts.is_null() {
+                            let all = std::slice::from_raw_parts(p.pBreadcrumbContexts, p.BreadcrumbContextsCount as usize);
+                            for c in all.iter().filter(|c| c.BreadcrumbIndex + 3 >= done && c.BreadcrumbIndex <= done + 1) {
+                                if !c.pContextString.is_null() {
+                                    ctx.push(format!("{}: {}", c.BreadcrumbIndex, c.pContextString.to_string().unwrap_or_default()));
+                                }
+                            }
+                        }
+                        if !ctx.is_empty() {
+                            text.push_str(&format!(" {ctx:?}"));
+                        }
+                    }
+                    index += 1;
+                    node = p.pNext;
+                }
+                text.push_str(&format!("; {finished} of {index} lists finished"));
+            }
+        }
+    }
+    tracing::error!("the card was lost: {text}");
+}
+
+fn op_name(op: i32) -> &'static str {
+    match op {
+        0 => "SetMarker",
+        1 => "BeginEvent",
+        2 => "EndEvent",
+        3 => "DrawInstanced",
+        4 => "DrawIndexedInstanced",
+        5 => "ExecuteIndirect",
+        6 => "Dispatch",
+        7 => "CopyBufferRegion",
+        8 => "CopyTextureRegion",
+        9 => "CopyResource",
+        10 => "CopyTiles",
+        11 => "ResolveSubresource",
+        12 => "ClearRenderTargetView",
+        13 => "ClearUnorderedAccessView",
+        14 => "ClearDepthStencilView",
+        15 => "ResourceBarrier",
+        16 => "ExecuteBundle",
+        17 => "Present",
+        18 => "ResolveQueryData",
+        19 => "BeginSubmission",
+        20 => "EndSubmission",
+        21 => "DecodeFrame",
+        22 => "ProcessFrames",
+        23 => "AtomicCopyBufferUint",
+        24 => "AtomicCopyBufferUint64",
+        25 => "ResolveSubresourceRegion",
+        26 => "WriteBufferImmediate",
+        27 => "DecodeFrame1",
+        28 => "SetProtectedResourceSession",
+        29 => "DecodeFrame2",
+        30 => "ProcessFrames1",
+        31 => "BuildRaytracingAccelerationStructure",
+        32 => "EmitRaytracingAccelerationStructurePostbuildInfo",
+        33 => "CopyRaytracingAccelerationStructure",
+        34 => "DispatchRays",
+        35 => "InitializeMetaCommand",
+        36 => "ExecuteMetaCommand",
+        37 => "EstimateMotion",
+        38 => "ResolveMotionVectorHeap",
+        39 => "SetPipelineState1",
+        40 => "InitializeExtensionCommand",
+        41 => "ExecuteExtensionCommand",
+        42 => "DispatchMesh",
+        43 => "EncodeFrame",
+        44 => "ResolveEncoderOutputMetadata",
+        45 => "Barrier",
+        46 => "BeginCommandList",
+        _ => "?",
+    }
+}
+
+/// The replay's device, kept (one reference) so a failure anywhere can still
+/// ask what the card says: [`report_lost`].
+static DEVICE: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+pub(super) fn keep_device(device: &ID3D12Device) {
+    let mut kept = DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    if *kept == 0 {
+        *kept = device.clone().into_raw() as usize;
+    }
+}
+
+/// If the card was lost: says what the device-removed data has (once).
+pub fn report_lost() {
+    let kept = *DEVICE.lock().unwrap_or_else(|e| e.into_inner());
+    if kept == 0 {
+        return;
+    }
+    // SAFETY: the reference taken in `keep_device`, never released.
+    let raw = kept as *mut core::ffi::c_void;
+    let device = unsafe { ID3D12Device::from_raw_borrowed(&raw) };
+    if let Some(device) = device
+        // SAFETY: a live device.
+        && unsafe { device.GetDeviceRemovedReason() }.is_err()
+    {
+        lost(device);
+    }
+}
+
+/// With `--breadcrumbs`: the capture's record of each resource made, for
+/// [`lost`] to say what the faulting ones are.
+static NOTES: std::sync::Mutex<Option<std::collections::HashMap<u32, String>>> = std::sync::Mutex::new(None);
+
+pub(super) fn note_resource(id: u32, what: String) {
+    NOTES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(Default::default).insert(id, what);
+}
+
+fn noted(name: &str) -> Option<String> {
+    let id: u32 = name.strip_prefix('r')?.parse().ok()?;
+    NOTES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&id).cloned()
 }

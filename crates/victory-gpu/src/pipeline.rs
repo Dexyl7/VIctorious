@@ -110,12 +110,15 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
         .or_insert_with(|| {
             KEPT[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             KEPT[1].fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            let hash = full.to_hex()[..16].to_owned();
             Arc::new(Shader {
                 stage,
-                hash: full.to_hex()[..16].to_owned(),
-                container: bytes.to_vec(),
                 #[cfg(windows)]
-                ambient: (stage == "compute").then(|| crate::ambient::role(bytes)).flatten(),
+                ambient: (stage == "compute")
+                    .then(|| crate::ambient::role(bytes).or_else(|| crate::ambient::role_by_hash(&hash)))
+                    .flatten(),
+                hash,
+                container: bytes.to_vec(),
                 #[cfg(windows)]
                 translated: OnceLock::new(),
             })
