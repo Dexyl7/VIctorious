@@ -38,10 +38,11 @@ $settings = @{
     VICTORY_SHOW_AFTER = '1'; VICTORY_AMBIENT = '0.8'; VICTORY_D3D12_DRED = 'light'; VICTORY_SKIP_PIPELINES = 'none'
     # Recording threads: a table's descriptor copies in one call; lookups forgotten only where buffers changed.
     VICTORY_TABLE_BATCH = '1'; VICTORY_FIND_BY_RANGE = '1'
-    # Title buffers of 1 MB and more get their copy on the card and are compared there (trustno1-coder/
-    # victory-nvidia's setting; the way is fxceless/victory-fork's): 80 such copies instead of 43 here,
-    # the submitting thread's snapshots 4.0 -> 1.6 ms and the copy-back 8-10 -> 6-7 ms a frame.
-    VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    # Every title buffer of 64 KiB and more gets its copy on the card and is compared there (the way is
+    # fxceless/victory-fork's, the KiB setting after its c36971b2; 1 MB was trustno1-coder/victory-nvidia's):
+    # at 1 MB the snapshots went 4.0 -> 1.6 ms a frame, at 64 KiB to 0; 3,426 copies, 802 MB on the card,
+    # frames mean 36.8 -> 33.6 ms, slowest tenth 38.6 -> 35.0 (2026-11-28).
+    VICTORY_CARD_BUFFERS_MIN_KB = '64'
     # The heaps' records round asked for when the title submits, made while the line gets there:
     # the submitting thread's wait for it ~6-9 -> ~1-4 ms a frame (A/B drive, 2026-11-28).
     VICTORY_SYNC_AT_SUBMIT = '1'

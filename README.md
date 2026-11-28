@@ -115,7 +115,7 @@ time are drawn in the corners of the picture; **F3 hides and shows them**
 | `VICTORY_TABLE_BATCH` | 1 (play.ps1) | a table's descriptor copies in one driver call |
 | `VICTORY_FIND_BY_RANGE` | 1 (play.ps1) | buffer lookups forgotten only where buffers changed |
 | `VICTORY_SYNC_AT_SUBMIT` | 1 (play.ps1) | the descriptor records round a submission waits for is asked for when the title submits it, not when it is prepared |
-| `VICTORY_CARD_BUFFERS_MIN_MB` | 1 (play.ps1; 4 on a 16 GB card without it) | title buffers of that size and more copied to the card and compared there, not on the CPU (setting from trustno1-coder/victory-nvidia, the method from fxceless/victory-fork): the sending thread's snapshots 4.0 → 1.6 ms, copy-back 8-10 → 6-7 ms a frame |
+| `VICTORY_CARD_BUFFERS_MIN_KB` | 64 (play.ps1; 4 MB on a 16 GB card without it) | title buffers of that size and more copied to the card and compared there, not on the CPU (the method from fxceless/victory-fork, the KiB setting after its c36971b2; trustno1-coder/victory-nvidia uses 1 MB). At 1 MB: the sending thread's snapshots 4.0 → 1.6 ms a frame; at 64 KiB: 0, 3,426 copies (802 MB) on the card, frames mean 36.8 → 33.6 ms, slowest tenth 38.6 → 35.0 |
 | `VICTORY_FRAMEGEN`, `VICTORY_FFX_FG_DIR` | off | what `-FrameGen` sets |
 | `VICTORY_LAZY_HOSTS`, `VICTORY_LIST_SIZES`, `VICTORY_UPLOAD_POOL_MB` | on, on, 512 | command and upload memory reused instead of made anew |
 | `VICTORY_WIDE_THREADS` | 4 | threads that copy title memory for a submission (1-15) |
